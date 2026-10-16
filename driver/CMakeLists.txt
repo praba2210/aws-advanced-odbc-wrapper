@@ -364,7 +364,7 @@ if(USE_ASAN)
 endif()
 
 # Link External Library ------------------------------------------------------------------------------------------
-list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc)
+list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc dsql)
 if(MSVC)
     set(OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_BUILD_TYPE})
 else()
@@ -398,7 +398,7 @@ endif()
 
 # Copy External Dependencies -------------------------------------------------------------------------------------
 if(MSVC)
-    list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc)
+    list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc dsql)
     AWSSDK_CPY_DYN_LIBS(SERVICE_LIST "" ${OUTPUT_DIR})
 else()
     set(CMAKE_BUILD_WITH_INSTALL_RPATH true)

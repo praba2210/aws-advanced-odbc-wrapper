@@ -31,6 +31,9 @@ namespace {
     const std::string CHINA_REGION_CLUSTER_READ_ONLY = "database-test-name.cluster-ro-XYZ.rds.cn-northwest-1.amazonaws.com.cn";
     const std::string CHINA_REGION_PROXY = "proxy-test-name.proxy-XYZ.rds.cn-northwest-1.amazonaws.com.cn";
     const std::string CHINA_REGION_CUSTOM_DOMAIN = "custom-test-name.cluster-custom-XYZ.rds.cn-northwest-1.amazonaws.com.cn";
+    const std::string DSQL_CLUSTER = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
+    const std::string DSQL_CLUSTER_SUFFIXED = "abcdefghijklmnopqrstuvwxyz.dsql-gamma.us-west-2.on.aws";
+    const std::string DSQL_CLUSTER_UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ.DSQL.EU-WEST-1.ON.AWS";
 }  // namespace
 
 class RdsUtilsTest : public testing::Test {
@@ -155,4 +158,31 @@ TEST_F(RdsUtilsTest, GetRdsInstanceId) {
     EXPECT_EQ("instance-test-name", RdsUtils::GetRdsInstanceId(US_EAST_REGION_INSTANCE));
     EXPECT_EQ(std::string(), RdsUtils::GetRdsInstanceId(US_EAST_REGION_CLUSTER_READ_ONLY));
     EXPECT_EQ(std::string(), RdsUtils::GetRdsInstanceId(US_EAST_REGION_CLUSTER));
+}
+
+TEST_F(RdsUtilsTest, IsDsqlDns) {
+    EXPECT_TRUE(RdsUtils::IsDsqlDns(DSQL_CLUSTER));
+    EXPECT_TRUE(RdsUtils::IsDsqlDns(DSQL_CLUSTER_SUFFIXED));
+    EXPECT_TRUE(RdsUtils::IsDsqlDns(DSQL_CLUSTER_UPPER));
+
+    EXPECT_FALSE(RdsUtils::IsDsqlDns(US_EAST_REGION_CLUSTER));
+    EXPECT_FALSE(RdsUtils::IsDsqlDns(US_EAST_LIMITLESS_SHARD_GROUP));
+    EXPECT_FALSE(RdsUtils::IsDsqlDns("abcdefghijklmnopqrstuvwxyz"));
+    EXPECT_FALSE(RdsUtils::IsDsqlDns("abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws.example.com"));
+    EXPECT_FALSE(RdsUtils::IsDsqlDns(""));
+}
+
+TEST_F(RdsUtilsTest, GetDsqlRegion) {
+    EXPECT_EQ("us-east-1", RdsUtils::GetDsqlRegion(DSQL_CLUSTER));
+    EXPECT_EQ("us-west-2", RdsUtils::GetDsqlRegion(DSQL_CLUSTER_SUFFIXED));
+    EXPECT_EQ("eu-west-1", RdsUtils::GetDsqlRegion(DSQL_CLUSTER_UPPER));
+
+    EXPECT_EQ("", RdsUtils::GetDsqlRegion(US_EAST_REGION_CLUSTER));
+    EXPECT_EQ("", RdsUtils::GetDsqlRegion("localhost"));
+    EXPECT_EQ("", RdsUtils::GetDsqlRegion(""));
+}
+
+// The RDS parser must keep ignoring DSQL endpoints, so the IAM plugin doesn't sign for them by accident.
+TEST_F(RdsUtilsTest, GetRdsRegion_DsqlHost_Empty) {
+    EXPECT_EQ("", RdsUtils::GetRdsRegion(DSQL_CLUSTER));
 }

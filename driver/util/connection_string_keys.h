@@ -54,6 +54,7 @@
 #define VALUE_AUTH_ADFS "ADFS"
 #define VALUE_AUTH_OKTA "OKTA"
 #define VALUE_AUTH_SSO "AWS_SSO"
+#define VALUE_AUTH_DSQL "DSQL"
 
 /* Common Auth Settings */
 #define KEY_REGION "REGION"

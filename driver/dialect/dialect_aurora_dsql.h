@@ -25,8 +25,6 @@
 // HostListProvider and never starts a topology monitor.
 class DialectAuroraDsql : public Dialect {
 public:
-    using Dialect::IsSqlStateAccessError;
-
     int GetDefaultPort() override { return DEFAULT_DSQL_PORT; };
     DatabaseDialectType GetDialectType() override { return DatabaseDialectType::AURORA_DSQL; };
 
@@ -35,6 +33,17 @@ public:
         return std::ranges::any_of(ACCESS_ERRORS, [&state](const std::string &prefix) {
             return state.starts_with(prefix);
         });
+    };
+
+    bool IsSqlStateAccessError(const char* sql_state, const std::string& error_message) override {
+        if (IsSqlStateAccessError(sql_state)) {
+            return true;
+        }
+        // psqlODBC reports every failed libpq connect as 08001 (connection exception) with the server's message,
+        // so a rejected token is only recognizable from the message.
+        return !error_message.empty()
+            && (error_message.find("PAM authentication failed") != std::string::npos
+                || error_message.find("password authentication failed") != std::string::npos);
     };
 
     bool IsSqlStateNetworkError(const char* sql_state) override {
@@ -47,7 +56,7 @@ public:
 private:
     const int DEFAULT_DSQL_PORT = 5432;
 
-    // Same classes as Aurora PostgreSQL until a cluster run shows what psqlODBC reports for a bad DSQL token.
+    // Same classes and messages as Aurora PostgreSQL until a cluster run shows what DSQL returns for a bad token.
     const std::vector<std::string> ACCESS_ERRORS = {
         "28P01",
         "28000",

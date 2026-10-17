@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/utils/DateTime.h>
 
 #include <chrono>
 #include <string>
@@ -122,4 +123,21 @@ TEST_F(DsqlAuthProviderTest, GetToken_SigningFails_ReturnsEmpty) {
     DsqlAuthProvider provider(REGION, TestCredentials());
     EXPECT_EQ("", provider.GetToken("", REGION, PORT, "admin", true, false, EXPIRATION).first);
     EXPECT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
+}
+
+// Expired credentials aren't empty, so IsEmpty() alone lets the SDK sign a token the server rejects. This is what an
+// SSO-backed provider returns after the session expires.
+TEST_F(DsqlAuthProviderTest, GetToken_ExpiredCredentials_ReturnsEmpty) {
+    const Aws::Auth::AWSCredentials expired("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "",
+        Aws::Utils::DateTime::Now() - std::chrono::hours(1));
+    DsqlAuthProvider provider(REGION, expired);
+    EXPECT_FALSE(provider.HasResolvedCredentials());
+    EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);
+}
+
+// The SigV4 presigner skips signing when either key is empty, not only when both are.
+TEST_F(DsqlAuthProviderTest, GetToken_MissingSecretKey_ReturnsEmpty) {
+    DsqlAuthProvider provider(REGION, Aws::Auth::AWSCredentials("AKIDEXAMPLE", ""));
+    EXPECT_FALSE(provider.HasResolvedCredentials());
+    EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);
 }

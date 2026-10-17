@@ -203,3 +203,73 @@ TEST_F(DsqlAuthPluginTest, Connect_AccessError_NoSecondToken) {
     DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_, mock_dialect_, mock_odbc_helper_);
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
 }
+
+namespace {
+    const std::string EXPECTED_APP_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
+}  // namespace
+
+TEST_F(DsqlAuthPluginTest, Defaults_EmptyAttributes) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("verify-full", conn_attr.at("SSLMODE"));
+    EXPECT_EQ("admin", conn_attr.at(KEY_DB_USERNAME));
+    EXPECT_EQ("postgres", conn_attr.at(KEY_DATABASE));
+    EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// DSQL rejects plaintext, and Go, .NET, PHP, Ruby and Rust always verify the server. A weaker mode is overridden.
+TEST_F(DsqlAuthPluginTest, Defaults_ForcesVerifyFull) {
+    std::map<std::string, std::string> conn_attr = {{"SSLMODE", "require"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("verify-full", conn_attr.at("SSLMODE"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_ForcesVerifyFull_ShortKey) {
+    std::map<std::string, std::string> conn_attr = {{"CA", "disable"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_FALSE(conn_attr.contains("CA"));
+    EXPECT_EQ("verify-full", conn_attr.at("SSLMODE"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_KeepUserAndDatabase) {
+    std::map<std::string, std::string> conn_attr = {{KEY_DB_USERNAME, "app_user"}, {KEY_DATABASE, "mydb"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("app_user", conn_attr.at(KEY_DB_USERNAME));
+    EXPECT_EQ("mydb", conn_attr.at(KEY_DATABASE));
+}
+
+// psqlODBC also accepts USERNAME/USER and the short form DX. Adding UID or DATABASE would send a second value.
+TEST_F(DsqlAuthPluginTest, Defaults_RespectAliasKeys) {
+    std::map<std::string, std::string> conn_attr = {{ALIAS_KEY_USERNAME_2, "app_user"}, {"DX", "mydb"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_FALSE(conn_attr.contains(KEY_DB_USERNAME));
+    EXPECT_FALSE(conn_attr.contains(KEY_DATABASE));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptKeepsUserRootCert) {
+    std::map<std::string, std::string> conn_attr = {{"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{sslrootcert=/etc/ssl/corp-ca.pem application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptKeepsUserApplicationName_ShortKey) {
+    std::map<std::string, std::string> conn_attr = {{"D5", "{application_name=billing}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_FALSE(conn_attr.contains("PQOPT"));
+    EXPECT_EQ("{application_name=billing sslrootcert=system}", conn_attr.at("D5"));
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_AppliesDefaultsBeforeBaseDriver) {
+    dbc_->conn_attr.erase(KEY_DB_USERNAME);
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, "admin",
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(1))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+    EXPECT_EQ("verify-full", dbc_->conn_attr.at("SSLMODE"));
+    EXPECT_EQ("admin", dbc_->conn_attr.at(KEY_DB_USERNAME));
+}

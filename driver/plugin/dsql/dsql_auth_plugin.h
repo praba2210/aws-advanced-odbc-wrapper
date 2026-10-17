@@ -15,6 +15,7 @@
 #ifndef DSQL_AUTH_PLUGIN_H_
 #define DSQL_AUTH_PLUGIN_H_
 
+#include <map>
 #include <memory>
 #include <string>
 
@@ -32,6 +33,17 @@ public:
                    const std::shared_ptr<AuthProvider>& auth_provider,
                    std::shared_ptr<Dialect> dialect,
                    std::shared_ptr<OdbcHelper> odbc_helper);
+
+    SQLRETURN Connect(
+        SQLHDBC        ConnectionHandle,
+        SQLHWND        WindowHandle,
+        SQLTCHAR *     OutConnectionString,
+        SQLSMALLINT    BufferLength,
+        SQLSMALLINT *  StringLengthPtr,
+        SQLUSMALLINT   DriverCompletion) override;
+
+    // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes. Public for tests.
+    static void ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr);
 
 protected:
     std::string ResolveRegion(DBC* dbc) override;

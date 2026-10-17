@@ -26,6 +26,23 @@
 #include "aws_sdk_helper.h"
 #include "logger_wrapper.h"
 
+namespace {
+    // Why these credentials can't sign a DSQL token, or "" when they can. The C++ SigV4 presigner skips signing when
+    // either key is empty and returns an unsigned URL, and it signs with expired credentials; the server rejects both
+    // as a bad password.
+    std::string CredentialsProblem(const Aws::Auth::AWSCredentials& credentials)
+    {
+        if (credentials.GetAWSAccessKeyId().empty() || credentials.GetAWSSecretKey().empty()) {
+            return "No AWS credentials available for Aurora DSQL token generation";
+        }
+        if (credentials.IsExpired()) {
+            return "AWS credentials for Aurora DSQL token generation have expired. If they come from AWS IAM Identity "
+                   "Center (SSO), run 'aws sso login'";
+        }
+        return "";
+    }
+}  // namespace
+
 DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile) {
     // The base default constructor skips Init, but the base destructor always calls Shutdown.
     AwsSdkHelper::Init();
@@ -37,8 +54,7 @@ DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string 
         credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
     // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own.
-    if (credentials_provider_->GetAWSCredentials().IsEmpty()) {
-        dsql_credentials_resolved_ = false;
+    if (!HasResolvedCredentials()) {
         LOG(ERROR) << "Unable to resolve AWS credentials for Aurora DSQL authentication"
                    << (profile.empty() ? "" : " with profile '" + profile + "'");
     }
@@ -47,7 +63,6 @@ DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string 
 
 DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials) {
     AwsSdkHelper::Init();
-    dsql_credentials_resolved_ = !credentials.IsEmpty();
     credentials_provider_ = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials);
     SetUpDsqlClient(region);
 }
@@ -61,11 +76,10 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     bool extra_url_encode,
     std::chrono::milliseconds time_to_expire_ms)
 {
-    // The C++ SigV4 presigner skips signing when credentials are empty and returns an unsigned URL, which the server
-    // rejects as a bad password. Check first, so no unsigned token is sent. Credentials can disappear after
-    // construction, for example when an SSO session expires.
-    if (credentials_provider_->GetAWSCredentials().IsEmpty()) {
-        LOG(ERROR) << "No AWS credentials available for Aurora DSQL token generation";
+    // Check before signing, so an unusable token is never sent. Credentials can disappear or expire after
+    // construction, for example when an SSO session ends.
+    if (const std::string problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
+        LOG(ERROR) << problem;
         return {"", false};
     }
 
@@ -94,4 +108,9 @@ void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
         client_config.region = region;
     }
     dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(credentials_provider_, nullptr, client_config);
+}
+
+bool DsqlAuthProvider::HasResolvedCredentials() const
+{
+    return CredentialsProblem(credentials_provider_->GetAWSCredentials()).empty();
 }

@@ -47,7 +47,8 @@ public:
         bool use_cache = true,
         bool extra_url_encode = false,
         std::chrono::milliseconds time_to_expire_ms = DEFAULT_EXPIRATION_MS) override;
-    [[nodiscard]] bool HasResolvedCredentials() const override { return dsql_credentials_resolved_; }
+    // Checked against the provider on every call, so a handle recovers after `aws sso login` and stops at expiry.
+    [[nodiscard]] bool HasResolvedCredentials() const override;
 
     static inline const std::string ADMIN_USER = "admin";
 
@@ -56,7 +57,6 @@ private:
 
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider_;
     std::shared_ptr<Aws::DSQL::DSQLClient> dsql_client_;
-    bool dsql_credentials_resolved_ = true;
 };
 
 #endif // DSQL_AUTH_PROVIDER_H_

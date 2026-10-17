@@ -23,6 +23,25 @@
 #include "../../driver/host_info.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/plugin_service.h"
+#include "../../driver/dialect/dialect.h"
+#include "../../driver/driver.h"
+#include "../../driver/host_list_providers/rds_host_list_provider.h"
+#include "../../driver/util/rds_lib_loader.h"
+
+namespace {
+    const std::string DSQL_HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
+    const std::string PSQLODBC_PATH = "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so";
+
+    // Records every base-driver function the wrapper looks up, and returns nullptr so nothing is called.
+    class RecordingRdsLibLoader : public RdsLibLoader {
+    public:
+        FUNC_HANDLE GetFunction(const std::string& function_name) override {
+            requested_functions.push_back(function_name);
+            return nullptr;
+        }
+        std::vector<std::string> requested_functions;
+    };
+}  // namespace
 
 class PluginServiceTest : public testing::Test {
 protected:
@@ -103,4 +122,67 @@ TEST_F(PluginServiceTest, InitClusterId_Generated) {
     EXPECT_FALSE(returned_id.empty());
     std::string map_id = conn_info.at(KEY_CLUSTER_ID);
     EXPECT_EQ(map_id, returned_id);
+}
+
+TEST_F(PluginServiceTest, InitDialect_DsqlHostWithPsqlodbc) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, DSQL_HOST},
+        {KEY_DRIVER, PSQLODBC_PATH},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+TEST_F(PluginServiceTest, InitDialect_DsqlExplicit) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, "my-endpoint.example.com"},
+        {KEY_DATABASE_DIALECT, "aurora_dsql"},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+TEST_F(PluginServiceTest, InitDialect_ExplicitDialectWinsOverDsqlHost) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, DSQL_HOST},
+        {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_POSTGRESQL},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_POSTGRESQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+TEST_F(PluginServiceTest, InitDialect_PsqlodbcAuroraHost_Unchanged) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, "database-test-name.cluster-XYZ.us-east-2.rds.amazonaws.com"},
+        {KEY_DRIVER, PSQLODBC_PATH},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_POSTGRESQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+TEST_F(PluginServiceTest, DsqlDialect_Defaults) {
+    const std::map<std::string, std::string> conn_info = {{KEY_SERVER, DSQL_HOST}};
+    const std::shared_ptr<Dialect> dialect = PluginService::InitDialect(conn_info);
+    EXPECT_EQ(5432, dialect->GetDefaultPort());
+    EXPECT_EQ("", dialect->GetTopologyQuery());
+    EXPECT_TRUE(dialect->IsSqlStateAccessError("28P01", ""));
+    EXPECT_TRUE(dialect->IsSqlStateNetworkError("08006"));
+    EXPECT_FALSE(dialect->IsSqlStateNetworkError("40001"));
+}
+
+TEST_F(PluginServiceTest, InitHostListProvider_Dsql_NoTopologyMonitor) {
+    PluginService service(nullptr, nullptr, {{KEY_SERVER, DSQL_HOST}, {KEY_DRIVER, PSQLODBC_PATH}}, "");
+    service.InitHostListProvider();
+    const std::shared_ptr<HostListProvider> provider = service.GetHostListProvider();
+    ASSERT_NE(nullptr, provider);
+    EXPECT_EQ(nullptr, std::dynamic_pointer_cast<RdsHostListProvider>(provider));
+}
+
+TEST_F(PluginServiceTest, UpdateDialect_Dsql_SkipsTopologyQuery) {
+    const auto lib_loader = std::make_shared<RecordingRdsLibLoader>();
+    PluginService service(lib_loader, nullptr, {{KEY_SERVER, DSQL_HOST}}, "");
+    DBC dbc;
+    // Any non-null handle, so a topology query would get as far as allocating a statement.
+    dbc.wrapped_dbc = reinterpret_cast<SQLHDBC>(&dbc);
+
+    service.UpdateDialect(&dbc);
+
+    EXPECT_TRUE(lib_loader->requested_functions.empty());
+    dbc.wrapped_dbc = SQL_NULL_HDBC;
 }

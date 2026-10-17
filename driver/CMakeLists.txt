@@ -118,6 +118,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/windows_headers.h
 
     # Dialects
+    ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_dsql.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_mysql.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_postgres.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect.h

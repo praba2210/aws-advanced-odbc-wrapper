@@ -103,6 +103,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/concurrent_stack.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_keys.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.h
@@ -212,6 +213,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/aws_sdk_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cluster_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.cpp

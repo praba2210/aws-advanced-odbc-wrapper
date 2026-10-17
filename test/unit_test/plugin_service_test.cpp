@@ -186,3 +186,13 @@ TEST_F(PluginServiceTest, UpdateDialect_Dsql_SkipsTopologyQuery) {
     EXPECT_TRUE(lib_loader->requested_functions.empty());
     dbc.wrapped_dbc = SQL_NULL_HDBC;
 }
+
+// A custom DNS name or VPC endpoint doesn't match the DSQL pattern, but the auth type still says DSQL.
+TEST_F(PluginServiceTest, InitDialect_DsqlAuthTypeCustomHost) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, "db.internal.example.com"},
+        {KEY_DRIVER, PSQLODBC_PATH},
+        {KEY_AUTH_TYPE, "dsql"},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}

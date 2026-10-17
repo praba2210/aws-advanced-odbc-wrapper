@@ -43,6 +43,7 @@ enum AuthType : std::uint8_t {
     ADFS,
     OKTA,
     AWS_SSO,
+    DSQL,
     INVALID,
 };
 
@@ -53,6 +54,7 @@ static std::map<std::string, AuthType> const AUTH_TABLE = {
     {VALUE_AUTH_ADFS,       AuthType::ADFS},
     {VALUE_AUTH_OKTA,       AuthType::OKTA},
     {VALUE_AUTH_SSO,        AuthType::AWS_SSO},
+    {VALUE_AUTH_DSQL,       AuthType::DSQL},
 };
 
 struct TokenInfo {

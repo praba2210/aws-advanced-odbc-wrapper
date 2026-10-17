@@ -336,9 +336,11 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
             dialect = DatabaseDialectType::AURORA_POSTGRESQL_LIMITLESS;
         }
 
-        // Aurora DSQL has no topology. Detect it before the psqlODBC driver-name default (Aurora PostgreSQL)
-        // starts a topology monitor.
-        if (RdsUtils::IsDsqlDns(host)) {
+        // Aurora DSQL has no topology. Detect it, from the endpoint or the auth type, before the psqlODBC
+        // driver-name default (Aurora PostgreSQL) starts a topology monitor.
+        if (RdsUtils::IsDsqlDns(host)
+            || RDS_STR_UPPER(MapUtils::GetStringValue(conn_info, KEY_AUTH_TYPE, "")) == VALUE_AUTH_DSQL)
+        {
             dialect = DatabaseDialectType::AURORA_DSQL;
         }
     }

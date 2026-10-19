@@ -35,7 +35,9 @@ namespace {
         if (credentials.GetAWSAccessKeyId().empty() || credentials.GetAWSSecretKey().empty()) {
             return "No AWS credentials available for Aurora DSQL token generation";
         }
-        if (credentials.IsExpired()) {
+        // CRT-backed providers (profile, process) report "never expires" as UINT64_MAX seconds, which overflows the
+        // SDK's DateTime and reads as at or before 1970. Only an expiration after the epoch is a real one.
+        if (credentials.GetExpiration().Millis() > 0 && credentials.IsExpired()) {
             return "AWS credentials for Aurora DSQL token generation have expired. If they come from AWS IAM Identity "
                    "Center (SSO), run 'aws sso login'";
         }

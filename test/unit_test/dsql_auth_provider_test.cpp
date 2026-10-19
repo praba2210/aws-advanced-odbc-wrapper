@@ -19,16 +19,52 @@
 #include <aws/core/utils/DateTime.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 #include <string>
 
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/dsql_auth_provider.h"
+
+#ifndef AWS_PROFILE_TEST_RESOURCES_DIR
+    #error "AWS_PROFILE_TEST_RESOURCES_DIR must be defined by the build"
+#endif
 
 namespace {
     const std::string HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
     const std::string REGION = "us-east-1";
     const std::string PORT = "5432";
     const std::chrono::milliseconds EXPIRATION = std::chrono::seconds(900);
+
+    // Sets or unsets an environment variable for one scope and restores the old value afterwards.
+    class ScopedEnvVar {
+    public:
+        ScopedEnvVar(const char* name, const std::optional<std::string>& value) : name_(name) {
+            if (const char* old = std::getenv(name)) {
+                saved_ = old;
+            }
+            Set(value);
+        }
+        ~ScopedEnvVar() { Set(saved_); }
+        ScopedEnvVar(const ScopedEnvVar&) = delete;
+        ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+    private:
+        void Set(const std::optional<std::string>& value) const {
+#ifdef _WIN32
+            _putenv_s(name_, value ? value->c_str() : "");
+#else
+            if (value) {
+                setenv(name_, value->c_str(), 1);
+            } else {
+                unsetenv(name_);
+            }
+#endif
+        }
+
+        const char* name_;
+        std::optional<std::string> saved_;
+    };
 }  // namespace
 
 // DSQL tokens are presigned locally, so these tests run the real SDK with fake keys and never reach AWS.
@@ -140,4 +176,20 @@ TEST_F(DsqlAuthProviderTest, GetToken_MissingSecretKey_ReturnsEmpty) {
     DsqlAuthProvider provider(REGION, Aws::Auth::AWSCredentials("AKIDEXAMPLE", ""));
     EXPECT_FALSE(provider.HasResolvedCredentials());
     EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);
+}
+
+// Profile keys come through the CRT-backed ProfileCredentialsProvider, which reports "never expires" as UINT64_MAX
+// seconds. The SDK's DateTime overflows on that value, so the expiration reads as at or before 1970. Those
+// credentials are valid and must still sign.
+TEST_F(DsqlAuthProviderTest, ProfileStaticCredentials_AreResolved) {
+    const ScopedEnvVar credentials_file("AWS_SHARED_CREDENTIALS_FILE",
+        std::string(AWS_PROFILE_TEST_RESOURCES_DIR) + "/aws_credentials");
+    // CI exports role credentials; the environment provider would answer before the profile one.
+    const ScopedEnvVar access_key("AWS_ACCESS_KEY_ID", std::nullopt);
+    const ScopedEnvVar secret_key("AWS_SECRET_ACCESS_KEY", std::nullopt);
+    const ScopedEnvVar session_token("AWS_SESSION_TOKEN", std::nullopt);
+
+    DsqlAuthProvider provider(REGION, "dsql_static");
+    EXPECT_TRUE(provider.HasResolvedCredentials());
+    EXPECT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
 }

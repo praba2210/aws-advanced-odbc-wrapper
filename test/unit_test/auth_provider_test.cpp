@@ -72,6 +72,8 @@ TEST_F(AuthProviderTest, AuthTypeFromString_Test) {
     EXPECT_EQ(AuthType::OKTA, AuthProvider::AuthTypeFromString("OKTA"));
     EXPECT_EQ(AuthType::DATABASE, AuthProvider::AuthTypeFromString("database"));
     EXPECT_EQ(AuthType::DATABASE, AuthProvider::AuthTypeFromString("DATABASE"));
+    EXPECT_EQ(AuthType::DSQL, AuthProvider::AuthTypeFromString("dsql"));
+    EXPECT_EQ(AuthType::DSQL, AuthProvider::AuthTypeFromString("DSQL"));
     EXPECT_EQ(AuthType::INVALID, AuthProvider::AuthTypeFromString("garbage"));
     EXPECT_EQ(AuthType::INVALID, AuthProvider::AuthTypeFromString("unknown"));
 }

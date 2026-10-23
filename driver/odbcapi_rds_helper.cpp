@@ -25,6 +25,7 @@
 #include "plugin/blue_green/blue_green_plugin.h"
 #include "plugin/custom_endpoint/custom_endpoint_plugin.h"
 #include "plugin/default_plugin.h"
+#include "plugin/dsql/dsql_auth_plugin.h"
 #include "plugin/failover/failover_plugin.h"
 #include "plugin/federated/adfs_auth_plugin.h"
 #include "plugin/federated/aws_sso_auth_plugin.h"
@@ -2927,6 +2928,9 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
                             break;
                         case AuthType::AWS_SSO:
                             plugin_head = std::make_shared<AwsSsoAuthPlugin>(dbc, plugin_head);
+                            break;
+                        case AuthType::DSQL:
+                            plugin_head = std::make_shared<DsqlAuthPlugin>(dbc, plugin_head);
                             break;
                         case AuthType::DATABASE:
                         case AuthType::INVALID:

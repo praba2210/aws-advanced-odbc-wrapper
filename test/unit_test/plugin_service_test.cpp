@@ -196,16 +196,3 @@ TEST_F(PluginServiceTest, InitDialect_DsqlAuthTypeCustomHost) {
     };
     EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
 }
-
-// psqlODBC reports every failed libpq connect as 08001 with the server's message, so a rejected token is only
-// recognizable from the message. A plain connection failure must stay a non-access error.
-TEST_F(PluginServiceTest, DsqlDialect_PsqlodbcAuthFailureIsAccessError) {
-    const std::map<std::string, std::string> conn_info = {{KEY_SERVER, DSQL_HOST}};
-    const std::shared_ptr<Dialect> dialect = PluginService::InitDialect(conn_info);
-    EXPECT_TRUE(dialect->IsSqlStateAccessError("08001", "FATAL:  password authentication failed for user \"admin\""));
-    // What DSQL returns for a token it rejects (smoke run, 2026-10-19).
-    EXPECT_TRUE(dialect->IsSqlStateAccessError("08001",
-        "connection to server at \"x.dsql.us-east-1.on.aws\", port 5432 failed: FATAL:  unable to accept connection, "
-        "access denied\nDETAIL:  Session Id: abc\nHINT:  Credential should be scoped to a valid region."));
-    EXPECT_FALSE(dialect->IsSqlStateAccessError("08001", "could not translate host name to address"));
-}

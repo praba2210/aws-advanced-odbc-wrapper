@@ -35,18 +35,6 @@ public:
         });
     };
 
-    bool IsSqlStateAccessError(const char* sql_state, const std::string& error_message) override {
-        if (IsSqlStateAccessError(sql_state)) {
-            return true;
-        }
-        // psqlODBC reports every failed libpq connect as 08001 (connection exception) with the server's message,
-        // so a rejected token is only recognizable from the message.
-        return !error_message.empty()
-            && (error_message.find("unable to accept connection, access denied") != std::string::npos
-                || error_message.find("PAM authentication failed") != std::string::npos
-                || error_message.find("password authentication failed") != std::string::npos);
-    };
-
     bool IsSqlStateNetworkError(const char* sql_state) override {
         const std::string state(sql_state);
         return std::ranges::any_of(NETWORK_ERRORS, [&state](const std::string &prefix) {
@@ -57,7 +45,7 @@ public:
 private:
     const int DEFAULT_DSQL_PORT = 5432;
 
-    // Same classes as Aurora PostgreSQL. A rejected DSQL token arrives as 08001 with "access denied" in the message.
+    // Same classes as Aurora PostgreSQL.
     const std::vector<std::string> ACCESS_ERRORS = {
         "28P01",
         "28000",

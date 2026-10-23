@@ -36,7 +36,7 @@ namespace {
         dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
         return SQL_ERROR;
     }
-}  // namespace
+}
 
 BaseTokenAuthPlugin::BaseTokenAuthPlugin(
     DBC* dbc,

@@ -43,6 +43,8 @@ protected:
     virtual std::string ResolveRegion(DBC* dbc);
     virtual bool EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error);
     virtual bool RefreshCredentials(DBC* dbc, const std::string& region);
+    // Called when the base driver rejects the connect, with the error it reported. Does nothing by default.
+    virtual void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) {}
 
     // NOLINTBEGIN(misc-non-private-member-variables-in-classes)
     std::shared_ptr<AuthProvider> auth_provider_;

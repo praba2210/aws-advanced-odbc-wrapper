@@ -187,6 +187,21 @@ TEST_F(PluginServiceTest, UpdateDialect_Dsql_SkipsTopologyQuery) {
     dbc.wrapped_dbc = SQL_NULL_HDBC;
 }
 
+// An unrecognized driver name gets the base dialect, which has no topology query either. It used to run that empty
+// query; now nothing is looked up.
+TEST_F(PluginServiceTest, UpdateDialect_BaseDialect_SkipsTopologyQuery) {
+    const auto lib_loader = std::make_shared<RecordingRdsLibLoader>();
+    PluginService service(lib_loader, nullptr, {{KEY_SERVER, "db.internal.example.com"}}, "");
+    ASSERT_EQ(DatabaseDialectType::UNKNOWN_DIALECT, service.GetDialect()->GetDialectType());
+    DBC dbc;
+    dbc.wrapped_dbc = reinterpret_cast<SQLHDBC>(&dbc);
+
+    service.UpdateDialect(&dbc);
+
+    EXPECT_TRUE(lib_loader->requested_functions.empty());
+    dbc.wrapped_dbc = SQL_NULL_HDBC;
+}
+
 // A custom DNS name or VPC endpoint doesn't match the DSQL pattern, but the auth type still says DSQL.
 TEST_F(PluginServiceTest, InitDialect_DsqlAuthTypeCustomHost) {
     const std::map<std::string, std::string> conn_info = {

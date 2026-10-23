@@ -255,6 +255,21 @@ TEST_F(DsqlAuthPluginTest, Connect_AccessError_NoSecondToken) {
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
 }
 
+// Missing or expired credentials fail the connect before signing, so no token the server would reject is sent.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ(dbc_->err->native_err, ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication", dbc_->err->error_msg);
+}
+
 namespace {
     const std::string EXPECTED_APP_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
 }  // namespace

@@ -1,0 +1,5 @@
+[default]
+region = eu-north-1
+
+[profile env_profile]
+region = ap-northeast-2

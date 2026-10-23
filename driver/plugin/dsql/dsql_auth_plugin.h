@@ -45,8 +45,14 @@ public:
     // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes. Public for tests.
     static void ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr);
 
+    // A hint for a connect that failed on the server certificate while relying on sslrootcert=system, or "" when the
+    // error has nothing to do with it. Public for tests.
+    static std::string GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
+                                       const std::string& error_message);
+
 protected:
     std::string ResolveRegion(DBC* dbc) override;
+    void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;
 };
 
 #endif // DSQL_AUTH_PLUGIN_H_

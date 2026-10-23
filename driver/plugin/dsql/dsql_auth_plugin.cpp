@@ -35,6 +35,10 @@ namespace {
     const std::string PG_KEY_PQOPT_SHORT = "D5";
 
     const std::string SSLMODE_VERIFY_FULL = "verify-full";
+    const std::string SSLMODE_VERIFY_CA = "verify-ca";
+    const std::string SSLMODE_REQUIRE = "require";
+    const std::string SYSTEM_ROOT_CERT = "sslrootcert=system";
+    const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
 
@@ -43,8 +47,32 @@ namespace {
         return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
     }
 
-    // pqopt is a brace-quoted libpq conninfo string. Add each option the user didn't set; keep theirs.
-    std::string MergePqopt(std::string pqopt)
+    // Aurora DSQL rejects plaintext. Verify the server by default, as the Go, .NET, PHP, Ruby and Rust connectors do.
+    // verify-ca and require still encrypt, and a PrivateLink endpoint's own DNS name can't pass verify-full, so they
+    // stay. Any other mode becomes verify-full. psqlODBC reads the mode's first letter case-sensitively, so the
+    // result is lowercase.
+    std::string ResolveSslMode(const std::string& requested_mode)
+    {
+        const std::string requested_upper = RDS_STR_UPPER(requested_mode);
+        for (const std::string& mode : {SSLMODE_VERIFY_FULL, SSLMODE_VERIFY_CA, SSLMODE_REQUIRE}) {
+            if (requested_upper == RDS_STR_UPPER(mode)) {
+                if (mode == SSLMODE_REQUIRE) {
+                    LOG(WARNING) << "[DSQL] SSLmode=require encrypts but doesn't verify the server certificate";
+                } else if (mode == SSLMODE_VERIFY_CA) {
+                    LOG(WARNING) << "[DSQL] SSLmode=verify-ca verifies the server certificate but not its host name";
+                }
+                return mode;
+            }
+        }
+        if (!requested_mode.empty()) {
+            LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
+        }
+        return SSLMODE_VERIFY_FULL;
+    }
+
+    // pqopt is a brace-quoted libpq conninfo string. Add each option the user didn't set; keep theirs. libpq rejects
+    // sslrootcert=system with any mode weaker than verify-full, so it's only a default for verify-full.
+    std::string MergePqopt(std::string pqopt, const std::string& ssl_mode)
     {
         if (pqopt.size() >= 2 && pqopt.front() == '{' && pqopt.back() == '}') {
             pqopt = pqopt.substr(1, pqopt.size() - 2);
@@ -54,9 +82,18 @@ namespace {
                 pqopt += (pqopt.empty() ? "" : " ") + name + "=" + value;
             }
         };
-        add_if_missing("sslrootcert", "system");
+        if (ssl_mode == SSLMODE_VERIFY_FULL) {
+            add_if_missing("sslrootcert", "system");
+        }
         add_if_missing("application_name", APPLICATION_NAME);
         return "{" + pqopt + "}";
+    }
+
+    // pqopt, or its short form D5 when only that one is set.
+    const std::string& PqoptKey(const std::map<std::string, std::string>& conn_attr)
+    {
+        return (!conn_attr.contains(PG_KEY_PQOPT) && conn_attr.contains(PG_KEY_PQOPT_SHORT)) ? PG_KEY_PQOPT_SHORT
+                                                                                             : PG_KEY_PQOPT;
     }
 
     std::string GetEnvRegion()
@@ -69,20 +106,36 @@ namespace {
         return "";
     }
 
-    // REGION, then the region in a DSQL endpoint, then AWS_REGION / AWS_DEFAULT_REGION (the order most DSQL
-    // connectors use), then the AWS_PROFILE region. There is no default region: an empty result fails the connect
-    // with "Missing required parameters: Region".
+    // The profile the credentials come from: the AWS_PROFILE key, else the AWS_PROFILE variable, else "default". This
+    // is the SDK's profile provider order; it doesn't read AWS_DEFAULT_PROFILE.
+    std::string GetCredentialsProfile(DBC* dbc)
+    {
+        if (std::string profile = MapUtils::GetStringValue(dbc->conn_attr, KEY_AWS_PROFILE, ""); !profile.empty()) {
+            return profile;
+        }
+        if (const char* value = std::getenv("AWS_PROFILE"); value && value[0] != '\0') {
+            return value;
+        }
+        return DEFAULT_PROFILE;
+    }
+
+    // REGION, then the region in the DSQL endpoint being signed (IAM_HOST, then SERVER: behind a PrivateLink
+    // endpoint without private DNS, SERVER is the endpoint's own name), then AWS_REGION / AWS_DEFAULT_REGION (the
+    // order most DSQL connectors use), then the region of the credentials' profile. There is no default region: an
+    // empty result fails the connect with "Missing required parameters: Region".
     std::string ResolveDsqlRegion(DBC* dbc)
     {
         std::string region = MapUtils::GetStringValue(dbc->conn_attr, KEY_REGION, "");
-        if (region.empty()) {
-            region = RdsUtils::GetDsqlRegion(MapUtils::GetStringValue(dbc->conn_attr, KEY_SERVER, ""));
+        for (const char* host_key : {KEY_IAM_HOST, KEY_SERVER}) {
+            if (region.empty()) {
+                region = RdsUtils::GetDsqlRegion(MapUtils::GetStringValue(dbc->conn_attr, host_key, ""));
+            }
         }
         if (region.empty()) {
             region = GetEnvRegion();
         }
         if (region.empty()) {
-            region = AuthProvider::GetRegionForProfile(MapUtils::GetStringValue(dbc->conn_attr, KEY_AWS_PROFILE, ""));
+            region = AuthProvider::GetRegionForProfile(GetCredentialsProfile(dbc));
         }
         return region;
     }
@@ -130,26 +183,50 @@ SQLRETURN DsqlAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
 }
 
+void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message)
+{
+    if (const std::string hint = GetRootCertHint(dbc->conn_attr, error_message); !hint.empty()) {
+        LOG(WARNING) << hint;
+    }
+}
+
 void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr)
 {
-    // Aurora DSQL rejects plaintext. Always verify the server, as the Go, .NET, PHP, Ruby and Rust connectors do;
-    // only the root certificate stays user-settable, through pqopt.
-    const std::string requested_mode = MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
-        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
-    if (!requested_mode.empty() && RDS_STR_UPPER(requested_mode) != RDS_STR_UPPER(SSLMODE_VERIFY_FULL)) {
-        LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
-    }
+    const std::string ssl_mode = ResolveSslMode(MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
+        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, "")));
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
-    conn_attr.insert_or_assign(PG_KEY_SSLMODE, SSLMODE_VERIFY_FULL);
+    conn_attr.insert_or_assign(PG_KEY_SSLMODE, ssl_mode);
 
-    if (!ContainsAny(conn_attr, {KEY_DB_USERNAME, ALIAS_KEY_USERNAME_1, ALIAS_KEY_USERNAME_2})) {
-        conn_attr.insert_or_assign(KEY_DB_USERNAME, DsqlAuthProvider::ADMIN_USER);
+    // A connection string keeps USER and USERNAME as typed (only DSN entries are mapped to UID), but the token is
+    // signed for UID. Move an alias to UID, so psqlODBC also gets a single user name.
+    for (const char* alias : {ALIAS_KEY_USERNAME_1, ALIAS_KEY_USERNAME_2}) {
+        if (const auto it = conn_attr.find(alias); it != conn_attr.end()) {
+            conn_attr.try_emplace(KEY_DB_USERNAME, it->second);
+            conn_attr.erase(it);
+        }
     }
+    conn_attr.try_emplace(KEY_DB_USERNAME, DsqlAuthProvider::ADMIN_USER);
     if (!ContainsAny(conn_attr, {KEY_DATABASE, PG_KEY_DATABASE_SHORT})) {
         conn_attr.insert_or_assign(KEY_DATABASE, DEFAULT_DATABASE);
     }
 
-    const std::string& pqopt_key =
-        (!conn_attr.contains(PG_KEY_PQOPT) && conn_attr.contains(PG_KEY_PQOPT_SHORT)) ? PG_KEY_PQOPT_SHORT : PG_KEY_PQOPT;
-    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, "")));
+    const std::string& pqopt_key = PqoptKey(conn_attr);
+    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode));
+}
+
+std::string DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
+                                            const std::string& error_message)
+{
+    // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". On Windows it means
+    // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against. A host
+    // name mismatch isn't matched: the roots worked there.
+    const std::string pqopt = MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), "");
+    const bool root_cert_error = error_message.find("root certificate file \"system\"") != std::string::npos
+        || error_message.find("certificate verify failed") != std::string::npos;
+    if (pqopt.find(SYSTEM_ROOT_CERT) == std::string::npos || !root_cert_error) {
+        return "";
+    }
+    return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
+           "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
+           "AmazonRootCA1.pem>} instead.";
 }

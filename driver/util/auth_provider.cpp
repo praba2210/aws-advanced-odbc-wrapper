@@ -39,7 +39,10 @@ AuthProvider::AuthProvider(const std::string &region) {
 AuthProvider::AuthProvider(const std::string &region, const std::string &profile) {
     AwsSdkHelper::Init();
     if (profile.empty()) {
-        SetUpRdsClient(Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials(), region);
+        // With no credentials the SDK returns an unsigned token, which the server rejects as a bad password.
+        const Aws::Auth::AWSCredentials credentials = Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials();
+        credentials_resolved_ = !credentials.IsEmpty();
+        SetUpRdsClient(credentials, region);
         return;
     }
     // Resolve credentials for profile from static access keys, AWS IAM Identity Center (SSO),
@@ -135,6 +138,11 @@ std::pair<std::string, bool> AuthProvider::GetToken(
     }
     const std::string aws_token =
         rds_client_->GenerateConnectAuthToken(server.c_str(), region.c_str(), parsed_port.value(), username.c_str());
+    if (aws_token.empty()) {
+        // Not cached: the next connect asks the SDK again.
+        LOG(ERROR) << "The AWS SDK returned an empty token for " << server << ":" << port << " in region " << region;
+        return {"", false};
+    }
     token_info.token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
     {
         const std::lock_guard<std::recursive_mutex> lock_guard(token_cache_mutex_);

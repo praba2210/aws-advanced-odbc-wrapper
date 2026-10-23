@@ -24,6 +24,20 @@
 #include "../util/plugin_service.h"
 #include "../util/rds_utils.h"
 
+namespace {
+    // Providers return an empty token when generation fails. Connecting anyway would only surface a misleading
+    // "password authentication failed" from the server.
+    SQLRETURN FailTokenGeneration(DBC* dbc, const std::string& plugin_name)
+    {
+        const std::string error_msg = "Failed to generate " + plugin_name
+            + " authentication token. See the driver log for the cause.";
+        LOG(ERROR) << error_msg;
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        return SQL_ERROR;
+    }
+}
+
 BaseTokenAuthPlugin::BaseTokenAuthPlugin(
     DBC* dbc,
     std::shared_ptr<BasePlugin> next_plugin,
@@ -119,6 +133,9 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
 
     std::pair<std::string, bool> token = auth_provider_->GetToken(
         iam_host, region, port, username, true, extra_url_encode, token_expiration);
+    if (token.first.empty()) {
+        return FailTokenGeneration(dbc, plugin_name_);
+    }
     const bool is_cached_token = token.second;
 
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
@@ -153,6 +170,9 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
 
     token = auth_provider_->GetToken(
         iam_host, region, port, username, false, extra_url_encode, token_expiration);
+    if (token.first.empty()) {
+        return FailTokenGeneration(dbc, plugin_name_);
+    }
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
     ret = ConnectNext(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);

@@ -15,7 +15,11 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "auth_mock_objects.h"
 
@@ -139,4 +143,47 @@ TEST_F(AuthProviderTest, GetToken_Expired) {
     EXPECT_FALSE(token_info_second.second);
 
     EXPECT_NE(token_info_first.first, token_info_second.first);
+}
+
+// An empty token from the SDK must not be cached: the next connect asks the SDK again instead of failing for the
+// token's whole lifetime.
+TEST_F(AuthProviderTest, GetToken_EmptySdkToken_IsNotCached) {
+    std::string server = "host.com", region = "us-west-1", port = "1234", username = "my-user";
+    EXPECT_CALL(*mock_rds_client_, GenerateConnectAuthToken(testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(2))
+        .WillOnce(testing::Return(""))
+        .WillOnce(testing::Return("token"));
+
+    AuthProvider auth_provider(mock_rds_client_);
+    EXPECT_EQ(std::make_pair(std::string(""), false), auth_provider.GetToken(server, region, port, username));
+    EXPECT_EQ(std::make_pair(std::string("token"), false), auth_provider.GetToken(server, region, port, username));
+}
+
+// With nothing in the default chain the SDK signs nothing, and the server would reject the unsigned token as a bad
+// password. The provider must say the credentials are missing instead.
+TEST_F(AuthProviderTest, Constructor_DefaultChainWithoutCredentials_IsUnresolved) {
+    const char* const cleared[] = {
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
+        "AWS_EC2_METADATA_DISABLED"};
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+    for (const char* name : cleared) {
+        const char* value = std::getenv(name);
+        saved.emplace_back(name, value ? std::optional<std::string>(value) : std::nullopt);
+    }
+    for (const char* name : cleared) {
+        SetEnvVar(name, "");
+    }
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
+    SetEnvVar("AWS_CONFIG_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
+    SetEnvVar("AWS_EC2_METADATA_DISABLED", "true");
+
+    const AuthProvider auth_provider("us-west-1", "");
+    const bool resolved = auth_provider.HasResolvedCredentials();
+
+    for (const auto& [name, value] : saved) {
+        SetEnvVar(name.c_str(), value.value_or(""));
+    }
+    EXPECT_FALSE(resolved);
 }

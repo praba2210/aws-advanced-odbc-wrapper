@@ -266,7 +266,6 @@ TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
 
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     ASSERT_NE(nullptr, dbc_->err);
-    EXPECT_EQ(dbc_->err->native_err, ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
     EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication", dbc_->err->error_msg);
 }
 

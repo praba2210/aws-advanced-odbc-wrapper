@@ -76,12 +76,13 @@ bool IamAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std::
     }
 
     const std::string profile = MapUtils::GetStringValue(dbc->conn_attr, KEY_AWS_PROFILE, "");
-    std::string msg = "Unable to resolve AWS credentials for the '" + std::string(KEY_AWS_PROFILE) + "' profile";
-    if (!profile.empty()) {
-        msg += " '" + profile + "'";
+    if (profile.empty()) {
+        out_error = "Unable to resolve AWS credentials from the default credential chain (such as environment "
+                    "variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container or "
+                    "instance role)";
+        return false;
     }
-    msg += ". If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login";
-    msg += profile.empty() ? "'." : (" --profile " + profile + "'.");
-    out_error = msg;
+    out_error = "Unable to resolve AWS credentials for the '" + std::string(KEY_AWS_PROFILE) + "' profile '" + profile
+        + "'. If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile " + profile + "'.";
     return false;
 }

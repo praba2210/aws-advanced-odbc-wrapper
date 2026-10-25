@@ -85,8 +85,26 @@ TEST_F(IamAuthPluginTest, Connect_SSO_CredentialFail) {
     IamAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
     SQLRETURN ret = plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT);
     EXPECT_EQ(SQL_ERROR, ret);
-    EXPECT_EQ(dbc_->err->native_err, ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+    EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
     EXPECT_NE(std::string(dbc_->err->error_msg).find("aws sso login"), std::string::npos);
+}
+
+// With no AWS_PROFILE key the credentials come from the default chain, so the error names that, not a profile.
+TEST_F(IamAuthPluginTest, Connect_DefaultChain_CredentialFail) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_)).Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_)).Times(testing::Exactly(0));
+
+    IamAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
+    EXPECT_STREQ("Unable to resolve AWS credentials from the default credential chain (such as environment "
+        "variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container or instance role)",
+        dbc_->err->error_msg);
 }
 
 TEST_F(IamAuthPluginTest, Connect_Success) {
@@ -253,7 +271,7 @@ TEST_F(IamAuthPluginTest, Connect_EmptyToken_Fails) {
     IamAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
-    EXPECT_EQ(dbc_->err->native_err, ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+    EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
     EXPECT_STREQ("Failed to generate IAM authentication token. See the driver log for the cause.",
         dbc_->err->error_msg);
 }
@@ -276,6 +294,7 @@ TEST_F(IamAuthPluginTest, Connect_CacheHit_AccessError_EmptyFreshToken_Fails) {
     IamAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_, mock_dialect_, mock_odbc_helper_);
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
     EXPECT_STREQ("Failed to generate IAM authentication token. See the driver log for the cause.",
         dbc_->err->error_msg);
 }

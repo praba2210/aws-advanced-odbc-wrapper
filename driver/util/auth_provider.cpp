@@ -31,17 +31,17 @@
 #include "number_utils.h"
 #include "plugin_service.h"
 
-AuthProvider::AuthProvider(const std::string &region) {
-    AwsSdkHelper::Init();
-    SetUpRdsClient(Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials(), region);
-}
+AuthProvider::AuthProvider(const std::string &region) : AuthProvider(region, "") {}
 
 AuthProvider::AuthProvider(const std::string &region, const std::string &profile) {
     AwsSdkHelper::Init();
     if (profile.empty()) {
         // With no credentials the SDK returns an unsigned token, which the server rejects as a bad password.
         const Aws::Auth::AWSCredentials credentials = Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials();
-        credentials_resolved_ = !credentials.IsEmpty();
+        if (credentials.IsEmpty()) {
+            credentials_resolved_ = false;
+            LOG(ERROR) << "Unable to resolve AWS credentials from the default credential chain";
+        }
         SetUpRdsClient(credentials, region);
         return;
     }

@@ -25,6 +25,10 @@
 #include "../util/rds_utils.h"
 
 namespace {
+    // 28000, not 08001: the dialects count 08 as a network error, which the initial connection strategy retries until
+    // its timeout. Missing credentials or a failed token don't recover on a retry.
+    constexpr SQL_STATE_CODE CREDENTIAL_ERROR = ERR_INVALID_AUTHORIZATION_SPECIFICATION;
+
     // Providers return an empty token when generation fails. Connecting anyway would only surface a misleading
     // "password authentication failed" from the server.
     SQLRETURN FailTokenGeneration(DBC* dbc, const std::string& plugin_name)
@@ -33,7 +37,7 @@ namespace {
             + " authentication token. See the driver log for the cause.";
         LOG(ERROR) << error_msg;
         ClearError(dbc);
-        dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), CREDENTIAL_ERROR);
         return SQL_ERROR;
     }
 }
@@ -127,7 +131,7 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
     if (std::string credential_error; !EnsureCredentials(dbc, region, credential_error)) {
         LOG(ERROR) << credential_error;
         ClearError(dbc);
-        dbc->err = std::make_unique<ErrInfo>(credential_error.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        dbc->err = std::make_unique<ErrInfo>(credential_error.c_str(), CREDENTIAL_ERROR);
         return SQL_ERROR;
     }
 

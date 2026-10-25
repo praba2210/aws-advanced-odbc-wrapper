@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include <aws/core/config/ConfigAndCredentialsCacheManager.h>
+
 #include "auth_mock_objects.h"
 
 #include "../../driver/util/auth_provider.h"
@@ -42,8 +44,61 @@ namespace {
 #endif
     }
 
+    void UnsetEnvVar(const char* name) {
+#ifdef _WIN32
+        _putenv_s(name, "");  // An empty value removes the variable on Windows.
+#else
+        unsetenv(name);
+#endif
+    }
+
     const std::string TEST_RESOURCE_DIR = AWS_PROFILE_TEST_RESOURCES_DIR;
     const std::string TEST_CONFIG_FILE = TEST_RESOURCE_DIR + "/aws_config";
+
+    constexpr const char* DEFAULT_CHAIN_VARS[] = {
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
+        "AWS_EC2_METADATA_DISABLED"};
+
+    // Leaves the default chain nothing to find while in scope: no credential variables, no credentials or config
+    // file, and no IMDS. Restores every variable when the scope ends, unsetting the ones that weren't set.
+    class NoDefaultChainCredentials {
+    public:
+        NoDefaultChainCredentials() {
+            for (const char* name : DEFAULT_CHAIN_VARS) {
+                const char* value = std::getenv(name);
+                saved_.emplace_back(name, value ? std::optional<std::string>(value) : std::nullopt);
+                UnsetEnvVar(name);
+            }
+            SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
+            SetEnvVar("AWS_CONFIG_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
+            SetEnvVar("AWS_EC2_METADATA_DISABLED", "true");
+            ReloadCachedFiles();
+        }
+        ~NoDefaultChainCredentials() {
+            for (const auto& [name, value] : saved_) {
+                if (value) {
+                    SetEnvVar(name.c_str(), *value);
+                } else {
+                    UnsetEnvVar(name.c_str());
+                }
+            }
+            ReloadCachedFiles();
+        }
+        NoDefaultChainCredentials(const NoDefaultChainCredentials&) = delete;
+        NoDefaultChainCredentials& operator=(const NoDefaultChainCredentials&) = delete;
+
+    private:
+        // The SSO and web identity providers read the files cached when the SDK started, so a developer's own
+        // ~/.aws/config could still supply credentials. Reload the cache from the files the variables now name.
+        static void ReloadCachedFiles() {
+            Aws::Config::ReloadCachedConfigFile();
+            Aws::Config::ReloadCachedCredentialsFile();
+        }
+
+        std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+    };
 }
 
 class AuthProviderTest : public testing::Test {
@@ -162,28 +217,23 @@ TEST_F(AuthProviderTest, GetToken_EmptySdkToken_IsNotCached) {
 // With nothing in the default chain the SDK signs nothing, and the server would reject the unsigned token as a bad
 // password. The provider must say the credentials are missing instead.
 TEST_F(AuthProviderTest, Constructor_DefaultChainWithoutCredentials_IsUnresolved) {
-    const char* const cleared[] = {
-        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_DEFAULT_PROFILE",
-        "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CONFIG_FILE",
-        "AWS_EC2_METADATA_DISABLED"};
-    std::vector<std::pair<std::string, std::optional<std::string>>> saved;
-    for (const char* name : cleared) {
-        const char* value = std::getenv(name);
-        saved.emplace_back(name, value ? std::optional<std::string>(value) : std::nullopt);
-    }
-    for (const char* name : cleared) {
-        SetEnvVar(name, "");
-    }
-    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
-    SetEnvVar("AWS_CONFIG_FILE", TEST_RESOURCE_DIR + "/does_not_exist");
-    SetEnvVar("AWS_EC2_METADATA_DISABLED", "true");
-
+    const NoDefaultChainCredentials no_credentials;
     const AuthProvider auth_provider("us-west-1", "");
-    const bool resolved = auth_provider.HasResolvedCredentials();
+    EXPECT_FALSE(auth_provider.HasResolvedCredentials());
+}
 
-    for (const auto& [name, value] : saved) {
-        SetEnvVar(name.c_str(), value.value_or(""));
-    }
-    EXPECT_FALSE(resolved);
+// The region-only constructor reads the same default chain.
+TEST_F(AuthProviderTest, Constructor_RegionOnlyWithoutCredentials_IsUnresolved) {
+    const NoDefaultChainCredentials no_credentials;
+    const AuthProvider auth_provider("us-west-1");
+    EXPECT_FALSE(auth_provider.HasResolvedCredentials());
+}
+
+// Credentials anywhere in the default chain, here the environment, still count as resolved.
+TEST_F(AuthProviderTest, Constructor_DefaultChainWithEnvCredentials_IsResolved) {
+    const NoDefaultChainCredentials no_credentials;
+    SetEnvVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    const AuthProvider auth_provider("us-west-1", "");
+    EXPECT_TRUE(auth_provider.HasResolvedCredentials());
 }

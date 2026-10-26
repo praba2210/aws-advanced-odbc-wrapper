@@ -86,18 +86,19 @@ public:
 
     static std::string GetPort(DBC* dbc);
     static std::string GetRegionForProfile(const std::string &profile);
-    [[nodiscard]] virtual bool HasResolvedCredentials() const { return credentials_resolved_; }
-    // Reads the credentials again from the chain this provider was built with, the default chain or a profile's,
-    // and returns whether they resolved. A provider built from explicit credentials or a client has no chain.
-    // Reads at most once per MIN_RELOAD_INTERVAL, counting the constructor's read.
-    virtual bool ReloadCredentials(const std::string &region);
-    // For tests.
-    void SetMinReloadInterval(const std::chrono::milliseconds interval) { min_reload_interval_ = interval; }
+    // Credentials read from a chain also count as unresolved once they expire.
+    [[nodiscard]] virtual bool HasResolvedCredentials() const { return CredentialsUsable(); }
+    // Returns whether the credentials are resolved. If they aren't, first reads them again from the chain this
+    // provider was built with, the default chain or a profile's. A provider built from explicit credentials, a client
+    // or the default constructor has no chain and never reads.
+    // Reads at most once per interval, counting the constructor's read. The interval starts at MIN_RELOAD_INTERVAL_MS,
+    // doubles after each read that finds no usable credentials, up to MAX_RELOAD_INTERVAL_MS, and starts over after a
+    // read that finds them. While another thread reads, returns false without reading.
+    // Credentials it finds update this class's RDS client; an override of UpdateAwsCredential isn't called.
+    [[nodiscard]] virtual bool ReloadCredentials(const std::string &region);
 
     static inline const std::chrono::milliseconds
         DEFAULT_EXPIRATION_MS = std::chrono::minutes(15);
-    // A chain read can wait seconds on IMDS, STS or credential_process, and the monitors connect every 100 ms.
-    static inline const std::chrono::milliseconds MIN_RELOAD_INTERVAL = std::chrono::seconds(5);
     static AuthType AuthTypeFromString(const std::string& auth_type);
     static std::string BuildCacheKey(
         const std::string &server,
@@ -107,7 +108,19 @@ public:
     static void ClearCache();
 
 protected:
+    // For tests. Setting the minimum also restarts the current interval from it.
+    void SetMinReloadInterval(std::chrono::milliseconds interval);
+    void SetMaxReloadInterval(std::chrono::milliseconds interval);
+
 private:
+    // A chain read can wait seconds on IMDS, STS or credential_process, and the monitors connect every 100 ms.
+    static inline const std::chrono::milliseconds MIN_RELOAD_INTERVAL_MS = std::chrono::seconds(5);
+    // A read can run credential_process or sign in to STS or SSO again, and a monitor connects for as long as the
+    // connection handle lives. Reads don't stop, so a handle recovers once the credentials are back, for example after
+    // aws sso login or an IMDS outage.
+    static inline const std::chrono::milliseconds MAX_RELOAD_INTERVAL_MS = std::chrono::minutes(2);
+
+    [[nodiscard]] bool CredentialsUsable() const;
     void SetUpRdsClient(const Aws::Auth::AWSCredentials& credentials, const std::string &region);
     static inline std::unordered_map<std::string, TokenInfo> token_cache_;
     static inline std::recursive_mutex token_cache_mutex_;
@@ -117,9 +130,15 @@ private:
     std::atomic<bool> credentials_resolved_{true};
     // The profile of the chain the credentials came from ("" for the default chain), if they came from one.
     std::optional<std::string> chain_profile_;
+    // When the credentials read from the chain expire, in milliseconds since the epoch. The RDS client keeps a copy,
+    // and chain credentials are often temporary (SSO, assume-role, IMDS).
+    std::atomic<std::int64_t> chain_expiration_ms_{0};
+    // One chain read at a time. Guards the members below.
     std::mutex reload_mutex_;
     std::chrono::steady_clock::time_point last_chain_read_;
-    std::chrono::milliseconds min_reload_interval_ = MIN_RELOAD_INTERVAL;
+    std::chrono::milliseconds min_reload_interval_ = MIN_RELOAD_INTERVAL_MS;
+    std::chrono::milliseconds max_reload_interval_ = MAX_RELOAD_INTERVAL_MS;
+    std::chrono::milliseconds reload_interval_ = MIN_RELOAD_INTERVAL_MS;
 };
 
 #endif // AUTH_PROVIDER_H_

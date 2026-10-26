@@ -128,6 +128,7 @@ TEST_F(AwsSsoAuthPluginTest, Connect_Fail_LoginReturnsNoCredentials) {
     AwsSsoAuthPlugin plugin(dbc_, mock_base_plugin_, mock_login_util_, nullptr, mock_dialect_, mock_odbc_helper_);
     SQLRETURN ret = plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT);
     EXPECT_EQ(SQL_ERROR, ret);
+    EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
 }
 
 TEST_F(AwsSsoAuthPluginTest, Connect_Fail_MissingParams) {

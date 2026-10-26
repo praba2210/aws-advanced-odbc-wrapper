@@ -15,11 +15,13 @@
 #ifndef AUTH_PROVIDER_H_
 #define AUTH_PROVIDER_H_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 
 #include "aws_sdk_helper.h"
@@ -85,9 +87,17 @@ public:
     static std::string GetPort(DBC* dbc);
     static std::string GetRegionForProfile(const std::string &profile);
     [[nodiscard]] virtual bool HasResolvedCredentials() const { return credentials_resolved_; }
+    // Reads the credentials again from the chain this provider was built with, the default chain or a profile's,
+    // and returns whether they resolved. A provider built from explicit credentials or a client has no chain.
+    // Reads at most once per MIN_RELOAD_INTERVAL, counting the constructor's read.
+    virtual bool ReloadCredentials(const std::string &region);
+    // For tests.
+    void SetMinReloadInterval(const std::chrono::milliseconds interval) { min_reload_interval_ = interval; }
 
     static inline const std::chrono::milliseconds
         DEFAULT_EXPIRATION_MS = std::chrono::minutes(15);
+    // A chain read can wait seconds on IMDS, STS or credential_process, and the monitors connect every 100 ms.
+    static inline const std::chrono::milliseconds MIN_RELOAD_INTERVAL = std::chrono::seconds(5);
     static AuthType AuthTypeFromString(const std::string& auth_type);
     static std::string BuildCacheKey(
         const std::string &server,
@@ -101,8 +111,15 @@ private:
     void SetUpRdsClient(const Aws::Auth::AWSCredentials& credentials, const std::string &region);
     static inline std::unordered_map<std::string, TokenInfo> token_cache_;
     static inline std::recursive_mutex token_cache_mutex_;
+    // The monitor threads share one provider, so the client is swapped and read under this lock.
+    std::mutex rds_client_mutex_;
     std::shared_ptr<Aws::RDS::RDSClient> rds_client_;
-    bool credentials_resolved_ = true;
+    std::atomic<bool> credentials_resolved_{true};
+    // The profile of the chain the credentials came from ("" for the default chain), if they came from one.
+    std::optional<std::string> chain_profile_;
+    std::mutex reload_mutex_;
+    std::chrono::steady_clock::time_point last_chain_read_;
+    std::chrono::milliseconds min_reload_interval_ = MIN_RELOAD_INTERVAL;
 };
 
 #endif // AUTH_PROVIDER_H_

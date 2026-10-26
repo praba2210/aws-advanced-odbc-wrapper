@@ -15,9 +15,12 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -236,4 +239,102 @@ TEST_F(AuthProviderTest, Constructor_DefaultChainWithEnvCredentials_IsResolved) 
     SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
     const AuthProvider auth_provider("us-west-1", "");
     EXPECT_TRUE(auth_provider.HasResolvedCredentials());
+}
+
+// A first read that found nothing isn't final: reading the chain again picks up credentials that appeared since.
+TEST_F(AuthProviderTest, ReloadCredentials_DefaultChain_ResolvesOnceCredentialsAppear) {
+    const NoDefaultChainCredentials no_credentials;
+    AuthProvider auth_provider("us-west-1", "");
+    auth_provider.SetMinReloadInterval(std::chrono::milliseconds(0));
+    ASSERT_FALSE(auth_provider.HasResolvedCredentials());
+    EXPECT_FALSE(auth_provider.ReloadCredentials("us-west-1"));
+    EXPECT_FALSE(auth_provider.HasResolvedCredentials());
+
+    SetEnvVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    EXPECT_TRUE(auth_provider.ReloadCredentials("us-west-1"));
+    EXPECT_TRUE(auth_provider.HasResolvedCredentials());
+    // The token is signed with the credentials just read, not with the empty ones from the first read.
+    const std::string token = auth_provider.GetToken("host.com", "us-west-1", "5432", "my-user", false).first;
+    EXPECT_NE(std::string::npos, token.find("X-Amz-Credential=AKIDEXAMPLE"));
+}
+
+// Connect reloads on every attempt while the credentials are missing, so reads are spaced out. The constructor's
+// read counts: the first connect right after it doesn't read the chain again.
+TEST_F(AuthProviderTest, ReloadCredentials_WithinInterval_DoesNotReadTheChain) {
+    const NoDefaultChainCredentials no_credentials;
+    AuthProvider auth_provider("us-west-1", "");
+    SetEnvVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    EXPECT_FALSE(auth_provider.ReloadCredentials("us-west-1"));
+    EXPECT_FALSE(auth_provider.HasResolvedCredentials());
+
+    auth_provider.SetMinReloadInterval(std::chrono::milliseconds(0));
+    EXPECT_TRUE(auth_provider.ReloadCredentials("us-west-1"));
+}
+
+// Threads that share a provider can all find the credentials missing. Once one of them resolves them, the others
+// don't read the chain again.
+TEST_F(AuthProviderTest, ReloadCredentials_AlreadyResolved_DoesNotReadTheChain) {
+    const NoDefaultChainCredentials no_credentials;
+    SetEnvVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    AuthProvider auth_provider("us-west-1", "");
+    ASSERT_TRUE(auth_provider.HasResolvedCredentials());
+
+    UnsetEnvVar("AWS_ACCESS_KEY_ID");
+    UnsetEnvVar("AWS_SECRET_ACCESS_KEY");
+    EXPECT_TRUE(auth_provider.ReloadCredentials("us-west-1"));  // Within the interval.
+    auth_provider.SetMinReloadInterval(std::chrono::milliseconds(0));
+    EXPECT_TRUE(auth_provider.ReloadCredentials("us-west-1"));  // Past it.
+    EXPECT_TRUE(auth_provider.HasResolvedCredentials());
+}
+
+// The monitor threads share one provider, so a thread can sign while another updates the credentials. Every token
+// must come from a complete client, the old one or the new one.
+TEST_F(AuthProviderTest, GetToken_WhileCredentialsUpdate_SignsWithACompleteClient) {
+    const NoDefaultChainCredentials no_credentials;  // Keeps the client configuration away from IMDS.
+    AuthProvider auth_provider("us-west-1", Aws::Auth::AWSCredentials("AKIDOLD", "old-secret-key"));
+    std::atomic<bool> done = false;
+    std::atomic<int> tokens = 0;
+    std::atomic<int> unsigned_tokens = 0;
+    std::vector<std::thread> signers;
+    for (int i = 0; i < 4; ++i) {
+        signers.emplace_back([&] {
+            while (!done) {
+                const std::string token =
+                    auth_provider.GetToken("host.com", "us-west-1", "5432", "my-user", false).first;
+                ++tokens;
+                if (token.find("X-Amz-Credential=AKID") == std::string::npos) {
+                    ++unsigned_tokens;
+                }
+            }
+        });
+    }
+    while (tokens == 0) {
+        std::this_thread::yield();
+    }
+    const int tokens_before_updates = tokens;
+    for (int i = 0; i < 50; ++i) {
+        auth_provider.UpdateAwsCredential(
+            Aws::Auth::AWSCredentials(i % 2 == 0 ? "AKIDNEW" : "AKIDOLD", "test-secret-key"), "us-west-1");
+    }
+    const int tokens_during_updates = tokens - tokens_before_updates;
+    done = true;
+    for (std::thread& signer : signers) {
+        signer.join();
+    }
+    EXPECT_GT(tokens_during_updates, 0);
+    EXPECT_EQ(0, unsigned_tokens.load());
+}
+
+// The federated plugins build the provider from credentials they fetched themselves, so there is no chain to read.
+// The chain has credentials here, so a provider that read it by mistake would resolve.
+TEST_F(AuthProviderTest, ReloadCredentials_ExplicitCredentials_ReturnsFalse) {
+    const NoDefaultChainCredentials no_credentials;
+    SetEnvVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    SetEnvVar("AWS_SECRET_ACCESS_KEY", "test-secret-key");
+    AuthProvider auth_provider("us-west-1", Aws::Auth::AWSCredentials());
+    EXPECT_FALSE(auth_provider.ReloadCredentials("us-west-1"));
+    EXPECT_FALSE(auth_provider.HasResolvedCredentials());
 }

@@ -51,6 +51,7 @@ public:
         std::chrono::milliseconds time_to_expire_ms), ());
 
     MOCK_METHOD(void, UpdateAwsCredential, (const Aws::Auth::AWSCredentials &credentials, const std::string &region), ());
+    MOCK_METHOD(bool, ReloadCredentials, (const std::string &region), (override));
 
     bool mock_has_resolved_credentials = true;
     bool HasResolvedCredentials() const override { return mock_has_resolved_credentials; }

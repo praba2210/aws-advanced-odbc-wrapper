@@ -71,7 +71,9 @@ std::string IamAuthPlugin::ResolveRegion(DBC* dbc)
 
 bool IamAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error)
 {
-    if (auth_provider_ && auth_provider_->HasResolvedCredentials()) {
+    // The provider lasts as long as the connection handle, so read the credentials again before failing. The first
+    // read can miss them briefly (an IMDS timeout), or an SSO session can be renewed since.
+    if (auth_provider_ && (auth_provider_->HasResolvedCredentials() || auth_provider_->ReloadCredentials(region))) {
         return true;
     }
 

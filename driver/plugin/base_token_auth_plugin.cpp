@@ -26,7 +26,8 @@
 
 namespace {
     // 28000, not 08001: the dialects count 08 as a network error, which the initial connection strategy retries until
-    // its timeout. Missing credentials or a failed token don't recover on a retry.
+    // its timeout. Most of these failures can't pass on a retry, and for ADFS and Okta each retry is another sign-in
+    // to the identity provider.
     constexpr SQL_STATE_CODE CREDENTIAL_ERROR = ERR_INVALID_AUTHORIZATION_SPECIFICATION;
 
     // Providers return an empty token when generation fails. Connecting anyway would only surface a misleading

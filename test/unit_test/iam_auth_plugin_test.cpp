@@ -76,6 +76,7 @@ TEST_F(IamAuthPluginTest, Connect_MissingParam) {
 TEST_F(IamAuthPluginTest, Connect_SSO_CredentialFail) {
     mock_auth_provider_->mock_has_resolved_credentials = false;
     dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "sso-test");
+    EXPECT_CALL(*mock_auth_provider_, ReloadCredentials(REGION)).WillOnce(testing::Return(false));
 
     EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
         testing::_, testing::_, testing::_)).Times(testing::Exactly(0));
@@ -92,6 +93,7 @@ TEST_F(IamAuthPluginTest, Connect_SSO_CredentialFail) {
 // With no AWS_PROFILE key the credentials come from the default chain, so the error names that, not a profile.
 TEST_F(IamAuthPluginTest, Connect_DefaultChain_CredentialFail) {
     mock_auth_provider_->mock_has_resolved_credentials = false;
+    EXPECT_CALL(*mock_auth_provider_, ReloadCredentials(REGION)).WillOnce(testing::Return(false));
 
     EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
         testing::_, testing::_, testing::_)).Times(testing::Exactly(0));
@@ -105,6 +107,21 @@ TEST_F(IamAuthPluginTest, Connect_DefaultChain_CredentialFail) {
     EXPECT_STREQ("Unable to resolve AWS credentials from the default credential chain (such as environment "
         "variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container or instance role)",
         dbc_->err->error_msg);
+}
+
+// The provider lasts as long as the connection handle, so credentials missing at first are read again before the
+// connect fails: the first read can miss them briefly (an IMDS timeout), or an SSO session can be renewed since.
+TEST_F(IamAuthPluginTest, Connect_UnresolvedCredentials_ReloadSucceeds_Connects) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    EXPECT_CALL(*mock_auth_provider_, ReloadCredentials(REGION)).WillOnce(testing::Return(true));
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(std::pair<std::string, bool>("token", false)));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+
+    IamAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
 }
 
 TEST_F(IamAuthPluginTest, Connect_Success) {

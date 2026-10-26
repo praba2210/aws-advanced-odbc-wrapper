@@ -80,6 +80,8 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/okta_auth_plugin.h
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/saml_util.h
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.h
+    ## DSQL
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.h
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.h
     ## Secrets Manager
@@ -103,6 +105,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/concurrent_stack.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_keys.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.h
@@ -118,6 +121,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/windows_headers.h
 
     # Dialects
+    ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_dsql.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_mysql.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect_aurora_postgres.h
     ${CMAKE_CURRENT_SOURCE_DIR}/dialect/dialect.h
@@ -191,6 +195,8 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/okta_auth_plugin.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/saml_util.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.cpp
+    ## DSQL
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.cpp
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.cpp
     ## Secrets Manager
@@ -211,6 +217,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/aws_sdk_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cluster_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.cpp
@@ -364,7 +371,7 @@ if(USE_ASAN)
 endif()
 
 # Link External Library ------------------------------------------------------------------------------------------
-list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc)
+list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc dsql)
 if(MSVC)
     set(OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_BUILD_TYPE})
 else()
@@ -398,7 +405,7 @@ endif()
 
 # Copy External Dependencies -------------------------------------------------------------------------------------
 if(MSVC)
-    list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc)
+    list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc dsql)
     AWSSDK_CPY_DYN_LIBS(SERVICE_LIST "" ${OUTPUT_DIR})
 else()
     set(CMAKE_BUILD_WITH_INSTALL_RPATH true)

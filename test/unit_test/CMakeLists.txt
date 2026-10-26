@@ -42,6 +42,8 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_stack_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/connection_string_helper_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/custom_endpoint_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_provider_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/failover_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/highest_weight_host_selector_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/iam_auth_plugin_test.cpp
@@ -101,7 +103,7 @@ endif()
 set(AWS_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../aws_sdk/install")
 list(APPEND CMAKE_PREFIX_PATH ${AWS_SDK_DIR})
 
-find_package(AWSSDK REQUIRED COMPONENTS core rds secretsmanager sts sso sso-oidc)
+find_package(AWSSDK REQUIRED COMPONENTS core rds secretsmanager sts sso sso-oidc dsql)
 list(APPEND EXTERNAL_LIBRARIES ${AWSSDK_LINK_LIBRARIES})
 
 # -- ODBC --
@@ -194,5 +196,5 @@ else()
 endif()
 message("Copying Libraries to: ${OUTPUT_DIR}")
 
-list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc)
+list(APPEND SERVICE_LIST rds secretsmanager sts sso sso-oidc dsql)
 AWSSDK_CPY_DYN_LIBS(SERVICE_LIST "" ${OUTPUT_DIR})

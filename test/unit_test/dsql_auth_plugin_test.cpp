@@ -669,3 +669,56 @@ TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBefo
     EXPECT_FALSE(env.driver_lib_loader);
     dbc_->env = nullptr;
 }
+
+// libpq keywords are whole words: fallback_application_name isn't application_name, and a path that mentions
+// sslrootcert isn't the sslrootcert option.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptMatchesWholeKeywords) {
+    std::map<std::string, std::string> conn_attr = {
+        {"PQOPT", "{fallback_application_name=etl sslcert=/certs/sslrootcert-client.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{fallback_application_name=etl sslcert=/certs/sslrootcert-client.pem sslrootcert=system "
+              "application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// A single-quoted value can hold spaces and '=' (PrivateLink: options='-c amzn-cluster-id=<id>'); nothing inside it
+// is a keyword. Spaces around '=' are allowed.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptSkipsQuotedValues) {
+    std::map<std::string, std::string> conn_attr = {
+        {"PQOPT", "{options='-c sslrootcert=x' application_name = 'billing app'}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{options='-c sslrootcert=x' application_name = 'billing app' sslrootcert=system}", conn_attr.at("PQOPT"));
+}
+
+// A connection string value keeps the spaces typed around it; they must not stop the braces from being unwrapped.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptTrimsSpaces) {
+    std::map<std::string, std::string> conn_attr = {{"PQOPT", "  { sslrootcert=/etc/ssl/corp-ca.pem }  "}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{sslrootcert=/etc/ssl/corp-ca.pem application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// A Windows path typed with backslashes stays as typed (libpq reads a backslash as an escape; the page says to use
+// forward slashes) and is still the user's sslrootcert: a sslrootcert=system after it would win, because libpq keeps
+// the last of a repeated keyword.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptKeepsBackslashPath) {
+    std::map<std::string, std::string> conn_attr = {{"PQOPT", "{sslrootcert=C:\\certs\\AmazonRootCA1.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{sslrootcert=C:\\certs\\AmazonRootCA1.pem application_name=" + EXPECTED_APP_NAME + "}",
+              conn_attr.at("PQOPT"));
+}
+
+// The hint needs the sslrootcert value to be exactly "system", however the option is spaced.
+TEST_F(DsqlAuthPluginTest, RootCertHint_MatchesTheSystemValueOnly) {
+    const std::string error = "SSL error: certificate verify failed";
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint({{"PQOPT", "{sslrootcert=system_roots.pem}"}}, error));
+    EXPECT_NE("", DsqlAuthPlugin::GetRootCertHint({{"PQOPT", "{sslrootcert = system}"}}, error));
+}
+
+// On Windows, libpq can report OpenSSL's "unregistered scheme" for sslrootcert=system (DSQL user guide, Configuring
+// SSL/TLS certificates, Windows).
+TEST_F(DsqlAuthPluginTest, RootCertHint_WindowsUnregisteredScheme) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr,
+        "connection to server at \"x.dsql.us-east-1.on.aws\" (10.0.0.1), port 5432 failed: SSL error: unregistered scheme");
+    EXPECT_NE(std::string_view::npos, hint.find("pqopt={sslrootcert="));
+}

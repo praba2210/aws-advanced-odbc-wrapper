@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <map>
 #include <string>
+#include <string_view>
 
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_auth_provider.h"
@@ -39,12 +40,15 @@ namespace {
     const std::string SSLMODE_VERIFY_FULL = "verify-full";
     const std::string SSLMODE_VERIFY_CA = "verify-ca";
     const std::string SSLMODE_REQUIRE = "require";
-    const std::string SYSTEM_ROOT_CERT = "sslrootcert=system";
+    const std::string ROOT_CERT_KEYWORD = "sslrootcert";
+    const std::string SYSTEM_ROOT_CERT = "system";
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
     // An Aurora DSQL cluster ID, as .NET, Go, PHP, Ruby and Rust test it: 26 letters or digits.
     constexpr size_t CLUSTER_ID_LENGTH = 26;
+    // The characters libpq's isspace() skips between conninfo options.
+    constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";
 
     bool ContainsAny(const std::map<std::string, std::string>& conn_attr, std::initializer_list<std::string> keys)
     {
@@ -88,23 +92,104 @@ namespace {
         return SSLMODE_VERIFY_FULL;
     }
 
+    bool IsConninfoSpace(char c)
+    {
+        return CONNINFO_SPACES.find(c) != std::string_view::npos;
+    }
+
+    std::string_view TrimSpaces(std::string_view text)
+    {
+        const size_t first = text.find_first_not_of(CONNINFO_SPACES);
+        if (first == std::string_view::npos) {
+            return {};
+        }
+        return text.substr(first, text.find_last_not_of(CONNINFO_SPACES) - first + 1);
+    }
+
+    // The options of a libpq conninfo string ("keyword = value ..."), read as libpq's conninfo_parse reads them: a value
+    // may be single-quoted, and a backslash escapes the next character. Keywords are case-sensitive, and the last of a
+    // repeated keyword wins. A malformed string yields what parses; libpq reports the error itself.
+    std::map<std::string, std::string> ParseConninfo(std::string_view conninfo)
+    {
+        std::map<std::string, std::string> options;
+        size_t pos = 0;
+        const auto skip_spaces = [&conninfo, &pos]() {
+            while (pos < conninfo.size() && IsConninfoSpace(conninfo[pos])) {
+                ++pos;
+            }
+        };
+        while (true) {
+            skip_spaces();
+            if (pos >= conninfo.size()) {
+                break;
+            }
+            const size_t keyword_start = pos;
+            while (pos < conninfo.size() && conninfo[pos] != '=' && !IsConninfoSpace(conninfo[pos])) {
+                ++pos;
+            }
+            const std::string keyword(conninfo.substr(keyword_start, pos - keyword_start));
+            skip_spaces();
+            if (pos < conninfo.size() && conninfo[pos] == '=') {
+                ++pos;
+            }
+            skip_spaces();
+            const bool quoted = pos < conninfo.size() && conninfo[pos] == '\'';
+            if (quoted) {
+                ++pos;
+            }
+            std::string value;
+            while (pos < conninfo.size()) {
+                const char c = conninfo[pos++];
+                if (c == '\\') {
+                    if (pos < conninfo.size()) {
+                        value += conninfo[pos++];
+                    }
+                    continue;
+                }
+                if (quoted ? c == '\'' : IsConninfoSpace(c)) {
+                    break;
+                }
+                value += c;
+            }
+            options.insert_or_assign(keyword, value);
+        }
+        return options;
+    }
+
+    // The conninfo string inside pqopt's braces. A connection string value keeps the spaces typed around it.
+    std::string_view UnwrapPqopt(std::string_view pqopt)
+    {
+        pqopt = TrimSpaces(pqopt);
+        if (pqopt.size() >= 2 && pqopt.front() == '{' && pqopt.back() == '}') {
+            pqopt = TrimSpaces(pqopt.substr(1, pqopt.size() - 2));
+        }
+        return pqopt;
+    }
+
     // pqopt is a brace-quoted libpq conninfo string. Add each option the user didn't set; keep theirs. libpq rejects
     // sslrootcert=system with any mode weaker than verify-full, so it's only a default for verify-full.
-    std::string MergePqopt(std::string pqopt, const std::string& ssl_mode)
+    std::string MergePqopt(const std::string& pqopt, const std::string& ssl_mode)
     {
-        if (pqopt.size() >= 2 && pqopt.front() == '{' && pqopt.back() == '}') {
-            pqopt = pqopt.substr(1, pqopt.size() - 2);
-        }
-        const auto add_if_missing = [&pqopt](const std::string& name, const std::string& value) {
-            if (pqopt.find(name) == std::string::npos) {
-                pqopt += (pqopt.empty() ? "" : " ") + name + "=" + value;
+        const std::string_view conninfo = UnwrapPqopt(pqopt);
+        const std::map<std::string, std::string> options = ParseConninfo(conninfo);
+        std::string merged(conninfo);
+        const auto add_if_missing = [&options, &merged](const std::string& keyword, const std::string& value) {
+            if (!options.contains(keyword)) {
+                merged += (merged.empty() ? "" : " ") + keyword + "=" + value;
             }
         };
         if (ssl_mode == SSLMODE_VERIFY_FULL) {
-            add_if_missing("sslrootcert", "system");
+            add_if_missing(ROOT_CERT_KEYWORD, SYSTEM_ROOT_CERT);
         }
         add_if_missing("application_name", APPLICATION_NAME);
-        return "{" + pqopt + "}";
+        return "{" + merged + "}";
+    }
+
+    bool UsesSystemRootCert(const std::string& pqopt)
+    {
+        const std::map<std::string, std::string> options = ParseConninfo(UnwrapPqopt(pqopt));
+        const auto it = options.find(ROOT_CERT_KEYWORD);
+        return it != options.end() && it->second == SYSTEM_ROOT_CERT;
     }
 
     // pqopt, or its short form D5 when only that one is set.
@@ -237,12 +322,13 @@ std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std
                                                  const std::string& error_message)
 {
     // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". On Windows it means
-    // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against. A host
-    // name mismatch isn't matched: the roots worked there.
-    const std::string pqopt = MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), "");
+    // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against; there
+    // libpq can also report OpenSSL's "unregistered scheme" (DSQL user guide). A host name mismatch isn't matched: the
+    // roots worked there.
     const bool root_cert_error = error_message.find("root certificate file \"system\"") != std::string::npos
-        || error_message.find("certificate verify failed") != std::string::npos;
-    if (pqopt.find(SYSTEM_ROOT_CERT) == std::string::npos || !root_cert_error) {
+        || error_message.find("certificate verify failed") != std::string::npos
+        || error_message.find("unregistered scheme") != std::string::npos;
+    if (!root_cert_error || !UsesSystemRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
         return "";
     }
     return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "

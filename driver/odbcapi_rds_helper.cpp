@@ -1518,7 +1518,10 @@ SQLRETURN RDS_SQLGetDiagField(
             {
                 env = static_cast<ENV*>(Handle);
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
-                if (env->wrapped_env) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                if (env->err && env->err->sqlstate && env->err->error_msg) {
+                    err.emplace(*env->err);
+                } else if (env->wrapped_env) {
 #if UNICODE
                     const auto odbc_helper = RDS_GetOdbcHelper(nullptr, env);
                     if (odbc_helper && odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1639,7 +1642,10 @@ SQLRETURN RDS_SQLGetDiagField(
 
                 const std::lock_guard<std::recursive_mutex> lock_guard(desc->lock);
 
-                if (desc->wrapped_desc) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                if (desc->err && desc->err->sqlstate && desc->err->error_msg) {
+                    err.emplace(*desc->err);
+                } else if (desc->wrapped_desc) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1804,7 +1810,10 @@ SQLRETURN RDS_SQLGetDiagField(
             }
 
             // Pass info back to caller. BufferLength and *StringLengthPtr count bytes of the caller's characters.
-            if (char_value) {
+            if (BufferLength < 0 && OdbcHelper::IsStringDiagField(DiagIdentifier)) {
+                // A string field needs a BufferLength of 0 or more; nothing is written.
+                ret = SQL_ERROR;
+            } else if (char_value) {
                 len = strlen(char_value);
 #ifdef UNICODE
                 // A W caller reads SQLWCHARs (4 bytes each for a 4-byte SQLWCHAR app), as RDS_SQLGetDiagRec writes.

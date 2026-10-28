@@ -492,3 +492,59 @@ TEST_F(ErrorHandlingTest, DiagField_SubclassOriginFollowsTheSqlstate) {
         static_cast<SQLSMALLINT>(sizeof(origin)), nullptr));
     EXPECT_EQ("ISO 9075", AppText(origin));
 }
+
+// The environment and descriptor handles read the wrapper's record first too. Through a driver manager the wrapper's
+// ENV and DESC records come only from a function the base driver doesn't export; the order is the same everywhere.
+TEST_F(ErrorHandlingTest, DiagField_EnvWrapperRecordBeforeBaseDriver) {
+    int fake_handle = 0;
+    env_->wrapped_env = &fake_handle;  // never called through
+    env_->err = std::make_unique<ErrInfo>("SQLCancelHandle ENV - API Unsupported",
+        ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+    const std::string expected(env_->err->sqlstate);
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_ENV, env_, 1, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+    EXPECT_EQ(expected, AppText(state));
+    EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagField(SQL_HANDLE_ENV, env_, 2, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+
+    env_->wrapped_env = SQL_NULL_HENV;
+}
+
+TEST_F(ErrorHandlingTest, DiagField_DescWrapperRecordBeforeBaseDriver) {
+    int fake_handle = 0;
+    desc_->wrapped_desc = &fake_handle;  // never called through
+    desc_->err = std::make_unique<ErrInfo>("SQLCancelHandle DESC - API Unsupported",
+        ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+    const std::string expected(desc_->err->sqlstate);
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DESC, desc_, 1, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+    EXPECT_EQ(expected, AppText(state));
+
+    SQLINTEGER native = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DESC, desc_, 1, SQL_DIAG_NATIVE, &native, 0, nullptr));
+    EXPECT_EQ(static_cast<SQLINTEGER>(ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED), native);
+
+    desc_->wrapped_desc = SQL_NULL_HDESC;
+}
+
+// A string field with a negative BufferLength is an error and nothing is written; an integer field ignores it.
+TEST_F(ErrorHandlingTest, DiagField_NegativeBufferLengthIsAnError) {
+    stmt_->err = std::make_unique<ErrInfo>("SQLExecDirect - Connection not open", ERR_CONNECTION_NOT_OPEN);
+
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLSMALLINT length = 77;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_MESSAGE_TEXT, message, -1, &length));
+    EXPECT_EQ(0, message[0]);
+    EXPECT_EQ(77, length);
+
+    // Also for a string field the record has no value for (no SERVER here).
+    EXPECT_EQ(SQL_ERROR, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SERVER_NAME, message, -1, &length));
+
+    SQLINTEGER native = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_NATIVE, &native, -1, nullptr));
+    EXPECT_EQ(static_cast<SQLINTEGER>(ERR_CONNECTION_NOT_OPEN), native);
+}

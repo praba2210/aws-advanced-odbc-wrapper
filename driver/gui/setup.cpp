@@ -294,6 +294,7 @@ const std::vector<std::pair<std::string, std::string>> DB_DIALECTS = {
     {"Aurora MySQL", VALUE_DB_DIALECT_AURORA_MYSQL},
     {"Multi-AZ PostgreSQL", VALUE_DB_DIALECT_MULTI_AZ_PG},
     {"Multi-AZ MySQL", VALUE_DB_DIALECT_MULTI_AZ_MYSQL},
+    {"Aurora DSQL", VALUE_DB_DIALECT_AURORA_DSQL},
 };
 
 const std::vector<std::pair<std::string, std::string>> MFA_TYPES = {

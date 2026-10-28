@@ -91,11 +91,16 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     // The signature covers the host; DNS is case-insensitive, so sign the lowercase form.
     std::string host = server;
     std::ranges::transform(host, host.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto expires_in_s = std::chrono::duration_cast<std::chrono::seconds>(time_to_expire_ms).count();
+    // TOKEN_EXPIRATION=0 means the default lifetime, as in the Go connector: X-Amz-Expires=0 would make a token that
+    // has already expired.
+    std::chrono::seconds lifetime = std::chrono::duration_cast<std::chrono::seconds>(time_to_expire_ms);
+    if (lifetime <= std::chrono::seconds::zero()) {
+        lifetime = std::chrono::duration_cast<std::chrono::seconds>(DEFAULT_EXPIRATION_MS);
+    }
     const bool is_admin = username == ADMIN_USER;
     const auto outcome = is_admin
-        ? dsql_client_->GenerateDBConnectAdminAuthToken(host, region, expires_in_s)
-        : dsql_client_->GenerateDBConnectAuthToken(host, region, expires_in_s);
+        ? dsql_client_->GenerateDBConnectAdminAuthToken(host, region, lifetime.count())
+        : dsql_client_->GenerateDBConnectAuthToken(host, region, lifetime.count());
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};

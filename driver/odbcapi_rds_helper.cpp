@@ -890,6 +890,10 @@ SQLRETURN RDS_SQLConnect(
         return SQL_ERROR;
     }
 
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
+
 #ifdef UNICODE
     bool use_4_bytes_user_app = dbc->env->use_4_bytes_user_app.load();
 #endif
@@ -1095,6 +1099,10 @@ SQLRETURN RDS_SQLDriverConnect(
         LOG(ERROR) << "Connection handle is already has an existing connection";
         return SQL_ERROR;
     }
+
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
 
     // Parse connection string, load input DSN followed by Base DSN
     ConnectionStringHelper::ParseConnectionString(conn_str_utf8, dbc->conn_attr);

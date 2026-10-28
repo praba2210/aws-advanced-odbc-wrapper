@@ -960,3 +960,60 @@ TEST_F(ErrorHandlingTest, GetInfo_FourByteAppGetsFourByteCharacters) {
     env_->use_4_bytes_user_app = false;
 }
 #endif
+
+// A handle reused after SQLDisconnect (the Windows driver manager keeps the driver's handle for the next connect)
+// starts from the new connection string: nothing an earlier connect parsed or a plugin added carries over.
+TEST_F(ConnectPathTest, DriverConnect_ReusedHandleStartsFromTheNewString) {
+    plugin_->added = {{KEY_DB_PASSWORD, "token-from-the-first-connect"}, {"PQOPT", "{sslrootcert=system}"}};
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("first.example.com", ";UID=first_user"), nullptr, 0, nullptr));
+    plugin_->added.clear();
+
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("second.example.com"), nullptr, 0, nullptr));
+    ASSERT_EQ(2U, plugin_->seen.size());
+    const std::map<std::string, std::string>& second = plugin_->seen[1];
+    EXPECT_EQ("second.example.com", second.at(KEY_SERVER));
+    EXPECT_FALSE(second.contains(KEY_DB_USERNAME));
+    EXPECT_FALSE(second.contains(KEY_DB_PASSWORD));
+    EXPECT_FALSE(second.contains("PQOPT"));
+}
+
+// The same after a failed connect, where no SQLDisconnect comes in between.
+TEST_F(ConnectPathTest, DriverConnect_AfterAFailedConnectStartsFromTheNewString) {
+    plugin_->result = SQL_ERROR;
+    plugin_->added = {{"PQOPT", "{sslrootcert=system}"}};
+    EXPECT_EQ(SQL_ERROR, DriverConnect(dbc_, ConnStr("first.example.com", ";UID=first_user"), nullptr, 0, nullptr));
+    plugin_->result = SQL_SUCCESS;
+    plugin_->added.clear();
+
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("second.example.com"), nullptr, 0, nullptr));
+    ASSERT_EQ(2U, plugin_->seen.size());
+    EXPECT_FALSE(plugin_->seen[1].contains(KEY_DB_USERNAME));
+    EXPECT_FALSE(plugin_->seen[1].contains("PQOPT"));
+}
+
+// What the application set with SQLSetConnectAttr is kept: a driver manager that reuses the handle expects it.
+TEST_F(ConnectPathTest, DriverConnect_ReusedHandleKeepsConnectAttributes) {
+    const SQLPOINTER login_timeout = reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(7));
+    ASSERT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_LOGIN_TIMEOUT, login_timeout, 0));
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("first.example.com"), nullptr, 0, nullptr));
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("second.example.com"), nullptr, 0, nullptr));
+    ASSERT_TRUE(dbc_.attr_map.contains(SQL_ATTR_LOGIN_TIMEOUT));
+    EXPECT_EQ(login_timeout, dbc_.attr_map.at(SQL_ATTR_LOGIN_TIMEOUT).first);
+}
+
+// SQLConnect too. The DSN isn't registered, so nothing names a base driver and the connect fails before the plugin
+// chain; the earlier connect's BASE_DRIVER and SERVER used to carry it through.
+TEST_F(ConnectPathTest, Connect_ReusedHandleStartsFromItsArguments) {
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(dbc_, ConnStr("first.example.com"), nullptr, 0, nullptr));
+
+    std::vector<SQLTCHAR> dsn = AppString("no-such-dsn-connect-path-test");
+    std::vector<SQLTCHAR> user = AppString("second_user");
+    std::vector<SQLTCHAR> password = AppString("second_password");
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(&dbc_, dsn.data(), SQL_NTS, user.data(), SQL_NTS, password.data(), SQL_NTS));
+    EXPECT_EQ(1U, plugin_->seen.size());
+    EXPECT_FALSE(dbc_.conn_attr.contains(KEY_SERVER));
+    EXPECT_FALSE(dbc_.conn_attr.contains(KEY_BASE_DRIVER));
+    EXPECT_EQ("second_user", dbc_.conn_attr.at(KEY_DB_USERNAME));
+    ASSERT_TRUE(dbc_.err);
+    EXPECT_EQ(static_cast<int>(ERR_NO_UNDER_LYING_DRIVER), dbc_.err->native_err);
+}

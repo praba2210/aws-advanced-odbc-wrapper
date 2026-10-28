@@ -22,6 +22,7 @@
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/client/GenericClientConfiguration.h>
 #include <aws/dsql/DSQLClient.h>
 
 #include "aws_sdk_helper.h"
@@ -105,13 +106,22 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     return {token, false};
 }
 
-void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
+Aws::Client::GenericClientConfiguration DsqlAuthProvider::MakeClientConfiguration(const std::string &region)
 {
-    Aws::DSQL::DSQLClientConfiguration client_config;
+    // The token is signed for the region GetToken is given, so the client's own region never needs an IMDS lookup,
+    // which off EC2 waits for its timeouts. The credentials chain is separate and still reads IMDS for an instance role.
+    const Aws::Client::ClientConfigurationInitValues init_values{.shouldDisableIMDS = true};
+    Aws::DSQL::DSQLClientConfiguration client_config(init_values);
     if (!region.empty()) {
         client_config.region = region;
     }
-    dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(credentials_provider_, nullptr, client_config);
+    return client_config;
+}
+
+void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
+{
+    dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(
+        credentials_provider_, nullptr, MakeClientConfiguration(region));
 }
 
 bool DsqlAuthProvider::HasResolvedCredentials() const

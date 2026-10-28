@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/client/GenericClientConfiguration.h>
 #include <aws/core/utils/DateTime.h>
 
 #include <chrono>
@@ -199,4 +200,12 @@ TEST_F(DsqlAuthProviderTest, ProfileStaticCredentials_AreResolved) {
 // control block destroys the right type anyway; a unique_ptr<AuthProvider> or a delete through the base would not.
 TEST_F(DsqlAuthProviderTest, AuthProvider_HasVirtualDestructor) {
     EXPECT_TRUE(std::has_virtual_destructor_v<AuthProvider>);
+}
+
+// The token is signed for the region GetToken is given. Off EC2, the client's own IMDS region lookup only waits for
+// its timeouts on every new provider.
+TEST_F(DsqlAuthProviderTest, ClientConfiguration_DisablesImds) {
+    const Aws::Client::GenericClientConfiguration config = DsqlAuthProvider::MakeClientConfiguration("eu-west-1");
+    EXPECT_TRUE(config.disableIMDS);
+    EXPECT_EQ("eu-west-1", config.region);
 }

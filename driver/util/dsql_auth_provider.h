@@ -27,6 +27,9 @@ namespace Aws {
     namespace Auth {
         class AWSCredentialsProvider;
     }
+    namespace Client {
+        struct GenericClientConfiguration;
+    }
     namespace DSQL {
         class DSQLClient;
     }
@@ -51,6 +54,9 @@ public:
     [[nodiscard]] bool HasResolvedCredentials() const override;
 
     static inline const std::string ADMIN_USER = "admin";
+
+    // The DSQL client's configuration. Public for tests.
+    static Aws::Client::GenericClientConfiguration MakeClientConfiguration(const std::string &region);
 
 private:
     void SetUpDsqlClient(const std::string &region);

@@ -71,7 +71,7 @@ public:
     AuthProvider(const std::string &region, const std::string &profile);
     AuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials);
     explicit AuthProvider(const std::shared_ptr<Aws::RDS::RDSClient>& rds_client);
-    ~AuthProvider();
+    virtual ~AuthProvider();
 
     virtual std::pair<std::string, bool> GetToken(
         const std::string &server,

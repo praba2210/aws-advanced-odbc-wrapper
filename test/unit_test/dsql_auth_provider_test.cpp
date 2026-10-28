@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/dsql_auth_provider.h"
@@ -192,4 +193,10 @@ TEST_F(DsqlAuthProviderTest, ProfileStaticCredentials_AreResolved) {
     DsqlAuthProvider provider(REGION, "dsql_static");
     EXPECT_TRUE(provider.HasResolvedCredentials());
     EXPECT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
+}
+
+// AuthProvider has subclasses (DsqlAuthProvider, the test mocks) and is held through base pointers. make_shared's
+// control block destroys the right type anyway; a unique_ptr<AuthProvider> or a delete through the base would not.
+TEST_F(DsqlAuthProviderTest, AuthProvider_HasVirtualDestructor) {
+    EXPECT_TRUE(std::has_virtual_destructor_v<AuthProvider>);
 }

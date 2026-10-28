@@ -27,6 +27,7 @@
 #include "common_mock_objects.h"
 
 #include "../../driver/driver.h"
+#include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/connection_string_keys.h"
@@ -490,4 +491,181 @@ TEST_F(DsqlAuthPluginTest, Connect_EnvRegionIsLowercased) {
     SetEnvVar("AWS_REGION", "CA-CENTRAL-1");
     ExpectTokenForRegion("ca-central-1");
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+namespace {
+    const std::string CLUSTER_ID = "abcdefghijklmnopqrstuvwxyz";
+    const std::string NO_REGION_ERROR =
+        "DSQL Authentication failed. Region is required when host is a cluster ID (set 'REGION')";
+
+    std::map<std::string, std::string> DsqlAttributes(const std::string& server) {
+        return {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {KEY_SERVER, server}};
+    }
+}  // namespace
+
+// 8 of 9 connectors accept a bare cluster ID and connect to <id>.dsql.<region>.on.aws.
+TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_EQ("", error);
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_AuthTypeIsCaseInsensitive) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, "dsql"}, {KEY_SERVER, CLUSTER_ID},
+                                                    {KEY_REGION, "eu-west-1"}};
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromEnv) {
+    SetEnvVar("AWS_REGION", "ca-central-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ca-central-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// Containers and CI hosts often set only AWS_DEFAULT_REGION.
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromAwsDefaultRegion) {
+    SetEnvVar("AWS_DEFAULT_REGION", "ap-northeast-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ap-northeast-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromProfile) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dev");  // region = us-west-2 in the fixture
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.us-west-2.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The region in IAM_HOST's endpoint, the host the token is signed for, comes before the environment's.
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromIamHostEndpoint) {
+    SetEnvVar("AWS_REGION", "ca-central-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID + ".dsql.eu-west-1.on.aws");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The majority connectors' rule: no region, no endpoint. Nothing is changed.
+TEST_F(DsqlAuthPluginTest, ClusterId_NoRegion_Fails) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(NO_REGION_ERROR, error);
+    EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER));
+}
+
+// DNS is case-insensitive and region names are lowercase, so an uppercase ID or region still names the cluster.
+TEST_F(DsqlAuthPluginTest, ClusterId_UppercaseIdAndRegion_AreLowercased) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    conn_attr.insert_or_assign(KEY_REGION, "EU-WEST-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// Only exactly 26 letters or digits make a cluster ID. Anything else is a host name, left as typed, with no region.
+TEST_F(DsqlAuthPluginTest, ClusterId_OtherHosts_Unchanged) {
+    const std::vector<std::string> hosts = {CLUSTER_ID.substr(1), CLUSTER_ID + "0", "abcdefghijklmnopqrstuvwxy-",
+                                            "localhost", "10.0.0.1", "::1", CLUSTER_ID + ".dsql.us-east-1.on.aws", ""};
+    for (const std::string& host : hosts) {
+        std::map<std::string, std::string> conn_attr = DsqlAttributes(host);
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << host;
+        EXPECT_EQ(host, conn_attr.at(KEY_SERVER)) << host;
+        EXPECT_EQ("", error) << host;
+    }
+}
+
+// A cluster ID means a DSQL endpoint only under RDS_AUTH_TYPE=DSQL; under any other auth type it's a host name.
+TEST_F(DsqlAuthPluginTest, ClusterId_OtherAuthType_Unchanged) {
+    for (const std::string auth_type : {"IAM", "DATABASE", ""}) {
+        std::map<std::string, std::string> conn_attr = {{KEY_SERVER, CLUSTER_ID}, {KEY_REGION, "eu-west-1"}};
+        if (!auth_type.empty()) {
+            conn_attr.insert_or_assign(KEY_AUTH_TYPE, auth_type);
+        }
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << auth_type;
+        EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER)) << auth_type;
+    }
+}
+
+// PrivateLink without private DNS: SERVER is the endpoint's own name and the token is signed for IAM_HOST, which can be
+// a cluster ID too.
+TEST_F(DsqlAuthPluginTest, ClusterId_InIamHost_Expanded) {
+    const std::string vpce_host = "vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.ap-southeast-2.vpce.amazonaws.com";
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(vpce_host);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "ap-southeast-2");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ap-southeast-2.on.aws", conn_attr.at(KEY_IAM_HOST));
+    EXPECT_EQ(vpce_host, conn_attr.at(KEY_SERVER));
+}
+
+// The Windows dialog shows IAM Host for Aurora DSQL, so the cluster ID can end up in both fields.
+TEST_F(DsqlAuthPluginTest, ClusterId_InServerAndIamHost_BothExpanded) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_IAM_HOST));
+}
+
+// A reused connection handle keeps the expanded SERVER when the new connection string has none, so a second pass must
+// leave it alone.
+TEST_F(DsqlAuthPluginTest, ClusterId_AlreadyExpanded_Unchanged) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    ASSERT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    conn_attr.erase(KEY_REGION);
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The plugin service takes its host, cluster ID and dialect from SERVER, so the expansion runs first in
+// RDS_InitializeConnection: SERVER is expanded even though loading the base driver fails afterwards.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ExpandsClusterIdFirst) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", dbc_->conn_attr.at(KEY_SERVER));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("IM003", dbc_->err->sqlstate);
+    EXPECT_EQ(nullptr, dbc_->plugin_service);
+    dbc_->env = nullptr;
+}
+
+// Without a region the connect fails with 08001 before the base driver is loaded (that would be IM003 here).
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBeforeLoadingTheDriver) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("08001", dbc_->err->sqlstate);
+    EXPECT_EQ(NO_REGION_ERROR, std::string(dbc_->err->error_msg));
+    EXPECT_FALSE(env.driver_lib_loader);
+    dbc_->env = nullptr;
 }

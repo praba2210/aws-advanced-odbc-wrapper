@@ -43,6 +43,8 @@ namespace {
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
+    // An Aurora DSQL cluster ID, as .NET, Go, PHP, Ruby and Rust test it: 26 letters or digits.
+    constexpr size_t CLUSTER_ID_LENGTH = 26;
 
     bool ContainsAny(const std::map<std::string, std::string>& conn_attr, std::initializer_list<std::string> keys)
     {
@@ -53,6 +55,14 @@ namespace {
     {
         std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return text;
+    }
+
+    // Letters match in any case, as the endpoint pattern does; the expansion lowercases them.
+    bool IsClusterId(const std::string& host)
+    {
+        return host.size() == CLUSTER_ID_LENGTH && std::ranges::all_of(host, [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        });
     }
 
     // Aurora DSQL rejects plaintext. Verify the server by default, as the Go, .NET, PHP, Ruby and Rust connectors do.
@@ -238,4 +248,41 @@ std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std
     return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
            "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
            "AmazonRootCA1.pem>} instead.";
+}
+
+bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error)
+{
+    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
+        return true;
+    }
+    std::string region;
+    for (const char* key : {KEY_SERVER, KEY_IAM_HOST}) {
+        const auto it = conn_attr.find(key);
+        if (it == conn_attr.end() || !IsClusterId(it->second)) {
+            continue;
+        }
+        if (region.empty()) {
+            region = ResolveDsqlRegion(conn_attr);
+        }
+        if (region.empty()) {
+            out_error = "DSQL Authentication failed. Region is required when host is a cluster ID (set '"
+                + std::string(KEY_REGION) + "')";
+            return false;
+        }
+        it->second = ToLower(it->second) + ".dsql." + region + ".on.aws";
+        LOG(INFO) << "[DSQL] Expanded the cluster ID in " << key << " to " << it->second;
+    }
+    return true;
+}
+
+bool DsqlAuthPlugin::ExpandClusterId(DBC* dbc)
+{
+    std::string error;
+    if (ExpandClusterId(dbc->conn_attr, error)) {
+        return true;
+    }
+    LOG(ERROR) << "[DSQL] " << error;
+    ClearError(dbc);
+    dbc->err = std::make_unique<ErrInfo>(error.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+    return false;
 }

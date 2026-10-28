@@ -66,6 +66,7 @@ public:
 
 protected:
     std::string ResolveRegion(DBC* dbc) override;
+    bool EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error) override;
     void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;
 };
 

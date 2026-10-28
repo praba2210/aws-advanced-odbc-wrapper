@@ -267,7 +267,9 @@ TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
 
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     ASSERT_NE(nullptr, dbc_->err);
-    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication", dbc_->err->error_msg);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such as "
+                 "environment variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container "
+                 "or instance role)", dbc_->err->error_msg);
 }
 
 namespace {
@@ -793,4 +795,49 @@ TEST_F(DsqlAuthPluginTest, TlsOverrideWarning_OnlyForReplacedModes) {
         EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;
     }
     EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({}));
+}
+
+// An expired AWS IAM Identity Center (SSO) session is the usual cause with a named profile, so the error says how to
+// renew it.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_NamesTheProfileToLogIn) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dev");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication with the 'AWS_PROFILE' profile 'dev'. If it "
+                 "is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile dev'.", dbc_->err->error_msg);
+}
+
+// The default chain reads the AWS_PROFILE variable too, so that profile is named.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_EnvProfileInHint) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    SetEnvVar("AWS_PROFILE", "env_profile");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_NE(std::string::npos, std::string(dbc_->err->error_msg).find("run 'aws sso login --profile env_profile'"));
+}
+
+// AWS_PROFILE=default exported in the shell names a profile too: an SSO profile called default needs the same login.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_DefaultProfileFromEnvIsNamed) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    SetEnvVar("AWS_PROFILE", "default");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication with the 'AWS_PROFILE' profile 'default'. "
+                 "If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile default'.",
+                 dbc_->err->error_msg);
 }

@@ -215,9 +215,9 @@ namespace {
         return "";
     }
 
-    // The profile the credentials come from: the AWS_PROFILE key, else the AWS_PROFILE variable, else "default". This
-    // is the SDK's profile provider order; it doesn't read AWS_DEFAULT_PROFILE.
-    std::string GetCredentialsProfile(const std::map<std::string, std::string>& conn_attr)
+    // The profile the credentials come from when one is named: the AWS_PROFILE key, else the AWS_PROFILE variable.
+    // This is the SDK's profile provider order; it doesn't read AWS_DEFAULT_PROFILE.
+    std::string GetNamedProfile(const std::map<std::string, std::string>& conn_attr)
     {
         if (std::string profile = MapUtils::GetStringValue(conn_attr, KEY_AWS_PROFILE, ""); !profile.empty()) {
             return profile;
@@ -225,7 +225,29 @@ namespace {
         if (const char* value = std::getenv("AWS_PROFILE"); value && value[0] != '\0') {
             return value;
         }
-        return DEFAULT_PROFILE;
+        return "";
+    }
+
+    // The profile the credentials come from, "default" when none is named.
+    std::string GetCredentialsProfile(const std::map<std::string, std::string>& conn_attr)
+    {
+        const std::string profile = GetNamedProfile(conn_attr);
+        return profile.empty() ? DEFAULT_PROFILE : profile;
+    }
+
+    // The connect error for missing or expired credentials, worded as the IAM plugin's. With a named profile an
+    // expired AWS IAM Identity Center (SSO) session is the usual cause, so it says how to renew one.
+    std::string CredentialsError(const std::map<std::string, std::string>& conn_attr)
+    {
+        const std::string profile = GetNamedProfile(conn_attr);
+        if (profile.empty()) {
+            return "Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such "
+                   "as environment variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a "
+                   "container or instance role)";
+        }
+        return "Unable to resolve AWS credentials for DSQL authentication with the '" + std::string(KEY_AWS_PROFILE)
+            + "' profile '" + profile + "'. If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login "
+            "--profile " + profile + "'.";
     }
 
     // REGION, then the region in the DSQL endpoint being signed (IAM_HOST, then SERVER: behind a PrivateLink
@@ -278,6 +300,19 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
 std::string DsqlAuthPlugin::ResolveRegion(DBC* dbc)
 {
     return ResolveDsqlRegion(dbc->conn_attr);
+}
+
+bool DsqlAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error)
+{
+    if (!auth_provider_) {
+        return BaseTokenAuthPlugin::EnsureCredentials(dbc, region, out_error);
+    }
+    // DsqlAuthProvider reads the credentials provider on every call, so this sees a renewed or expired session.
+    if (auth_provider_->HasResolvedCredentials()) {
+        return true;
+    }
+    out_error = CredentialsError(dbc->conn_attr);
+    return false;
 }
 
 SQLRETURN DsqlAuthPlugin::Connect(

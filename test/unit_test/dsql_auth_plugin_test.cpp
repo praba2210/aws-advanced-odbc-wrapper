@@ -672,6 +672,23 @@ TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBefo
     dbc_->env = nullptr;
 }
 
+// The expansion also runs before the attribute check: a region-less cluster ID with an invalid TOKEN_EXPIRATION reports
+// the 08001, not the validator's 01S00.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBeforeTheAttributeCheck) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_TOKEN_EXPIRATION, "-1");
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("08001", dbc_->err->sqlstate);
+    EXPECT_EQ(NO_REGION_ERROR, std::string(dbc_->err->error_msg));
+    dbc_->env = nullptr;
+}
+
 // libpq keywords are whole words: fallback_application_name isn't application_name, and a path that mentions
 // sslrootcert isn't the sslrootcert option.
 TEST_F(DsqlAuthPluginTest, Defaults_PqoptMatchesWholeKeywords) {

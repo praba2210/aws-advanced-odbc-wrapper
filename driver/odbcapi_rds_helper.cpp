@@ -2225,25 +2225,35 @@ SQLRETURN RDS_SQLGetInfo(
     }
     ret = SQL_SUCCESS;
 
-    // Pass info back to caller
+    // Pass info back to caller. BufferLength and *StringLengthPtr count bytes of the caller's characters.
     if (char_value) {
         len = strlen(char_value);
+#ifdef UNICODE
+        // A W caller reads SQLWCHARs, 4 bytes each for a 4-byte SQLWCHAR app, before a connect too.
+        const bool user_4_byte = dbc->env != nullptr && dbc->env->use_4_bytes_user_app.load();
+        const SQLULEN char_bytes = user_4_byte ? 2 * sizeof(SQLTCHAR) : sizeof(SQLTCHAR);
+#else
+        const SQLULEN char_bytes = sizeof(SQLTCHAR);
+#endif
+        const SQLULEN byte_len = len * char_bytes;
         if (InfoValuePtr) {
 #ifdef UNICODE
-            const SQLLEN written = CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(InfoValuePtr), static_cast<size_t>(BufferLength), char_value);
-            if (dbc->plugin_service) {
-                dbc->plugin_service->GetOdbcHelper()->ConvertWrapperOutputToTarget(
-                    static_cast<SQLTCHAR*>(InfoValuePtr), written, static_cast<size_t>(BufferLength));
+            const size_t buf_chars = BufferLength > 0 ? static_cast<size_t>(BufferLength) / char_bytes : 0;
+            if (buf_chars > 0) {
+                const size_t written = static_cast<size_t>(
+                    CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(InfoValuePtr), buf_chars, char_value));
+                OdbcHelper::ConvertWrapperOutputToTarget(user_4_byte, false, static_cast<SQLTCHAR*>(InfoValuePtr),
+                    written < buf_chars ? written : buf_chars - 1, static_cast<size_t>(BufferLength));
             }
 #else
             snprintf(static_cast<char*>(InfoValuePtr), static_cast<size_t>(BufferLength) / sizeof(SQLTCHAR), "%s", char_value);
 #endif
-            if (len >= BufferLength) {
+            if (byte_len >= static_cast<SQLULEN>(BufferLength)) {
                 ret = SQL_SUCCESS_WITH_INFO;
             }
         }
         if (StringLengthPtr) {
-            *StringLengthPtr = static_cast<SQLSMALLINT>(len * sizeof(SQLTCHAR));
+            *StringLengthPtr = static_cast<SQLSMALLINT>(byte_len);
         }
     } else {
         if (InfoValuePtr) {

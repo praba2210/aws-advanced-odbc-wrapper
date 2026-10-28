@@ -909,3 +909,54 @@ TEST_F(ConnectPathTest, DriverConnect_FourByteAppGetsFourByteCharacters) {
     EXPECT_STREQ("01004", second.err->sqlstate);
 }
 #endif
+
+// SQLGetInfo's BufferLength counts bytes. A W caller with room for 20 SQLWCHARs gets at most 19 and the terminator,
+// and a longer string is reported as truncated.
+TEST_F(ErrorHandlingTest, GetInfo_StringBufferLengthCountsBytes) {
+    const std::string name(DRIVER_NAME);
+    constexpr SQLTCHAR GUARD = 0x5A;
+    struct {
+        SQLTCHAR value[20];
+        SQLTCHAR guard[48];
+    } out{};
+    for (SQLTCHAR& c : out.guard) {
+        c = GUARD;
+    }
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLGetInfo(dbc_, SQL_DRIVER_NAME, out.value,
+        static_cast<SQLSMALLINT>(sizeof(out.value)), &length));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(name.size() * sizeof(SQLTCHAR)), length);
+    for (const SQLTCHAR c : out.guard) {
+        EXPECT_EQ(GUARD, c);
+    }
+}
+
+TEST_F(ErrorHandlingTest, GetInfo_StringThatFitsIsComplete) {
+    const std::string name(DRIVER_NAME);
+    std::vector<SQLTCHAR> value(name.size() + 1, 0x5A);
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetInfo(dbc_, SQL_DRIVER_NAME, value.data(),
+        static_cast<SQLSMALLINT>(value.size() * sizeof(SQLTCHAR)), &length));
+    EXPECT_EQ(name, AppText(value.data()));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(name.size() * sizeof(SQLTCHAR)), length);
+}
+
+#ifdef UNICODE
+// An app with a 4-byte SQLWCHAR gets 4-byte characters, before any connect too.
+TEST_F(ErrorHandlingTest, GetInfo_FourByteAppGetsFourByteCharacters) {
+    const std::string name(DRIVER_NAME);
+    env_->use_4_bytes_user_app = true;
+    std::vector<uint32_t> value(name.size() + 1, 0x5A5A5A5A);
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetInfo(dbc_, SQL_DRIVER_NAME, value.data(),
+        static_cast<SQLSMALLINT>(value.size() * sizeof(uint32_t)), &length));
+    std::string text;
+    for (size_t i = 0; i < name.size(); ++i) {
+        text.push_back(static_cast<char>(value[i]));
+    }
+    EXPECT_EQ(name, text);
+    EXPECT_EQ(0U, value[name.size()]);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(name.size() * sizeof(uint32_t)), length);
+    env_->use_4_bytes_user_app = false;
+}
+#endif

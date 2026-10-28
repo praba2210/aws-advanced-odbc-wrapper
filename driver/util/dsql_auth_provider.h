@@ -33,7 +33,7 @@ namespace Aws {
     namespace DSQL {
         class DSQLClient;
     }
-}
+}  // namespace Aws
 
 // Generates Aurora DSQL IAM tokens. Tokens are presigned locally, so every GetToken call mints a fresh one and
 // nothing is cached. DSQL tokens don't include the port.

@@ -185,7 +185,7 @@ SQLRETURN DsqlAuthPlugin::Connect(
 
 void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message)
 {
-    if (const std::string hint = GetRootCertHint(dbc->conn_attr, error_message); !hint.empty()) {
+    if (const std::string_view hint = GetRootCertHint(dbc->conn_attr, error_message); !hint.empty()) {
         LOG(WARNING) << hint;
     }
 }
@@ -214,8 +214,8 @@ void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>&
     conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode));
 }
 
-std::string DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
-                                            const std::string& error_message)
+std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
+                                                 const std::string& error_message)
 {
     // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". On Windows it means
     // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against. A host

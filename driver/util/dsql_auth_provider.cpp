@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
@@ -30,7 +31,7 @@ namespace {
     // Why these credentials can't sign a DSQL token, or "" when they can. The C++ SigV4 presigner skips signing when
     // either key is empty and returns an unsigned URL, and it signs with expired credentials; the server rejects both
     // as a bad password.
-    std::string CredentialsProblem(const Aws::Auth::AWSCredentials& credentials)
+    std::string_view CredentialsProblem(const Aws::Auth::AWSCredentials& credentials)
     {
         if (credentials.GetAWSAccessKeyId().empty() || credentials.GetAWSSecretKey().empty()) {
             return "No AWS credentials available for Aurora DSQL token generation";
@@ -56,7 +57,8 @@ DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string 
         credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
     // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own.
-    if (!HasResolvedCredentials()) {
+    // Qualified: a virtual call from a constructor never reaches an override anyway.
+    if (!DsqlAuthProvider::HasResolvedCredentials()) {
         LOG(ERROR) << "Unable to resolve AWS credentials for Aurora DSQL authentication"
                    << (profile.empty() ? "" : " with profile '" + profile + "'");
     }
@@ -80,7 +82,7 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
 {
     // Check before signing, so an unusable token is never sent. Credentials can disappear or expire after
     // construction, for example when an SSO session ends.
-    if (const std::string problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
+    if (const std::string_view problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
         LOG(ERROR) << problem;
         return {"", false};
     }
@@ -91,13 +93,13 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     const auto expires_in_s = std::chrono::duration_cast<std::chrono::seconds>(time_to_expire_ms).count();
     const bool is_admin = username == ADMIN_USER;
     const auto outcome = is_admin
-        ? dsql_client_->GenerateDBConnectAdminAuthToken(host.c_str(), region.c_str(), expires_in_s)
-        : dsql_client_->GenerateDBConnectAuthToken(host.c_str(), region.c_str(), expires_in_s);
+        ? dsql_client_->GenerateDBConnectAdminAuthToken(host, region, expires_in_s)
+        : dsql_client_->GenerateDBConnectAuthToken(host, region, expires_in_s);
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
     }
-    const std::string aws_token = outcome.GetResult().c_str();
+    const std::string& aws_token = outcome.GetResult();
     const std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
     LOG(INFO) << "Generated new Aurora DSQL " << (is_admin ? "admin " : "") << "token length: " << token.length();
     return {token, false};

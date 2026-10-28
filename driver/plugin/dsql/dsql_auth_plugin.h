@@ -18,6 +18,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include "../../dialect/dialect.h"
 #include "../../driver.h"
@@ -47,8 +48,8 @@ public:
 
     // A hint for a connect that failed on the server certificate while relying on sslrootcert=system, or "" when the
     // error has nothing to do with it. Public for tests.
-    static std::string GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
-                                       const std::string& error_message);
+    static std::string_view GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
+                                            const std::string& error_message);
 
 protected:
     std::string ResolveRegion(DBC* dbc) override;

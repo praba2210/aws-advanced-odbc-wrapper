@@ -399,7 +399,7 @@ TEST_F(DsqlAuthPluginTest, RootCertHint_SystemRootCertError) {
     std::map<std::string, std::string> conn_attr;
     DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
     for (const std::string& error : {OLD_LIBPQ_ROOT_CERT_ERROR, std::string("SSL error: certificate verify failed")}) {
-        const std::string hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, error);
+        const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, error);
         EXPECT_NE(std::string::npos, hint.find("libpq 16")) << error;
         EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert=")) << error;
     }

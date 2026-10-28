@@ -69,27 +69,33 @@ namespace {
         });
     }
 
-    // Aurora DSQL rejects plaintext. Verify the server by default, as the Go, .NET, PHP, Ruby and Rust connectors do.
-    // verify-ca and require still encrypt, and a PrivateLink endpoint's own DNS name can't pass verify-full, so they
-    // stay. Any other mode becomes verify-full. psqlODBC reads the mode's first letter case-sensitively, so the
-    // result is lowercase.
-    std::string ResolveSslMode(const std::string& requested_mode)
+    // The mode Aurora DSQL keeps for the requested one, lowercase, or "" when it's replaced. verify-ca and require
+    // still encrypt, and a PrivateLink endpoint's own DNS name can't pass verify-full, so they stay. psqlODBC reads
+    // the mode's first letter case-sensitively, so the result is lowercase.
+    std::string KeptSslMode(const std::string& requested_mode)
     {
         const std::string requested_upper = RDS_STR_UPPER(requested_mode);
         for (const std::string& mode : {SSLMODE_VERIFY_FULL, SSLMODE_VERIFY_CA, SSLMODE_REQUIRE}) {
             if (requested_upper == RDS_STR_UPPER(mode)) {
-                if (mode == SSLMODE_REQUIRE) {
-                    LOG(WARNING) << "[DSQL] SSLmode=require encrypts but doesn't verify the server certificate";
-                } else if (mode == SSLMODE_VERIFY_CA) {
-                    LOG(WARNING) << "[DSQL] SSLmode=verify-ca verifies the server certificate but not its host name";
-                }
                 return mode;
             }
         }
-        if (!requested_mode.empty()) {
+        return "";
+    }
+
+    // Aurora DSQL rejects plaintext. Verify the server by default, as the Go, .NET, PHP, Ruby and Rust connectors do.
+    // Any mode that isn't kept becomes verify-full.
+    std::string ResolveSslMode(const std::string& requested_mode)
+    {
+        const std::string mode = KeptSslMode(requested_mode);
+        if (mode == SSLMODE_REQUIRE) {
+            LOG(WARNING) << "[DSQL] SSLmode=require encrypts but doesn't verify the server certificate";
+        } else if (mode == SSLMODE_VERIFY_CA) {
+            LOG(WARNING) << "[DSQL] SSLmode=verify-ca verifies the server certificate but not its host name";
+        } else if (mode.empty() && !requested_mode.empty()) {
             LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
         }
-        return SSLMODE_VERIFY_FULL;
+        return mode.empty() ? SSLMODE_VERIFY_FULL : mode;
     }
 
     bool IsConninfoSpace(char c)
@@ -282,9 +288,20 @@ SQLRETURN DsqlAuthPlugin::Connect(
     SQLSMALLINT *  StringLengthPtr,
     SQLUSMALLINT   DriverCompletion)
 {
-    ApplyConnectionDefaults(static_cast<DBC*>(ConnectionHandle)->conn_attr);
-    return BaseTokenAuthPlugin::Connect(
+    DBC* dbc = static_cast<DBC*>(ConnectionHandle);
+    // Read before the defaults replace the requested mode.
+    const std::string tls_warning = GetTlsOverrideWarning(dbc->conn_attr);
+    ApplyConnectionDefaults(dbc->conn_attr);
+    const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
+    // The wrapper keeps one diagnostic record per handle, and it hides the base driver's. Report the override only
+    // when the base driver has nothing to report (a short output buffer, for one, gets psqlODBC's 01004).
+    if (ret != SQL_SUCCESS || tls_warning.empty()) {
+        return ret;
+    }
+    ClearError(dbc);
+    dbc->err = std::make_unique<ErrInfo>(tls_warning.c_str(), WARN_OPTION_VALUE_CHANGED);
+    return SQL_SUCCESS_WITH_INFO;
 }
 
 void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message)
@@ -371,4 +388,15 @@ bool DsqlAuthPlugin::ExpandClusterId(DBC* dbc)
     ClearError(dbc);
     dbc->err = std::make_unique<ErrInfo>(error.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
     return false;
+}
+
+std::string DsqlAuthPlugin::GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr)
+{
+    const std::string requested = MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
+        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
+    if (requested.empty() || !KeptSslMode(requested).empty()) {
+        return "";
+    }
+    return "SSLmode=" + requested + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
+           "verify-ca or require.";
 }

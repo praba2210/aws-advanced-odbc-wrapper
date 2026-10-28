@@ -384,7 +384,7 @@ TEST_F(DsqlAuthPluginTest, Connect_AppliesDefaultsBeforeBaseDriver) {
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
 
-    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
     EXPECT_EQ("verify-full", dbc_->conn_attr.at("SSLMODE"));
     EXPECT_EQ("admin", dbc_->conn_attr.at(KEY_DB_USERNAME));
 }
@@ -721,4 +721,76 @@ TEST_F(DsqlAuthPluginTest, RootCertHint_WindowsUnregisteredScheme) {
     const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr,
         "connection to server at \"x.dsql.us-east-1.on.aws\" (10.0.0.1), port 5432 failed: SSL error: unregistered scheme");
     EXPECT_NE(std::string_view::npos, hint.find("pqopt={sslrootcert="));
+}
+
+namespace {
+    std::string OverrideWarning(const std::string& mode) {
+        return "SSLmode=" + mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
+               "verify-ca or require.";
+    }
+}  // namespace
+
+// The override reaches the app, not only the log: SQL_SUCCESS_WITH_INFO with 01S02 (option value changed).
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ReturnsOptionValueChanged) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    ExpectTokenForRegion("us-west-2");
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("01S02", dbc_->err->sqlstate);
+    EXPECT_EQ(WARN_OPTION_VALUE_CHANGED, dbc_->err->native_err);
+    EXPECT_EQ(OverrideWarning("disable"), std::string(dbc_->err->error_msg));
+    EXPECT_EQ("verify-full", dbc_->conn_attr.at("SSLMODE"));
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_KeptOrDefaultSslMode_NoWarning) {
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    for (const std::string mode : {"", "verify-full", "Verify-CA", "require"}) {
+        dbc_->conn_attr.erase("SSLMODE");
+        dbc_->conn_attr.erase("PQOPT");
+        if (!mode.empty()) {
+            dbc_->conn_attr.insert_or_assign("SSLMODE", mode);
+        }
+        EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider()) << mode;
+        EXPECT_EQ(nullptr, dbc_->err) << mode;
+    }
+}
+
+// The wrapper keeps one record per handle, and its record hides the base driver's. When psqlODBC has its own
+// warnings (a short output buffer gets 01004), they stay; the override is only logged.
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_KeepsBaseDriverWarnings) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "prefer");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS_WITH_INFO));
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
+    EXPECT_EQ(nullptr, dbc_->err);
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_ERROR));
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    EXPECT_EQ(nullptr, dbc_->err);
+}
+
+// Only the three long names are kept; psqlODBC's one-letter forms are replaced too (review 1's decision).
+TEST_F(DsqlAuthPluginTest, TlsOverrideWarning_OnlyForReplacedModes) {
+    for (const std::string mode : {"disable", "allow", "prefer", "d", "vf", "verify-fulll"}) {
+        EXPECT_EQ(OverrideWarning(mode), DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;
+    }
+    EXPECT_EQ(OverrideWarning("allow"), DsqlAuthPlugin::GetTlsOverrideWarning({{"CA", "allow"}}));
+    for (const std::string mode : {"verify-full", "VERIFY-CA", "require", "Require"}) {
+        EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;
+    }
+    EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({}));
 }

@@ -60,6 +60,10 @@ public:
     // RDS_InitializeConnection calls it before anything reads the host.
     static bool ExpandClusterId(DBC* dbc);
 
+    // The 01S02 message for an SSLmode that ApplyConnectionDefaults replaces with verify-full, or "" when the mode is
+    // kept or not set. It reads the mode as the user set it, so call it before ApplyConnectionDefaults. Public for tests.
+    static std::string GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr);
+
 protected:
     std::string ResolveRegion(DBC* dbc) override;
     void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;

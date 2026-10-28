@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "../../driver/util/windows_headers.h"
+
+#include <sqlext.h>
+
+#include <cstdint>
 #include <map>
 #include <string>
 
@@ -22,6 +27,7 @@
 #include "../../driver/error.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/odbc_dsn_helper.h"
+#include "../../driver/util/rds_strings.h"
 
 class ErrorHandlingTest : public testing::Test {
 protected:
@@ -327,4 +333,162 @@ TEST(DsnLoadTest, Load_UnknownEntryIsEmpty) {
     fill_stack();
     const std::string value = OdbcDsnHelper::Load(dsn, entry);
     EXPECT_EQ("", value);
+}
+
+namespace {
+    // A string the wrapper wrote for the app, as UTF-8: a W build writes SQLWCHARs.
+    std::string AppText(SQLTCHAR* buffer) {
+#ifdef UNICODE
+        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(buffer));
+#else
+        return reinterpret_cast<const char*>(buffer);
+#endif
+    }
+}  // namespace
+
+// Both driver managers pass SQLGetDiagField for a driver's record to the driver (unixODBC answers only
+// SQL_DIAG_NUMBER itself). The wrapper's record comes first, as RDS_SQLGetDiagRec returns it: asking the base driver
+// first, whenever the handle had an underlying one, reported no record.
+TEST_F(ErrorHandlingTest, DiagField_DbcWrapperRecordBeforeBaseDriver) {
+    int fake_handle = 0;
+    dbc_->wrapped_dbc = &fake_handle;  // never called through
+    dbc_->err = std::make_unique<ErrInfo>("Option value changed", WARN_OPTION_VALUE_CHANGED);
+    const std::string expected(dbc_->err->sqlstate);
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 1, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+    EXPECT_EQ(expected, AppText(state));
+
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 1, SQL_DIAG_MESSAGE_TEXT, message,
+        static_cast<SQLSMALLINT>(sizeof(message)), nullptr));
+    EXPECT_EQ("Option value changed", AppText(message));
+
+    SQLINTEGER count = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 0, SQL_DIAG_NUMBER, &count, 0, nullptr));
+    EXPECT_EQ(1, count);
+
+    dbc_->wrapped_dbc = SQL_NULL_HDBC;
+}
+
+// The same for a statement: wrapper records on statements the base driver knows (failover's 08S02, HYC00).
+TEST_F(ErrorHandlingTest, DiagField_StmtWrapperRecordBeforeBaseDriver) {
+    int fake_handle = 0;
+    stmt_->wrapped_stmt = &fake_handle;  // never called through
+    stmt_->err = std::make_unique<ErrInfo>("Optional feature not implemented", ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+    const std::string expected(stmt_->err->sqlstate);
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+    EXPECT_EQ(expected, AppText(state));
+
+    SQLINTEGER native = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_NATIVE, &native, 0, nullptr));
+    EXPECT_EQ(static_cast<SQLINTEGER>(ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED), native);
+
+    stmt_->wrapped_stmt = SQL_NULL_HSTMT;
+}
+
+// String fields come back in the caller's character type, as RDS_SQLGetDiagRec writes them: SQLWCHARs in a W build,
+// 4-byte ones for an app with a 4-byte SQLWCHAR. BufferLength and the returned length count bytes.
+TEST_F(ErrorHandlingTest, DiagField_StringFieldsUseTheAppCharacterType) {
+    stmt_->err = std::make_unique<ErrInfo>("SQLExecDirect - Connection not open", ERR_CONNECTION_NOT_OPEN);
+    const std::string expected(stmt_->err->sqlstate);
+    const auto expected_bytes = static_cast<SQLSMALLINT>(expected.size() * sizeof(SQLTCHAR));
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), &length));
+    EXPECT_EQ(expected, AppText(state));
+    EXPECT_EQ(expected_bytes, length);
+
+    // Room for 3 characters and the terminator: truncated, and the full length is returned.
+    SQLTCHAR short_state[4] = {0};
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SQLSTATE, short_state,
+        static_cast<SQLSMALLINT>(sizeof(short_state)), &length));
+    EXPECT_EQ(expected_bytes, length);
+
+#ifdef UNICODE
+    env_->use_4_bytes_user_app = true;
+    uint32_t wide_state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SQLSTATE, wide_state,
+        static_cast<SQLSMALLINT>(sizeof(wide_state)), &length));
+    EXPECT_EQ(expected, std::string(wide_state, wide_state + expected.size()));
+    EXPECT_EQ(0U, wide_state[expected.size()]);
+    EXPECT_EQ(static_cast<SQLSMALLINT>(expected.size() * sizeof(uint32_t)), length);
+    env_->use_4_bytes_user_app = false;
+#endif
+}
+
+// SQL_DIAG_COLUMN_NUMBER is an SQLINTEGER (psqlODBC writes it as one); an SQLLEN write overruns it.
+TEST_F(ErrorHandlingTest, DiagField_ColumnNumberIsSqlInteger) {
+    constexpr SQLINTEGER GUARD = 0x5A5A5A5A;
+    stmt_->err = std::make_unique<ErrInfo>("test", ERR_GENERAL_ERROR);
+    struct {
+        SQLINTEGER column = 0;
+        SQLINTEGER guard = GUARD;
+    } out;
+
+    EXPECT_EQ(SQL_SUCCESS,
+        RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_COLUMN_NUMBER, &out.column, 0, nullptr));
+    EXPECT_EQ(SQL_COLUMN_NUMBER_UNKNOWN, out.column);
+    EXPECT_EQ(GUARD, out.guard);
+}
+
+// An application that reads records until SQL_NO_DATA stops after the wrapper's one record, also on a handle with an
+// underlying one: the base driver isn't asked for a record 2 it never had.
+TEST_F(ErrorHandlingTest, DiagField_DbcRecordTwoIsNoData) {
+    int fake_handle = 0;
+    dbc_->wrapped_dbc = &fake_handle;  // never called through
+    dbc_->err = std::make_unique<ErrInfo>("Option value changed", WARN_OPTION_VALUE_CHANGED);
+
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 2, SQL_DIAG_SQLSTATE, state,
+        static_cast<SQLSMALLINT>(sizeof(state)), nullptr));
+
+    dbc_->wrapped_dbc = SQL_NULL_HDBC;
+}
+
+// A statement record the wrapper posted came from a call it answered itself, which executed nothing: the statement
+// header fields are no rows and an unknown statement, with SQL_SUCCESS. Other handles don't have these fields.
+TEST_F(ErrorHandlingTest, DiagField_StatementHeaderFieldsWithAWrapperRecord) {
+    stmt_->err = std::make_unique<ErrInfo>("Optional feature not implemented", ERR_OPTIONAL_FEATURE_NOT_IMPLEMENTED);
+
+    SQLLEN rows = 77;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_ROW_COUNT, &rows, 0, nullptr));
+    EXPECT_EQ(0, rows);
+    SQLLEN cursor_rows = 77;
+    EXPECT_EQ(SQL_SUCCESS,
+        RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_CURSOR_ROW_COUNT, &cursor_rows, 0, nullptr));
+    EXPECT_EQ(0, cursor_rows);
+    SQLINTEGER code = 77;
+    EXPECT_EQ(SQL_SUCCESS,
+        RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_DYNAMIC_FUNCTION_CODE, &code, 0, nullptr));
+    EXPECT_EQ(SQL_DIAG_UNKNOWN_STATEMENT, code);
+    SQLTCHAR function[16] = {'x'};
+    SQLSMALLINT length = 77;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 0, SQL_DIAG_DYNAMIC_FUNCTION, function,
+        static_cast<SQLSMALLINT>(sizeof(function)), &length));
+    EXPECT_EQ("", AppText(function));
+    EXPECT_EQ(0, length);
+
+    dbc_->err = std::make_unique<ErrInfo>("Option value changed", WARN_OPTION_VALUE_CHANGED);
+    EXPECT_EQ(SQL_ERROR, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 0, SQL_DIAG_ROW_COUNT, &rows, 0, nullptr));
+}
+
+// SQL_DIAG_SUBCLASS_ORIGIN is "ODBC 3.0" for the SQLSTATEs ODBC defines, such as 01S02, and "ISO 9075" for the rest.
+TEST_F(ErrorHandlingTest, DiagField_SubclassOriginFollowsTheSqlstate) {
+    dbc_->err = std::make_unique<ErrInfo>("Option value changed", WARN_OPTION_VALUE_CHANGED);
+    SQLTCHAR origin[16] = {0};
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DBC, dbc_, 1, SQL_DIAG_SUBCLASS_ORIGIN, origin,
+        static_cast<SQLSMALLINT>(sizeof(origin)), nullptr));
+    EXPECT_EQ("ODBC 3.0", AppText(origin));
+
+    stmt_->err = std::make_unique<ErrInfo>("test", ERR_GENERAL_ERROR);
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_STMT, stmt_, 1, SQL_DIAG_SUBCLASS_ORIGIN, origin,
+        static_cast<SQLSMALLINT>(sizeof(origin)), nullptr));
+    EXPECT_EQ("ISO 9075", AppText(origin));
 }

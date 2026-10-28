@@ -36,7 +36,8 @@ void OdbcDsnHelper::LoadAll(const std::string &dsn_key, std::map<std::string, st
     odbc_ini_vec.push_back(0);
     uint16_t *odbc_ini = odbc_ini_vec.data();
 
-    uint16_t buffer_utf16[MAX_VAL_SIZE];
+    // unixODBC's SQLGetPrivateProfileStringW writes the buffer only for a non-empty result: start from zeros.
+    uint16_t buffer_utf16[MAX_VAL_SIZE] = {};
     // Check DSN if it is valid and contains entries
     size = SQLGetPrivateProfileString(reinterpret_cast<SQLWCHAR*>(dsn_key_ushort), nullptr, reinterpret_cast<SQLWCHAR*>(empty), reinterpret_cast<SQLWCHAR*>(buffer_utf16), MAX_VAL_SIZE, reinterpret_cast<SQLWCHAR*>(odbc_ini));
     std::vector<std::string> entries_vec;
@@ -151,7 +152,8 @@ std::string OdbcDsnHelper::Load(const std::string &dsn_key, const std::string &e
     odbc_ini_vec.push_back(0);
     uint16_t *odbc_ini = odbc_ini_vec.data();
 
-    uint16_t buffer_utf16[MAX_VAL_SIZE];
+    // unixODBC's SQLGetPrivateProfileStringW writes the buffer only for a non-empty result: start from zeros.
+    uint16_t buffer_utf16[MAX_VAL_SIZE] = {};
     // Check DSN if it is valid and contains entries
     size = SQLGetPrivateProfileString(reinterpret_cast<SQLWCHAR*>(dsn_key_ushort), reinterpret_cast<SQLWCHAR*>(entry_key_ushort), reinterpret_cast<SQLWCHAR*>(empty), reinterpret_cast<SQLWCHAR*>(buffer_utf16), MAX_VAL_SIZE, reinterpret_cast<SQLWCHAR*>(odbc_ini));
 

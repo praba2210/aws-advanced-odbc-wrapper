@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <map>
+#include <string>
+
 #include <gtest/gtest.h>
 
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/error.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/odbc_dsn_helper.h"
 
 class ErrorHandlingTest : public testing::Test {
 protected:
@@ -290,4 +294,37 @@ TEST_F(ErrorHandlingTest, DiagRec_InvalidHandleType) {
     SQLRETURN ret = RDS_SQLGetDiagRec(invalid_handle_type, dbc_, 1, sql_state, &native_error, message, MAX_MSG_LEN, &text_length, false);
 
     EXPECT_EQ(SQL_INVALID_HANDLE, ret);
+}
+
+namespace {
+    // Leaves runs of text, each ending in two NULs, on the stack below the caller, where the next call's locals go,
+    // so a buffer that nothing wrote holds text rather than zeros that happened to be there. Called through a
+    // volatile pointer, so that it isn't inlined into the caller.
+    void FillStackWithText() {
+        volatile char16_t junk[2 * MAX_VAL_SIZE];
+        for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); ++i) {
+            junk[i] = i % 8 < 6 ? u'x' : u'\0';
+        }
+    }
+    void (*volatile fill_stack)() = FillStackWithText;
+}  // namespace
+
+// A DSN the driver manager doesn't know adds nothing, and its entries are empty. unixODBC's
+// SQLGetPrivateProfileStringW writes the buffer only for a non-empty result, so the Unicode driver used to read
+// whatever the stack held.
+TEST(DsnLoadTest, LoadAll_UnknownDsnAddsNothing) {
+    std::map<std::string, std::string> conn_attr = {{KEY_SERVER, "kept.example.com"}};
+    const std::string dsn = "no-such-dsn-dsn-load-test";
+    fill_stack();
+    OdbcDsnHelper::LoadAll(dsn, conn_attr);
+    ASSERT_EQ(1U, conn_attr.size());
+    EXPECT_EQ("kept.example.com", conn_attr.at(KEY_SERVER));
+}
+
+TEST(DsnLoadTest, Load_UnknownEntryIsEmpty) {
+    const std::string dsn = "no-such-dsn-dsn-load-test";
+    const std::string entry = KEY_SERVER;
+    fill_stack();
+    const std::string value = OdbcDsnHelper::Load(dsn, entry);
+    EXPECT_EQ("", value);
 }

@@ -1552,9 +1552,8 @@ SQLRETURN RDS_SQLGetDiagField(
                 env = static_cast<ENV*>(Handle);
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
                 // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
-                if (env->err && env->err->sqlstate && env->err->error_msg) {
-                    err.emplace(*env->err);
-                } else if (env->wrapped_env) {
+                const bool wrapper_record = env->err && env->err->sqlstate != nullptr && env->err->error_msg != nullptr;
+                if (env->wrapped_env && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = RDS_GetOdbcHelper(nullptr, env);
                     if (odbc_helper && odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1592,9 +1591,8 @@ SQLRETURN RDS_SQLGetDiagField(
                 env = dbc->env;
                 const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
                 // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
-                if (dbc->err && dbc->err->sqlstate && dbc->err->error_msg) {
-                    err.emplace(*dbc->err);
-                } else if (dbc->wrapped_dbc) {
+                const bool wrapper_record = dbc->err && dbc->err->sqlstate != nullptr && dbc->err->error_msg != nullptr;
+                if (dbc->wrapped_dbc && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1633,9 +1631,8 @@ SQLRETURN RDS_SQLGetDiagField(
                 env = dbc->env;
                 const std::lock_guard<std::recursive_mutex> lock_guard(stmt->lock);
                 // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
-                if (stmt->err && stmt->err->sqlstate && stmt->err->error_msg) {
-                    err.emplace(*stmt->err);
-                } else if (stmt->wrapped_stmt) {
+                const bool wrapper_record = stmt->err && stmt->err->sqlstate != nullptr && stmt->err->error_msg != nullptr;
+                if (stmt->wrapped_stmt && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1676,9 +1673,8 @@ SQLRETURN RDS_SQLGetDiagField(
                 const std::lock_guard<std::recursive_mutex> lock_guard(desc->lock);
 
                 // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
-                if (desc->err && desc->err->sqlstate && desc->err->error_msg) {
-                    err.emplace(*desc->err);
-                } else if (desc->wrapped_desc) {
+                const bool wrapper_record = desc->err && desc->err->sqlstate != nullptr && desc->err->error_msg != nullptr;
+                if (desc->wrapped_desc && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0

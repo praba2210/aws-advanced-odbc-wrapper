@@ -60,7 +60,8 @@ enum AuthModeSelection {
     SECRETS_MANAGER,
     ADFS,
     OKTA,
-    AWS_SSO_MODE
+    AWS_SSO_MODE,
+    DSQL_MODE
 };
 
 enum RwSplitModeSelection {
@@ -262,7 +263,8 @@ const std::vector<std::pair<std::string, std::string>> AWS_AUTH_MODES = {
     {"Secrets Manager", VALUE_AUTH_SECRETS},
     {"ADFS", VALUE_AUTH_ADFS},
     {"OKTA", VALUE_AUTH_OKTA},
-    {"AWS SSO", VALUE_AUTH_SSO}
+    {"AWS SSO", VALUE_AUTH_SSO},
+    {"Aurora DSQL", VALUE_AUTH_DSQL}
 };
 
 const std::vector<std::pair<std::string, std::string>> FAILOVER_MODES = {
@@ -1230,6 +1232,9 @@ namespace {
                 return SSO_KEYS.contains(key)
                     || key == KEY_REGION || key == KEY_TOKEN_EXPIRATION
                     || key == KEY_IAM_HOST || key == KEY_IAM_PORT || key == KEY_EXTRA_URL_ENCODE;
+            case DSQL_MODE:
+                // The token is signed for IAM_HOST (default SERVER) but not the port, and needs no extra URL encoding.
+                return key == KEY_REGION || key == KEY_TOKEN_EXPIRATION || key == KEY_IAM_HOST;
             default:
                 return true;
         }

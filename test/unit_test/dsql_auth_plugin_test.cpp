@@ -477,3 +477,17 @@ TEST_F(DsqlAuthPluginTest, Defaults_WarnsWhatTheKeptModeSkips) {
     EXPECT_EQ(1, sink.Count("SSLmode=require encrypts but doesn't verify the server certificate"));
     EXPECT_EQ(1, sink.Count("SSLmode=verify-ca verifies the server certificate but not its host name"));
 }
+
+// SigV4 signs the region as given and region names are lowercase, so EU-WEST-1 couldn't authenticate.
+TEST_F(DsqlAuthPluginTest, Connect_RegionKeyIsLowercased) {
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "EU-WEST-1");
+    ExpectTokenForRegion("eu-west-1");
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_EnvRegionIsLowercased) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    SetEnvVar("AWS_REGION", "CA-CENTRAL-1");
+    ExpectTokenForRegion("ca-central-1");
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}

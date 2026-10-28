@@ -15,9 +15,11 @@
 #include "dsql_auth_plugin.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <initializer_list>
 #include <map>
+#include <string>
 
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_auth_provider.h"
@@ -45,6 +47,12 @@ namespace {
     bool ContainsAny(const std::map<std::string, std::string>& conn_attr, std::initializer_list<std::string> keys)
     {
         return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
+    }
+
+    std::string ToLower(std::string text)
+    {
+        std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return text;
     }
 
     // Aurora DSQL rejects plaintext. Verify the server by default, as the Go, .NET, PHP, Ruby and Rust connectors do.
@@ -108,9 +116,9 @@ namespace {
 
     // The profile the credentials come from: the AWS_PROFILE key, else the AWS_PROFILE variable, else "default". This
     // is the SDK's profile provider order; it doesn't read AWS_DEFAULT_PROFILE.
-    std::string GetCredentialsProfile(DBC* dbc)
+    std::string GetCredentialsProfile(const std::map<std::string, std::string>& conn_attr)
     {
-        if (std::string profile = MapUtils::GetStringValue(dbc->conn_attr, KEY_AWS_PROFILE, ""); !profile.empty()) {
+        if (std::string profile = MapUtils::GetStringValue(conn_attr, KEY_AWS_PROFILE, ""); !profile.empty()) {
             return profile;
         }
         if (const char* value = std::getenv("AWS_PROFILE"); value && value[0] != '\0') {
@@ -122,22 +130,23 @@ namespace {
     // REGION, then the region in the DSQL endpoint being signed (IAM_HOST, then SERVER: behind a PrivateLink
     // endpoint without private DNS, SERVER is the endpoint's own name), then AWS_REGION / AWS_DEFAULT_REGION (the
     // order most DSQL connectors use), then the region of the credentials' profile. There is no default region: an
-    // empty result fails the connect with "Missing required parameters: Region".
-    std::string ResolveDsqlRegion(DBC* dbc)
+    // empty result fails the connect with "Missing required parameters: Region". The result is lowercase: SigV4 signs
+    // the region as given, and region names are lowercase.
+    std::string ResolveDsqlRegion(const std::map<std::string, std::string>& conn_attr)
     {
-        std::string region = MapUtils::GetStringValue(dbc->conn_attr, KEY_REGION, "");
+        std::string region = MapUtils::GetStringValue(conn_attr, KEY_REGION, "");
         for (const char* host_key : {KEY_IAM_HOST, KEY_SERVER}) {
             if (region.empty()) {
-                region = RdsUtils::GetDsqlRegion(MapUtils::GetStringValue(dbc->conn_attr, host_key, ""));
+                region = RdsUtils::GetDsqlRegion(MapUtils::GetStringValue(conn_attr, host_key, ""));
             }
         }
         if (region.empty()) {
             region = GetEnvRegion();
         }
         if (region.empty()) {
-            region = AuthProvider::GetRegionForProfile(GetCredentialsProfile(dbc));
+            region = AuthProvider::GetRegionForProfile(GetCredentialsProfile(conn_attr));
         }
-        return region;
+        return ToLower(region);
     }
 
     std::shared_ptr<AuthProvider> CreateDsqlAuthProvider(DBC* dbc, const std::shared_ptr<AuthProvider>& auth_provider)
@@ -146,7 +155,7 @@ namespace {
             return auth_provider;
         }
         const std::string profile = MapUtils::GetStringValue(dbc->conn_attr, KEY_AWS_PROFILE, "");
-        return std::make_shared<DsqlAuthProvider>(ResolveDsqlRegion(dbc), profile);
+        return std::make_shared<DsqlAuthProvider>(ResolveDsqlRegion(dbc->conn_attr), profile);
     }
 }  // namespace
 
@@ -167,7 +176,7 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
 
 std::string DsqlAuthPlugin::ResolveRegion(DBC* dbc)
 {
-    return ResolveDsqlRegion(dbc);
+    return ResolveDsqlRegion(dbc->conn_attr);
 }
 
 SQLRETURN DsqlAuthPlugin::Connect(

@@ -1140,21 +1140,46 @@ SQLRETURN RDS_SQLDriverConnect(
     // When DSN-only output is enabled, return just the DSN name to avoid exposing credentials in the output connection string.
     conn_out_str_utf8 = ConnectionStringHelper::BuildDsnOnlyConnectionString(dbc->conn_attr, conn_out_str_utf8);
 
-    // Update OutConnectionString with parsed values
-    if (OutConnectionString && StringLength2Ptr) {
-        const SQLULEN len = conn_out_str_utf8.length();
+    // Update OutConnectionString with parsed values. The base driver wrote its own string, with the password or token
+    // in PWD, into the same buffer: clear all of it first, so none of it stays, with or without a length pointer.
 #ifdef UNICODE
-    const SQLULEN written = CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(OutConnectionString), BufferLength, conn_out_str_utf8);
-    if (dbc->plugin_service) {
-        dbc->plugin_service->GetOdbcHelper()->ConvertWrapperOutputToTarget(OutConnectionString, written, BufferLength);
-    }
+    const std::vector<uint16_t> conn_out_utf16 = ConvertUTF8ToUTF16(conn_out_str_utf8);
+    // The full length in the app's characters (UTF-16 units), not in UTF-8 bytes.
+    const SQLULEN out_length = conn_out_utf16.size() - 1;
 #else
-        const SQLULEN written = snprintf(AS_CHAR(OutConnectionString), BufferLength, "%s", conn_out_str_utf8.c_str());
+    const SQLULEN out_length = conn_out_str_utf8.length();
 #endif
-        if (len >= BufferLength && SQL_SUCCEEDED(ret)) {
-            ret = SQL_SUCCESS_WITH_INFO;
+    if (OutConnectionString && BufferLength > 0) {
+        const auto buffer_chars = static_cast<size_t>(BufferLength);
+#ifdef UNICODE
+        // An app with a 4-byte SQLWCHAR, which the parse above may have just detected, has 4 bytes per character.
+        const bool user_4_byte = dbc->env->use_4_bytes_user_app.load();
+        const size_t buffer_bytes = buffer_chars * (user_4_byte ? 2 : 1) * sizeof(SQLTCHAR);
+        std::memset(OutConnectionString, 0, buffer_bytes);
+        // The longest prefix that leaves room for the terminator, not ending in the first half of a surrogate pair.
+        size_t copied = std::min<size_t>(out_length, buffer_chars - 1);
+        if (copied > 0 && copied < out_length && U16_IS_LEAD(conn_out_utf16[copied - 1])) {
+            copied--;
         }
-        *StringLength2Ptr = static_cast<SQLSMALLINT>(written);
+        std::copy_n(conn_out_utf16.begin(), copied, reinterpret_cast<uint16_t*>(OutConnectionString));
+        OdbcHelper::ConvertWrapperOutputToTarget(user_4_byte, false, OutConnectionString, copied, buffer_bytes);
+#else
+        std::memset(OutConnectionString, 0, buffer_chars);
+        std::copy_n(conn_out_str_utf8.begin(), std::min<size_t>(out_length, buffer_chars - 1), OutConnectionString);
+#endif
+    }
+    if (StringLength2Ptr) {
+        *StringLength2Ptr = static_cast<SQLSMALLINT>(out_length);
+    }
+    // The wrapper cut its own string: say so with 01004. A connect that failed or returned a warning keeps its
+    // return code and its record (the wrapper keeps one record per handle).
+    const SQLULEN out_capacity = BufferLength > 0 ? static_cast<SQLULEN>(BufferLength) : 0;
+    if (OutConnectionString && out_length >= out_capacity && ret == SQL_SUCCESS) {
+        const std::string message = "SQLDriverConnect - The output connection string was truncated: the buffer needs "
+            + std::to_string(out_length + 1) + " characters";
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(message.c_str(), WARN_STRING_DATA_RIGHT_TRUNCATED);
+        ret = SQL_SUCCESS_WITH_INFO;
     }
 
     return ret;

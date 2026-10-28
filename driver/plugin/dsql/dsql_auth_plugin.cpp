@@ -45,7 +45,8 @@ namespace {
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
-    // An Aurora DSQL cluster ID, as .NET, Go, PHP, Ruby and Rust test it: 26 letters or digits.
+    // An Aurora DSQL cluster ID: 26 letters or digits. The connectors match lowercase only; any case is accepted
+    // here and lowercased.
     constexpr size_t CLUSTER_ID_LENGTH = 26;
     // The characters libpq's isspace() skips between conninfo options.
     constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";

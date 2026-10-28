@@ -505,7 +505,7 @@ namespace {
     }
 }  // namespace
 
-// 8 of 9 connectors accept a bare cluster ID and connect to <id>.dsql.<region>.on.aws.
+// A bare cluster ID connects to <id>.dsql.<region>.on.aws, as in the Aurora DSQL connectors.
 TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
     std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
     conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
@@ -785,7 +785,7 @@ TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
     EXPECT_EQ(nullptr, dbc_->err);
 }
 
-// Only the three long names are kept; psqlODBC's one-letter forms are replaced too (review 1's decision).
+// Only the three long names are kept; psqlODBC's short forms (d, a, p, r, vc, vf) are replaced too.
 TEST_F(DsqlAuthPluginTest, TlsOverrideWarning_OnlyForReplacedModes) {
     for (const std::string mode : {"disable", "allow", "prefer", "d", "vf", "verify-fulll"}) {
         EXPECT_EQ(OverrideWarning(mode), DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;

@@ -473,13 +473,17 @@ void SetInitialComboBoxValue(HWND hwnd, int id, std::string key, std::vector<std
             RDS_SQLReadFileDSN(current_dsn, ODBC, key, buff, &cbDriver);
         }
     }
+#ifdef UNICODE
+    const std::string saved = ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(buff));
+#else
+    const std::string saved(buff);
+#endif
+    // Match as the driver does, ignoring case (AuthTypeFromString, DatabaseDialectFromString): a DSN written
+    // outside the dialog with RDS_AUTH_TYPE=iam opens in IAM mode. Saving writes the entry's own value.
+    const std::string saved_upper = RDS_STR_UPPER(saved);
     int index = 0;
     for (const auto& option : options) {
-#ifdef UNICODE
-        if (wcscmp(buff, ConvertUTF8ToWString(option.second).c_str()) == 0) {
-#else
-        if (strcmp(buff, option.second.c_str()) == 0) {
-#endif
+        if (saved_upper == RDS_STR_UPPER(option.second)) {
             ComboBox_SetCurSel(ctrl, index);
         }
         index++;

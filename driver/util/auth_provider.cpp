@@ -14,6 +14,8 @@
 
 #include "auth_provider.h"
 
+#include <algorithm>
+
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
@@ -21,6 +23,7 @@
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/config/AWSConfigFileProfileConfigLoader.h>
 #include <aws/core/config/AWSProfileConfig.h>
+#include <aws/core/utils/DateTime.h>
 #include <aws/rds/RDSClient.h>
 
 #include "../dialect/dialect.h"
@@ -31,27 +34,44 @@
 #include "number_utils.h"
 #include "plugin_service.h"
 
-AuthProvider::AuthProvider(const std::string &region) {
-    AwsSdkHelper::Init();
-    SetUpRdsClient(Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials(), region);
-}
-
-AuthProvider::AuthProvider(const std::string &region, const std::string &profile) {
-    AwsSdkHelper::Init();
-    if (profile.empty()) {
-        SetUpRdsClient(Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials(), region);
-        return;
-    }
-    // Resolve credentials for profile from static access keys, AWS IAM Identity Center (SSO),
+namespace {
+    // The default chain, or the chain for one profile: static access keys, AWS IAM Identity Center (SSO),
     // assume-role (source_profile/role_arn), and credential_process.
-    Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config;
-    credential_config.profile = profile;
-    const Aws::Auth::AWSCredentials credentials = Aws::Auth::DefaultAWSCredentialsProviderChain(credential_config).GetAWSCredentials();
+    Aws::Auth::AWSCredentials ReadChainCredentials(const std::string &profile) {
+        if (profile.empty()) {
+            return Aws::Auth::DefaultAWSCredentialsProviderChain().GetAWSCredentials();
+        }
+        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config;
+        credential_config.profile = profile;
+        return Aws::Auth::DefaultAWSCredentialsProviderChain(credential_config).GetAWSCredentials();
+    }
+
+    // CRT-backed providers (profile, process) report "never expires" as UINT64_MAX seconds, which overflows the
+    // SDK's DateTime and reads as at or before 1970. Only an expiration after the epoch is a real one.
+    bool IsExpired(const std::int64_t expiration_ms) {
+        return expiration_ms > 0 && Aws::Utils::DateTime::Now().Millis() >= expiration_ms;
+    }
+}  // namespace
+
+AuthProvider::AuthProvider(const std::string &region) : AuthProvider(region, "") {}
+
+AuthProvider::AuthProvider(const std::string &region, const std::string &profile) : chain_profile_(profile) {
+    AwsSdkHelper::Init();
+    // With no credentials the SDK returns an unsigned token, which the server rejects as a bad password.
+    const Aws::Auth::AWSCredentials credentials = ReadChainCredentials(profile);
+    last_chain_read_ = std::chrono::steady_clock::now();
+    chain_expiration_ms_ = credentials.GetExpiration().Millis();
     if (credentials.IsEmpty()) {
         credentials_resolved_ = false;
-        LOG(ERROR) << "Unable to resolve AWS credentials for profile '" << profile
-                   << "'. If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile "
-                   << profile << "'.";
+        if (profile.empty()) {
+            LOG(ERROR) << "Unable to resolve AWS credentials from the default credential chain";
+        } else {
+            LOG(ERROR) << "Unable to resolve AWS credentials for profile '" << profile
+                       << "'. If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile "
+                       << profile << "'.";
+        }
+    } else if (IsExpired(chain_expiration_ms_)) {
+        LOG(ERROR) << "The AWS credentials from the credential chain have expired";
     }
     SetUpRdsClient(credentials, region);
 }
@@ -133,8 +153,18 @@ std::pair<std::string, bool> AuthProvider::GetToken(
         LOG(ERROR) << "Invalid port \"" << port << "\" for auth token generation";
         return {"", false};
     }
+    std::shared_ptr<Aws::RDS::RDSClient> rds_client;
+    {
+        const std::lock_guard<std::mutex> lock_guard(rds_client_mutex_);
+        rds_client = rds_client_;
+    }
     const std::string aws_token =
-        rds_client_->GenerateConnectAuthToken(server.c_str(), region.c_str(), parsed_port.value(), username.c_str());
+        rds_client->GenerateConnectAuthToken(server.c_str(), region.c_str(), parsed_port.value(), username.c_str());
+    if (aws_token.empty()) {
+        // Not cached: the next connect asks the SDK again.
+        LOG(ERROR) << "The AWS SDK returned an empty token for " << server << ":" << port << " in region " << region;
+        return {"", false};
+    }
     token_info.token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
     {
         const std::lock_guard<std::recursive_mutex> lock_guard(token_cache_mutex_);
@@ -144,12 +174,67 @@ std::pair<std::string, bool> AuthProvider::GetToken(
     return {token_info.token, false};
 }
 
-void AuthProvider::UpdateAwsCredential(const Aws::Auth::AWSCredentials& credentials, const std::string &region) {
-    if (rds_client_) {
-        rds_client_ = nullptr;
+bool AuthProvider::ReloadCredentials(const std::string &region) {
+    if (!chain_profile_) {
+        return HasResolvedCredentials();
     }
-    credentials_resolved_ = !credentials.IsEmpty();
+    // The monitor threads share a provider and connect every 100 ms. One of them reads the chain at a time; the
+    // others fail this attempt instead of waiting.
+    const std::unique_lock<std::mutex> lock(reload_mutex_, std::try_to_lock);
+    if (CredentialsUsable()) {
+        return true;
+    }
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    if (!lock.owns_lock() || now - last_chain_read_ < reload_interval_) {
+        return false;
+    }
+    if (credentials_resolved_) {
+        LOG(INFO) << "The AWS credentials from the credential chain have expired; reading the chain again";
+    }
+    const Aws::Auth::AWSCredentials credentials = ReadChainCredentials(*chain_profile_);
+    // After the read, so a read that took longer than the interval doesn't start the next one right away.
+    last_chain_read_ = std::chrono::steady_clock::now();
+    if (credentials.IsEmpty() || IsExpired(credentials.GetExpiration().Millis())) {
+        reload_interval_ = std::min<std::chrono::milliseconds>(reload_interval_ * 2, max_reload_interval_);
+        LOG(WARNING) << "No usable AWS credentials from the credential chain. A connect reads it again after "
+                     << std::chrono::duration_cast<std::chrono::seconds>(reload_interval_).count() << " s";
+        return false;
+    }
+    reload_interval_ = min_reload_interval_;
+    LOG(INFO) << "Resolved AWS credentials on a later read of the credential chain";
+    // Not the virtual call: an override must not run while reload_mutex_ is held.
+    AuthProvider::UpdateAwsCredential(credentials, region);
+    // After the new client is in place, so a thread that sees the new expiration signs with the new credentials.
+    chain_expiration_ms_ = credentials.GetExpiration().Millis();
+    return true;
+}
+
+bool AuthProvider::CredentialsUsable() const {
+    return credentials_resolved_ && !IsExpired(chain_expiration_ms_);
+}
+
+void AuthProvider::SetMinReloadInterval(const std::chrono::milliseconds interval) {
+    const std::lock_guard<std::mutex> lock(reload_mutex_);
+    min_reload_interval_ = interval;
+    reload_interval_ = interval;
+}
+
+void AuthProvider::SetMaxReloadInterval(const std::chrono::milliseconds interval) {
+    const std::lock_guard<std::mutex> lock(reload_mutex_);
+    max_reload_interval_ = interval;
+}
+
+void AuthProvider::UpdateAwsCredential(const Aws::Auth::AWSCredentials& credentials, const std::string &region) {
+    // Set the flag only after the new client is in place, so a thread that sees it turn true signs with the new
+    // credentials. Clear it first when the new credentials are empty.
+    const bool resolved = !credentials.IsEmpty();
+    if (!resolved) {
+        credentials_resolved_ = false;
+    }
     SetUpRdsClient(credentials, region);
+    if (resolved) {
+        credentials_resolved_ = true;
+    }
 }
 
 std::string AuthProvider::ExtraUrlEncodeString(const std::string &url_str) {
@@ -213,8 +298,12 @@ void AuthProvider::SetUpRdsClient(const Aws::Auth::AWSCredentials& credentials, 
         client_config.region = region;
     }
 
-    rds_client_ = std::make_shared<Aws::RDS::RDSClient>(
+    // Only the swap is locked. Building the configuration above can wait on IMDS for a region, and the old client is
+    // released after the lock.
+    auto rds_client = std::make_shared<Aws::RDS::RDSClient>(
         credentials,
         client_config
     );
+    const std::lock_guard<std::mutex> lock_guard(rds_client_mutex_);
+    rds_client_.swap(rds_client);
 }

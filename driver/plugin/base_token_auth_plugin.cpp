@@ -24,6 +24,29 @@
 #include "../util/plugin_service.h"
 #include "../util/rds_utils.h"
 
+namespace {
+    // 28000, not 08001: the dialects count 08 as a network error, which the initial connection strategy retries until
+    // its timeout. Most of these failures can't pass on a retry, and for ADFS and Okta each retry is another sign-in
+    // to the identity provider (for AWS SSO, another browser login when prompting is allowed).
+    constexpr SQL_STATE_CODE CREDENTIAL_ERROR = ERR_INVALID_AUTHORIZATION_SPECIFICATION;
+
+    SQLRETURN FailWithCredentialError(DBC* dbc, const std::string& error_msg)
+    {
+        LOG(ERROR) << error_msg;
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), CREDENTIAL_ERROR);
+        return SQL_ERROR;
+    }
+
+    // Providers return an empty token when generation fails. Connecting anyway would only fail with a misleading
+    // password error.
+    SQLRETURN FailTokenGeneration(DBC* dbc, const std::string& plugin_name)
+    {
+        return FailWithCredentialError(
+            dbc, "Failed to generate " + plugin_name + " authentication token. See the driver log for the cause.");
+    }
+}  // namespace
+
 BaseTokenAuthPlugin::BaseTokenAuthPlugin(
     DBC* dbc,
     std::shared_ptr<BasePlugin> next_plugin,
@@ -111,14 +134,14 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
     LOG(INFO) << "Generating an RDS authentication token for " << iam_host << ":" << port << " in region " << region;
 
     if (std::string credential_error; !EnsureCredentials(dbc, region, credential_error)) {
-        LOG(ERROR) << credential_error;
-        ClearError(dbc);
-        dbc->err = std::make_unique<ErrInfo>(credential_error.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
-        return SQL_ERROR;
+        return FailWithCredentialError(dbc, credential_error);
     }
 
     std::pair<std::string, bool> token = auth_provider_->GetToken(
         iam_host, region, port, username, true, extra_url_encode, token_expiration);
+    if (token.first.empty()) {
+        return FailTokenGeneration(dbc, plugin_name_);
+    }
     const bool is_cached_token = token.second;
 
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
@@ -154,6 +177,9 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
 
     token = auth_provider_->GetToken(
         iam_host, region, port, username, false, extra_url_encode, token_expiration);
+    if (token.first.empty()) {
+        return FailTokenGeneration(dbc, plugin_name_);
+    }
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
     ret = ConnectNext(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);

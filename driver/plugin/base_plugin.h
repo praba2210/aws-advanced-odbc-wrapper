@@ -45,6 +45,11 @@ public:
 
     virtual void ReleaseResources();
 
+    // The plugin below this one (null at the bottom of the chain) and this plugin's name, for tests that check the
+    // chain's order.
+    [[nodiscard]] BasePlugin* GetNextPlugin() const { return next_plugin_.get(); }
+    [[nodiscard]] const std::string& GetPluginName() const { return plugin_name_; }
+
 protected:
     SQLRETURN ConnectNext(
         SQLHDBC        ConnectionHandle,

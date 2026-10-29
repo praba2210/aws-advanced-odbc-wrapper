@@ -473,13 +473,17 @@ void SetInitialComboBoxValue(HWND hwnd, int id, std::string key, std::vector<std
             RDS_SQLReadFileDSN(current_dsn, ODBC, key, buff, &cbDriver);
         }
     }
+#ifdef UNICODE
+    const std::string saved = ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(buff));
+#else
+    const std::string saved(buff);
+#endif
+    // Match as the driver does, ignoring case (AuthTypeFromString, DatabaseDialectFromString): a DSN written
+    // outside the dialog with RDS_AUTH_TYPE=iam opens in IAM mode. Saving writes the entry's own value.
+    const std::string saved_upper = RDS_STR_UPPER(saved);
     int index = 0;
     for (const auto& option : options) {
-#ifdef UNICODE
-        if (wcscmp(buff, ConvertUTF8ToWString(option.second).c_str()) == 0) {
-#else
-        if (strcmp(buff, option.second.c_str()) == 0) {
-#endif
+        if (saved_upper == RDS_STR_UPPER(option.second)) {
             ComboBox_SetCurSel(ctrl, index);
         }
         index++;
@@ -1496,13 +1500,11 @@ std::tuple<std::string, std::string, bool> StartDialogForSqlDriverConnect(HWND h
     disable_optional = complete_required;
     std::string converted_str;
 
-    // Check if current_dsn or driver has already been set.
-    // This could happen if another connection has already been established.
-    if (!current_dsn.empty()) {
-        return { converted_str, converted_str, false };
-    }
+    // Per-call state: parse this call's connection string from scratch.
+    current_dsn.clear();
+    driver.clear();
+    dialog_box_cancelled = false;
 
-    // This is the initial connection.
     // Check if SAVEFILE is specified.
 #ifdef UNICODE
     converted_str = ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(InConnectionString));
@@ -1543,6 +1545,11 @@ std::string ConvertNullSeparatedToSemicolon(LPCSTR lpszAttributes) {
 }
 
 BOOL ConfigDSN(HWND hwndParent, WORD fRequest, LPCSTR lpszDriver, LPCSTR lpszAttributes) {
+    // Per-request state: start from this request's attributes, not a DSN or a connect-dialog mode left in the
+    // process by an earlier SQLDriverConnect or ConfigDSN.
+    current_dsn.clear();
+    driver_connect = false;
+    disable_optional = false;
     driver = lpszDriver;
     const std::string conn_str = ConvertNullSeparatedToSemicolon(lpszAttributes);
     GetDsnFromConnectionString(conn_str, hwndParent);

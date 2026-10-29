@@ -890,6 +890,10 @@ SQLRETURN RDS_SQLConnect(
         return SQL_ERROR;
     }
 
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
+
 #ifdef UNICODE
     bool use_4_bytes_user_app = dbc->env->use_4_bytes_user_app.load();
 #endif
@@ -1096,6 +1100,10 @@ SQLRETURN RDS_SQLDriverConnect(
         return SQL_ERROR;
     }
 
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
+
     // Parse connection string, load input DSN followed by Base DSN
     ConnectionStringHelper::ParseConnectionString(conn_str_utf8, dbc->conn_attr);
 
@@ -1140,21 +1148,46 @@ SQLRETURN RDS_SQLDriverConnect(
     // When DSN-only output is enabled, return just the DSN name to avoid exposing credentials in the output connection string.
     conn_out_str_utf8 = ConnectionStringHelper::BuildDsnOnlyConnectionString(dbc->conn_attr, conn_out_str_utf8);
 
-    // Update OutConnectionString with parsed values
-    if (OutConnectionString && StringLength2Ptr) {
-        const SQLULEN len = conn_out_str_utf8.length();
+    // Update OutConnectionString with parsed values. The base driver wrote its own string, with the password or token
+    // in PWD, into the same buffer: clear all of it first, so none of it stays, with or without a length pointer.
 #ifdef UNICODE
-    const SQLULEN written = CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(OutConnectionString), BufferLength, conn_out_str_utf8);
-    if (dbc->plugin_service) {
-        dbc->plugin_service->GetOdbcHelper()->ConvertWrapperOutputToTarget(OutConnectionString, written, BufferLength);
-    }
+    const std::vector<uint16_t> conn_out_utf16 = ConvertUTF8ToUTF16(conn_out_str_utf8);
+    // The full length in the app's characters (UTF-16 units), not in UTF-8 bytes.
+    const SQLULEN out_length = conn_out_utf16.size() - 1;
 #else
-        const SQLULEN written = snprintf(AS_CHAR(OutConnectionString), BufferLength, "%s", conn_out_str_utf8.c_str());
+    const SQLULEN out_length = conn_out_str_utf8.length();
 #endif
-        if (len >= BufferLength && SQL_SUCCEEDED(ret)) {
-            ret = SQL_SUCCESS_WITH_INFO;
+    if (OutConnectionString && BufferLength > 0) {
+        const auto buffer_chars = static_cast<size_t>(BufferLength);
+#ifdef UNICODE
+        // An app with a 4-byte SQLWCHAR, which the parse above may have just detected, has 4 bytes per character.
+        const bool user_4_byte = dbc->env->use_4_bytes_user_app.load();
+        const size_t buffer_bytes = buffer_chars * (user_4_byte ? 2 : 1) * sizeof(SQLTCHAR);
+        std::memset(OutConnectionString, 0, buffer_bytes);
+        // The longest prefix that leaves room for the terminator, not ending in the first half of a surrogate pair.
+        size_t copied = std::min<size_t>(out_length, buffer_chars - 1);
+        if (copied > 0 && copied < out_length && U16_IS_LEAD(conn_out_utf16[copied - 1])) {
+            copied--;
         }
-        *StringLength2Ptr = static_cast<SQLSMALLINT>(written);
+        std::copy_n(conn_out_utf16.begin(), copied, reinterpret_cast<uint16_t*>(OutConnectionString));
+        OdbcHelper::ConvertWrapperOutputToTarget(user_4_byte, false, OutConnectionString, copied, buffer_bytes);
+#else
+        std::memset(OutConnectionString, 0, buffer_chars);
+        std::copy_n(conn_out_str_utf8.begin(), std::min<size_t>(out_length, buffer_chars - 1), OutConnectionString);
+#endif
+    }
+    if (StringLength2Ptr) {
+        *StringLength2Ptr = static_cast<SQLSMALLINT>(out_length);
+    }
+    // The wrapper cut its own string: say so with 01004. A connect that failed or returned a warning keeps its
+    // return code and its record (the wrapper keeps one record per handle).
+    const SQLULEN out_capacity = BufferLength > 0 ? static_cast<SQLULEN>(BufferLength) : 0;
+    if (OutConnectionString && out_length >= out_capacity && ret == SQL_SUCCESS) {
+        const std::string message = "SQLDriverConnect - The output connection string was truncated: the buffer needs "
+            + std::to_string(out_length + 1) + " characters";
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(message.c_str(), WARN_STRING_DATA_RIGHT_TRUNCATED);
+        ret = SQL_SUCCESS_WITH_INFO;
     }
 
     return ret;
@@ -1518,7 +1551,9 @@ SQLRETURN RDS_SQLGetDiagField(
             {
                 env = static_cast<ENV*>(Handle);
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
-                if (env->wrapped_env) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                const bool wrapper_record = env->err && env->err->sqlstate != nullptr && env->err->error_msg != nullptr;
+                if (env->wrapped_env && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = RDS_GetOdbcHelper(nullptr, env);
                     if (odbc_helper && odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1555,7 +1590,9 @@ SQLRETURN RDS_SQLGetDiagField(
                 dbc = static_cast<DBC*>(Handle);
                 env = dbc->env;
                 const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
-                if (dbc->wrapped_dbc) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                const bool wrapper_record = dbc->err && dbc->err->sqlstate != nullptr && dbc->err->error_msg != nullptr;
+                if (dbc->wrapped_dbc && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1593,7 +1630,9 @@ SQLRETURN RDS_SQLGetDiagField(
                 dbc = stmt->dbc;
                 env = dbc->env;
                 const std::lock_guard<std::recursive_mutex> lock_guard(stmt->lock);
-                if (stmt->wrapped_stmt) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                const bool wrapper_record = stmt->err && stmt->err->sqlstate != nullptr && stmt->err->error_msg != nullptr;
+                if (stmt->wrapped_stmt && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1633,7 +1672,9 @@ SQLRETURN RDS_SQLGetDiagField(
 
                 const std::lock_guard<std::recursive_mutex> lock_guard(desc->lock);
 
-                if (desc->wrapped_desc) {
+                // The wrapper's own record first, as in RDS_SQLGetDiagRec: it replaces the base driver's.
+                const bool wrapper_record = desc->err && desc->err->sqlstate != nullptr && desc->err->error_msg != nullptr;
+                if (desc->wrapped_desc && !wrapper_record) {
 #if UNICODE
                     const auto odbc_helper = dbc->plugin_service->GetOdbcHelper();
                     if (odbc_helper->NeedsConversion() && DiagInfoPtr && BufferLength > 0
@@ -1666,7 +1707,7 @@ SQLRETURN RDS_SQLGetDiagField(
             return SQL_INVALID_HANDLE;
     }
 
-    // Given handle did not have an underlying driver handle allocated
+    // The wrapper's own record, or a handle without an underlying driver handle
     if (err) {
         if (RecNumber > 1) {
             ret = SQL_NO_DATA_FOUND;
@@ -1680,9 +1721,19 @@ SQLRETURN RDS_SQLGetDiagField(
                 case SQL_DIAG_DYNAMIC_FUNCTION_CODE:
                 case SQL_DIAG_ROW_COUNT:
                 {
-                    // If we're calling these at this point
-                    //  we are not connected to an underlying driver
-                    ret = SQL_ERROR;
+                    // Defined for statement handles only. A wrapper record comes from a call the wrapper
+                    // answered itself, which executed nothing: no rows and an unknown statement.
+                    if (HandleType != SQL_HANDLE_STMT) {
+                        ret = SQL_ERROR;
+                    } else if (DiagIdentifier == SQL_DIAG_DYNAMIC_FUNCTION) {
+                        char_value = "";
+                    } else if (DiagIdentifier == SQL_DIAG_DYNAMIC_FUNCTION_CODE) {
+                        if (DiagInfoPtr) {
+                            *(static_cast<SQLINTEGER*>(DiagInfoPtr)) = SQL_DIAG_UNKNOWN_STATEMENT;
+                        }
+                    } else if (DiagInfoPtr) {
+                        *(static_cast<SQLLEN*>(DiagInfoPtr)) = 0;
+                    }
                     break;
                 }
                 case SQL_DIAG_NUMBER:
@@ -1715,7 +1766,8 @@ SQLRETURN RDS_SQLGetDiagField(
                     if (RecNumber <= 0) {
                         ret = SQL_ERROR;
                     } else {
-                        *(static_cast<SQLLEN*>(DiagInfoPtr)) = SQL_ROW_NUMBER_UNKNOWN;
+                        // An SQLINTEGER, unlike SQL_DIAG_ROW_NUMBER's SQLLEN: 8 bytes would overrun the field.
+                        *(static_cast<SQLINTEGER*>(DiagInfoPtr)) = SQL_COLUMN_NUMBER_UNKNOWN;
                     }
                     break;
                 }
@@ -1774,7 +1826,8 @@ SQLRETURN RDS_SQLGetDiagField(
                     if (RecNumber <= 0) {
                         ret = SQL_ERROR;
                     }
-                    if (err->is_odbc3_subclass) {
+                    // ErrInfo's copy constructor doesn't copy is_odbc3_subclass: work it out from the SQLSTATE.
+                    if (err->sqlstate != nullptr && ErrInfo::IsOdbc3Subclass(err->sqlstate)) {
                         char_value = "ODBC 3.0";
                     } else {
                         char_value = "ISO 9075";
@@ -1785,19 +1838,41 @@ SQLRETURN RDS_SQLGetDiagField(
                     ret = SQL_ERROR;
             }
 
-            // Pass info back to caller
-            if (char_value) {
+            // Pass info back to caller. BufferLength and *StringLengthPtr count bytes of the caller's characters.
+            if (BufferLength < 0 && OdbcHelper::IsStringDiagField(DiagIdentifier)) {
+                // A string field needs a BufferLength of 0 or more; nothing is written.
+                ret = SQL_ERROR;
+            } else if (char_value) {
                 len = strlen(char_value);
+#ifdef UNICODE
+                // A W caller reads SQLWCHARs (4 bytes each for a 4-byte SQLWCHAR app), as RDS_SQLGetDiagRec writes.
+                const bool user_4_byte = env != nullptr && env->use_4_bytes_user_app.load();
+                const SQLULEN char_bytes = user_4_byte ? 2 * sizeof(SQLTCHAR) : sizeof(SQLTCHAR);
+#else
+                const SQLULEN char_bytes = sizeof(SQLTCHAR);
+#endif
+                const SQLULEN byte_len = len * char_bytes;
                 if (DiagInfoPtr) {
+#ifdef UNICODE
+                    const size_t buf_chars = BufferLength > 0 ? static_cast<size_t>(BufferLength) / char_bytes : 0;
+                    if (buf_chars > 0) {
+                        const size_t written = static_cast<size_t>(
+                            CopyUTF8ToUTF16Buffer(static_cast<uint16_t*>(DiagInfoPtr), buf_chars, char_value));
+                        OdbcHelper::ConvertWrapperOutputToTarget(user_4_byte, false,
+                            static_cast<SQLTCHAR*>(DiagInfoPtr), written < buf_chars ? written : buf_chars - 1,
+                            static_cast<size_t>(BufferLength));
+                    }
+#else
                     snprintf(static_cast<char*>(DiagInfoPtr), static_cast<size_t>(BufferLength) / sizeof(SQLTCHAR), "%s", char_value);
-                    if (len >= BufferLength) {
+#endif
+                    if (byte_len >= static_cast<SQLULEN>(BufferLength)) {
                         ret = SQL_SUCCESS_WITH_INFO;
                     }
                 } else {
                     ret = SQL_SUCCESS_WITH_INFO;
                 }
                 if (StringLengthPtr) {
-                    *StringLengthPtr = static_cast<SQLSMALLINT>(len * sizeof(SQLTCHAR));
+                    *StringLengthPtr = static_cast<SQLSMALLINT>(byte_len);
                 }
             }
         }
@@ -2154,25 +2229,35 @@ SQLRETURN RDS_SQLGetInfo(
     }
     ret = SQL_SUCCESS;
 
-    // Pass info back to caller
+    // Pass info back to caller. BufferLength and *StringLengthPtr count bytes of the caller's characters.
     if (char_value) {
         len = strlen(char_value);
+#ifdef UNICODE
+        // A W caller reads SQLWCHARs, 4 bytes each for a 4-byte SQLWCHAR app, before a connect too.
+        const bool user_4_byte = dbc->env != nullptr && dbc->env->use_4_bytes_user_app.load();
+        const SQLULEN char_bytes = user_4_byte ? 2 * sizeof(SQLTCHAR) : sizeof(SQLTCHAR);
+#else
+        const SQLULEN char_bytes = sizeof(SQLTCHAR);
+#endif
+        const SQLULEN byte_len = len * char_bytes;
         if (InfoValuePtr) {
 #ifdef UNICODE
-            const SQLLEN written = CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(InfoValuePtr), static_cast<size_t>(BufferLength), char_value);
-            if (dbc->plugin_service) {
-                dbc->plugin_service->GetOdbcHelper()->ConvertWrapperOutputToTarget(
-                    static_cast<SQLTCHAR*>(InfoValuePtr), written, static_cast<size_t>(BufferLength));
+            const size_t buf_chars = BufferLength > 0 ? static_cast<size_t>(BufferLength) / char_bytes : 0;
+            if (buf_chars > 0) {
+                const size_t written = static_cast<size_t>(
+                    CopyUTF8ToUTF16Buffer(reinterpret_cast<uint16_t*>(InfoValuePtr), buf_chars, char_value));
+                OdbcHelper::ConvertWrapperOutputToTarget(user_4_byte, false, static_cast<SQLTCHAR*>(InfoValuePtr),
+                    written < buf_chars ? written : buf_chars - 1, static_cast<size_t>(BufferLength));
             }
 #else
             snprintf(static_cast<char*>(InfoValuePtr), static_cast<size_t>(BufferLength) / sizeof(SQLTCHAR), "%s", char_value);
 #endif
-            if (len >= BufferLength) {
+            if (byte_len >= static_cast<SQLULEN>(BufferLength)) {
                 ret = SQL_SUCCESS_WITH_INFO;
             }
         }
         if (StringLengthPtr) {
-            *StringLengthPtr = static_cast<SQLSMALLINT>(len * sizeof(SQLTCHAR));
+            *StringLengthPtr = static_cast<SQLSMALLINT>(byte_len);
         }
     } else {
         if (InfoValuePtr) {

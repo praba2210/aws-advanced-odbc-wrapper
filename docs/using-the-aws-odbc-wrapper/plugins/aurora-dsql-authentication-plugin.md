@@ -152,7 +152,7 @@ Aurora DSQL accepts only TLS connections. The plugin sets psqlODBC's `SSLmode` b
 
 The mode names match in any case. See [Logging](../using-the-aws-odbc-wrapper.md#logging) for where the log is.
 
-When the plugin replaces a mode, the connect returns `SQL_SUCCESS_WITH_INFO` with a `01S02` diagnostic record: `SSLmode=<value> was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, verify-ca or require.` `SQLGetDiagField` reads this record once the wrapper's diagnostics fix in the companion fixes pull request is in; until then, read it with `SQLGetDiagRec` or `SQLError`. If psqlODBC returns its own warning on the same connect, for example `01004` when the application's output connection string buffer is too small, psqlODBC's record is kept and the replacement is only logged.
+When the plugin replaces a mode, the connect returns `SQL_SUCCESS_WITH_INFO` with a `01S02` diagnostic record: `SSLmode=<value> was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, verify-ca or require.` `SQLGetDiagField` reads this record once the wrapper's diagnostics fix in the companion fixes pull request is in; until then, read it with `SQLGetDiagRec` or `SQLError`. If psqlODBC returns its own warning on the same connect, psqlODBC's record is kept and the replacement is only logged. The usual one is `01004` (`The buffer was too small for the ConnStrOut.`): psqlODBC writes its output connection string, which holds the token, to the output buffer, and on Linux this can happen even when the application passes no buffer.
 
 #### Root Certificates
 

@@ -1500,13 +1500,13 @@ std::tuple<std::string, std::string, bool> StartDialogForSqlDriverConnect(HWND h
     disable_optional = complete_required;
     std::string converted_str;
 
-    // Check if current_dsn or driver has already been set.
-    // This could happen if another connection has already been established.
-    if (!current_dsn.empty()) {
-        return { converted_str, converted_str, false };
-    }
+    // Each call works from its own connection string: the DSN, driver and cancel flag that an earlier dialog
+    // connect or ConfigDSN left in this process don't carry over. A DSN left over used to send the next
+    // DSN=<name> connect to the dialog, and then to an empty connection string.
+    current_dsn.clear();
+    driver.clear();
+    dialog_box_cancelled = false;
 
-    // This is the initial connection.
     // Check if SAVEFILE is specified.
 #ifdef UNICODE
     converted_str = ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(InConnectionString));
@@ -1520,6 +1520,9 @@ std::tuple<std::string, std::string, bool> StartDialogForSqlDriverConnect(HWND h
         // Check for DSN and DRIVER from the connection string.
         GetDsnFromConnectionString(converted_str, hwnd);
         if (!current_dsn.empty() || !driver.empty()) {
+            // No dialog: leave no dialog state set, as after one, so ConfigDSN in this process reads the DSN.
+            driver_connect = false;
+            disable_optional = false;
             return { converted_str, converted_str, false };
         }
     }

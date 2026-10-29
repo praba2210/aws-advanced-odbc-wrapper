@@ -27,10 +27,13 @@ namespace Aws {
     namespace Auth {
         class AWSCredentialsProvider;
     }
+    namespace Client {
+        struct GenericClientConfiguration;
+    }
     namespace DSQL {
         class DSQLClient;
     }
-}
+}  // namespace Aws
 
 // Generates Aurora DSQL IAM tokens. Tokens are presigned locally, so every GetToken call mints a fresh one and
 // nothing is cached. DSQL tokens don't include the port.
@@ -51,6 +54,9 @@ public:
     [[nodiscard]] bool HasResolvedCredentials() const override;
 
     static inline const std::string ADMIN_USER = "admin";
+
+    // The DSQL client's configuration. Public for tests.
+    static Aws::Client::GenericClientConfiguration MakeClientConfiguration(const std::string &region);
 
 private:
     void SetUpDsqlClient(const std::string &region);

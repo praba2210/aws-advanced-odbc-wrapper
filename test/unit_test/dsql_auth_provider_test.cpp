@@ -16,12 +16,14 @@
 #include <gtest/gtest.h>
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/client/GenericClientConfiguration.h>
 #include <aws/core/utils/DateTime.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/dsql_auth_provider.h"
@@ -192,4 +194,28 @@ TEST_F(DsqlAuthProviderTest, ProfileStaticCredentials_AreResolved) {
     DsqlAuthProvider provider(REGION, "dsql_static");
     EXPECT_TRUE(provider.HasResolvedCredentials());
     EXPECT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
+}
+
+// AuthProvider has subclasses (DsqlAuthProvider, the test mocks) and is held through base pointers. make_shared's
+// control block destroys the right type anyway; a unique_ptr<AuthProvider> or a delete through the base would not.
+TEST_F(DsqlAuthProviderTest, AuthProvider_HasVirtualDestructor) {
+    EXPECT_TRUE(std::has_virtual_destructor_v<AuthProvider>);
+}
+
+// The token is signed for the region GetToken is given. Off EC2, the client's own IMDS region lookup only waits for
+// its timeouts on every new provider.
+TEST_F(DsqlAuthProviderTest, ClientConfiguration_DisablesImds) {
+    const Aws::Client::GenericClientConfiguration config = DsqlAuthProvider::MakeClientConfiguration("eu-west-1");
+    EXPECT_TRUE(config.disableIMDS);
+    EXPECT_EQ("eu-west-1", config.region);
+}
+
+// TOKEN_EXPIRATION=0 means the default lifetime, as in the Go connector: X-Amz-Expires=0 would make a token that has
+// already expired. Negative values can only come from a direct caller; the connection string validator rejects them.
+TEST_F(DsqlAuthProviderTest, GetToken_NonPositiveExpiration_UsesDefault) {
+    DsqlAuthProvider provider(REGION, TestCredentials());
+    for (const std::chrono::milliseconds expiration : {std::chrono::milliseconds(0), std::chrono::milliseconds(-5000)}) {
+        const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, expiration).first;
+        EXPECT_NE(std::string::npos, token.find("X-Amz-Expires=900")) << expiration.count();
+    }
 }

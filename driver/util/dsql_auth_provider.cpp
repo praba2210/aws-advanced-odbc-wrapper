@@ -16,11 +16,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <string_view>
 
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/client/ClientConfiguration.h>
+#include <aws/core/client/GenericClientConfiguration.h>
 #include <aws/dsql/DSQLClient.h>
 
 #include "aws_sdk_helper.h"
@@ -30,7 +32,7 @@ namespace {
     // Why these credentials can't sign a DSQL token, or "" when they can. The C++ SigV4 presigner skips signing when
     // either key is empty and returns an unsigned URL, and it signs with expired credentials; the server rejects both
     // as a bad password.
-    std::string CredentialsProblem(const Aws::Auth::AWSCredentials& credentials)
+    std::string_view CredentialsProblem(const Aws::Auth::AWSCredentials& credentials)
     {
         if (credentials.GetAWSAccessKeyId().empty() || credentials.GetAWSSecretKey().empty()) {
             return "No AWS credentials available for Aurora DSQL token generation";
@@ -56,7 +58,8 @@ DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string 
         credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
     // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own.
-    if (!HasResolvedCredentials()) {
+    // Qualified: a virtual call from a constructor never reaches an override anyway.
+    if (!DsqlAuthProvider::HasResolvedCredentials()) {
         LOG(ERROR) << "Unable to resolve AWS credentials for Aurora DSQL authentication"
                    << (profile.empty() ? "" : " with profile '" + profile + "'");
     }
@@ -80,7 +83,7 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
 {
     // Check before signing, so an unusable token is never sent. Credentials can disappear or expire after
     // construction, for example when an SSO session ends.
-    if (const std::string problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
+    if (const std::string_view problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
         LOG(ERROR) << problem;
         return {"", false};
     }
@@ -88,28 +91,42 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     // The signature covers the host; DNS is case-insensitive, so sign the lowercase form.
     std::string host = server;
     std::ranges::transform(host, host.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto expires_in_s = std::chrono::duration_cast<std::chrono::seconds>(time_to_expire_ms).count();
+    // TOKEN_EXPIRATION=0 means the default lifetime, as in the Go connector: X-Amz-Expires=0 would make a token that
+    // has already expired.
+    std::chrono::seconds lifetime = std::chrono::duration_cast<std::chrono::seconds>(time_to_expire_ms);
+    if (lifetime <= std::chrono::seconds::zero()) {
+        lifetime = std::chrono::duration_cast<std::chrono::seconds>(DEFAULT_EXPIRATION_MS);
+    }
     const bool is_admin = username == ADMIN_USER;
     const auto outcome = is_admin
-        ? dsql_client_->GenerateDBConnectAdminAuthToken(host.c_str(), region.c_str(), expires_in_s)
-        : dsql_client_->GenerateDBConnectAuthToken(host.c_str(), region.c_str(), expires_in_s);
+        ? dsql_client_->GenerateDBConnectAdminAuthToken(host, region, lifetime.count())
+        : dsql_client_->GenerateDBConnectAuthToken(host, region, lifetime.count());
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
     }
-    const std::string aws_token = outcome.GetResult().c_str();
+    const std::string& aws_token = outcome.GetResult();
     const std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
     LOG(INFO) << "Generated new Aurora DSQL " << (is_admin ? "admin " : "") << "token length: " << token.length();
     return {token, false};
 }
 
-void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
+Aws::Client::GenericClientConfiguration DsqlAuthProvider::MakeClientConfiguration(const std::string &region)
 {
-    Aws::DSQL::DSQLClientConfiguration client_config;
+    // The token is signed for the region GetToken is given, so the client's own region never needs an IMDS lookup,
+    // which off EC2 waits for its timeouts. The credentials chain is separate and still reads IMDS for an instance role.
+    const Aws::Client::ClientConfigurationInitValues init_values{.shouldDisableIMDS = true};
+    Aws::DSQL::DSQLClientConfiguration client_config(init_values);
     if (!region.empty()) {
         client_config.region = region;
     }
-    dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(credentials_provider_, nullptr, client_config);
+    return client_config;
+}
+
+void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
+{
+    dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(
+        credentials_provider_, nullptr, MakeClientConfiguration(region));
 }
 
 bool DsqlAuthProvider::HasResolvedCredentials() const

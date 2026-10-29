@@ -2806,6 +2806,11 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         dbc->conn_attr.insert_or_assign(KEY_DRIVER, dbc->conn_attr.at(KEY_BASE_DRIVER));
     }
 
+    // An Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint before anything reads the host.
+    if (!DsqlAuthPlugin::ExpandClusterId(dbc)) {
+        return SQL_ERROR;
+    }
+
     const std::unordered_set<std::string> invalid_params = AttributeValidator::ValidateMap(dbc->conn_attr);
     if (!invalid_params.empty()) {
         std::string invalid_message("Invalid value specified for connection string attribute:\n\t");

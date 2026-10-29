@@ -27,6 +27,7 @@
 #include "common_mock_objects.h"
 
 #include "../../driver/driver.h"
+#include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/connection_string_keys.h"
@@ -266,7 +267,9 @@ TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
 
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     ASSERT_NE(nullptr, dbc_->err);
-    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication", dbc_->err->error_msg);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such as "
+                 "environment variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container "
+                 "or instance role)", dbc_->err->error_msg);
 }
 
 namespace {
@@ -383,7 +386,7 @@ TEST_F(DsqlAuthPluginTest, Connect_AppliesDefaultsBeforeBaseDriver) {
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
 
-    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
     EXPECT_EQ("verify-full", dbc_->conn_attr.at("SSLMODE"));
     EXPECT_EQ("admin", dbc_->conn_attr.at(KEY_DB_USERNAME));
 }
@@ -399,7 +402,7 @@ TEST_F(DsqlAuthPluginTest, RootCertHint_SystemRootCertError) {
     std::map<std::string, std::string> conn_attr;
     DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
     for (const std::string& error : {OLD_LIBPQ_ROOT_CERT_ERROR, std::string("SSL error: certificate verify failed")}) {
-        const std::string hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, error);
+        const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, error);
         EXPECT_NE(std::string::npos, hint.find("libpq 16")) << error;
         EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert=")) << error;
     }
@@ -476,4 +479,382 @@ TEST_F(DsqlAuthPluginTest, Defaults_WarnsWhatTheKeptModeSkips) {
 
     EXPECT_EQ(1, sink.Count("SSLmode=require encrypts but doesn't verify the server certificate"));
     EXPECT_EQ(1, sink.Count("SSLmode=verify-ca verifies the server certificate but not its host name"));
+}
+
+// SigV4 signs the region as given and region names are lowercase, so EU-WEST-1 couldn't authenticate.
+TEST_F(DsqlAuthPluginTest, Connect_RegionKeyIsLowercased) {
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "EU-WEST-1");
+    ExpectTokenForRegion("eu-west-1");
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_EnvRegionIsLowercased) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    SetEnvVar("AWS_REGION", "CA-CENTRAL-1");
+    ExpectTokenForRegion("ca-central-1");
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+namespace {
+    const std::string CLUSTER_ID = "abcdefghijklmnopqrstuvwxyz";
+    const std::string NO_REGION_ERROR =
+        "DSQL Authentication failed. Region is required when host is a cluster ID (set 'REGION')";
+
+    std::map<std::string, std::string> DsqlAttributes(const std::string& server) {
+        return {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {KEY_SERVER, server}};
+    }
+}  // namespace
+
+// A bare cluster ID connects to <id>.dsql.<region>.on.aws, as in the Aurora DSQL connectors.
+TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_EQ("", error);
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_AuthTypeIsCaseInsensitive) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, "dsql"}, {KEY_SERVER, CLUSTER_ID},
+                                                    {KEY_REGION, "eu-west-1"}};
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromEnv) {
+    SetEnvVar("AWS_REGION", "ca-central-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ca-central-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// Containers and CI hosts often set only AWS_DEFAULT_REGION.
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromAwsDefaultRegion) {
+    SetEnvVar("AWS_DEFAULT_REGION", "ap-northeast-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ap-northeast-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromProfile) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dev");  // region = us-west-2 in the fixture
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.us-west-2.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The region in IAM_HOST's endpoint, the host the token is signed for, comes before the environment's.
+TEST_F(DsqlAuthPluginTest, ClusterId_RegionFromIamHostEndpoint) {
+    SetEnvVar("AWS_REGION", "ca-central-1");
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID + ".dsql.eu-west-1.on.aws");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The majority connectors' rule: no region, no endpoint. Nothing is changed.
+TEST_F(DsqlAuthPluginTest, ClusterId_NoRegion_Fails) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(NO_REGION_ERROR, error);
+    EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER));
+}
+
+// DNS is case-insensitive and region names are lowercase, so an uppercase ID or region still names the cluster.
+TEST_F(DsqlAuthPluginTest, ClusterId_UppercaseIdAndRegion_AreLowercased) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    conn_attr.insert_or_assign(KEY_REGION, "EU-WEST-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// Only exactly 26 letters or digits make a cluster ID. Anything else is a host name, left as typed, with no region.
+TEST_F(DsqlAuthPluginTest, ClusterId_OtherHosts_Unchanged) {
+    const std::vector<std::string> hosts = {CLUSTER_ID.substr(1), CLUSTER_ID + "0", "abcdefghijklmnopqrstuvwxy-",
+                                            "localhost", "10.0.0.1", "::1", CLUSTER_ID + ".dsql.us-east-1.on.aws", ""};
+    for (const std::string& host : hosts) {
+        std::map<std::string, std::string> conn_attr = DsqlAttributes(host);
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << host;
+        EXPECT_EQ(host, conn_attr.at(KEY_SERVER)) << host;
+        EXPECT_EQ("", error) << host;
+    }
+}
+
+// A cluster ID means a DSQL endpoint only under RDS_AUTH_TYPE=DSQL; under any other auth type it's a host name.
+TEST_F(DsqlAuthPluginTest, ClusterId_OtherAuthType_Unchanged) {
+    for (const std::string auth_type : {"IAM", "DATABASE", ""}) {
+        std::map<std::string, std::string> conn_attr = {{KEY_SERVER, CLUSTER_ID}, {KEY_REGION, "eu-west-1"}};
+        if (!auth_type.empty()) {
+            conn_attr.insert_or_assign(KEY_AUTH_TYPE, auth_type);
+        }
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << auth_type;
+        EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER)) << auth_type;
+    }
+}
+
+// PrivateLink without private DNS: SERVER is the endpoint's own name and the token is signed for IAM_HOST, which can be
+// a cluster ID too.
+TEST_F(DsqlAuthPluginTest, ClusterId_InIamHost_Expanded) {
+    const std::string vpce_host = "vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.ap-southeast-2.vpce.amazonaws.com";
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(vpce_host);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "ap-southeast-2");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.ap-southeast-2.on.aws", conn_attr.at(KEY_IAM_HOST));
+    EXPECT_EQ(vpce_host, conn_attr.at(KEY_SERVER));
+}
+
+// The Windows dialog shows IAM Host for Aurora DSQL, so the cluster ID can end up in both fields.
+TEST_F(DsqlAuthPluginTest, ClusterId_InServerAndIamHost_BothExpanded) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_IAM_HOST, CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_IAM_HOST));
+}
+
+// A reused connection handle keeps the expanded SERVER when the new connection string has none, so a second pass must
+// leave it alone.
+TEST_F(DsqlAuthPluginTest, ClusterId_AlreadyExpanded_Unchanged) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    ASSERT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    conn_attr.erase(KEY_REGION);
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+}
+
+// The plugin service takes its host, cluster ID and dialect from SERVER, so the expansion runs first in
+// RDS_InitializeConnection: SERVER is expanded even though loading the base driver fails afterwards.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ExpandsClusterIdFirst) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", dbc_->conn_attr.at(KEY_SERVER));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("IM003", dbc_->err->sqlstate);
+    EXPECT_EQ(nullptr, dbc_->plugin_service);
+    dbc_->env = nullptr;
+}
+
+// Without a region the connect fails with 08001 before the base driver is loaded (that would be IM003 here).
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBeforeLoadingTheDriver) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("08001", dbc_->err->sqlstate);
+    EXPECT_EQ(NO_REGION_ERROR, std::string(dbc_->err->error_msg));
+    EXPECT_FALSE(env.driver_lib_loader);
+    dbc_->env = nullptr;
+}
+
+// The expansion also runs before the attribute check: a region-less cluster ID with an invalid TOKEN_EXPIRATION reports
+// the 08001, not the validator's 01S00.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ClusterIdWithoutRegion_FailsBeforeTheAttributeCheck) {
+    ENV env;
+    dbc_->env = &env;
+    dbc_->conn_attr = DsqlAttributes(CLUSTER_ID);
+    dbc_->conn_attr.insert_or_assign(KEY_TOKEN_EXPIRATION, "-1");
+    dbc_->conn_attr.insert_or_assign(KEY_BASE_DRIVER, "/nonexistent/path/no-such-driver.so");
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("08001", dbc_->err->sqlstate);
+    EXPECT_EQ(NO_REGION_ERROR, std::string(dbc_->err->error_msg));
+    dbc_->env = nullptr;
+}
+
+// libpq keywords are whole words: fallback_application_name isn't application_name, and a path that mentions
+// sslrootcert isn't the sslrootcert option.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptMatchesWholeKeywords) {
+    std::map<std::string, std::string> conn_attr = {
+        {"PQOPT", "{fallback_application_name=etl sslcert=/certs/sslrootcert-client.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{fallback_application_name=etl sslcert=/certs/sslrootcert-client.pem sslrootcert=system "
+              "application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// A single-quoted value can hold spaces and '=' (PrivateLink: options='-c amzn-cluster-id=<id>'); nothing inside it
+// is a keyword. Spaces around '=' are allowed.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptSkipsQuotedValues) {
+    std::map<std::string, std::string> conn_attr = {
+        {"PQOPT", "{options='-c sslrootcert=x' application_name = 'billing app'}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{options='-c sslrootcert=x' application_name = 'billing app' sslrootcert=system}", conn_attr.at("PQOPT"));
+}
+
+// A connection string value keeps the spaces typed around it; they must not stop the braces from being unwrapped.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptTrimsSpaces) {
+    std::map<std::string, std::string> conn_attr = {{"PQOPT", "  { sslrootcert=/etc/ssl/corp-ca.pem }  "}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{sslrootcert=/etc/ssl/corp-ca.pem application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// A Windows path typed with backslashes stays as typed (libpq reads a backslash as an escape; the page says to use
+// forward slashes) and is still the user's sslrootcert: a sslrootcert=system after it would win, because libpq keeps
+// the last of a repeated keyword.
+TEST_F(DsqlAuthPluginTest, Defaults_PqoptKeepsBackslashPath) {
+    std::map<std::string, std::string> conn_attr = {{"PQOPT", "{sslrootcert=C:\\certs\\AmazonRootCA1.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("{sslrootcert=C:\\certs\\AmazonRootCA1.pem application_name=" + EXPECTED_APP_NAME + "}",
+              conn_attr.at("PQOPT"));
+}
+
+// The hint needs the sslrootcert value to be exactly "system", however the option is spaced.
+TEST_F(DsqlAuthPluginTest, RootCertHint_MatchesTheSystemValueOnly) {
+    const std::string error = "SSL error: certificate verify failed";
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint({{"PQOPT", "{sslrootcert=system_roots.pem}"}}, error));
+    EXPECT_NE("", DsqlAuthPlugin::GetRootCertHint({{"PQOPT", "{sslrootcert = system}"}}, error));
+}
+
+// On Windows, libpq can report OpenSSL's "unregistered scheme" for sslrootcert=system (DSQL user guide, Configuring
+// SSL/TLS certificates, Windows).
+TEST_F(DsqlAuthPluginTest, RootCertHint_WindowsUnregisteredScheme) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr,
+        "connection to server at \"x.dsql.us-east-1.on.aws\" (10.0.0.1), port 5432 failed: SSL error: unregistered scheme");
+    EXPECT_NE(std::string_view::npos, hint.find("pqopt={sslrootcert="));
+}
+
+namespace {
+    std::string OverrideWarning(const std::string& mode) {
+        return "SSLmode=" + mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
+               "verify-ca or require.";
+    }
+}  // namespace
+
+// The override reaches the app, not only the log: SQL_SUCCESS_WITH_INFO with 01S02 (option value changed).
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ReturnsOptionValueChanged) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    ExpectTokenForRegion("us-west-2");
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("01S02", dbc_->err->sqlstate);
+    EXPECT_EQ(WARN_OPTION_VALUE_CHANGED, dbc_->err->native_err);
+    EXPECT_EQ(OverrideWarning("disable"), std::string(dbc_->err->error_msg));
+    EXPECT_EQ("verify-full", dbc_->conn_attr.at("SSLMODE"));
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_KeptOrDefaultSslMode_NoWarning) {
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    for (const std::string mode : {"", "verify-full", "Verify-CA", "require"}) {
+        dbc_->conn_attr.erase("SSLMODE");
+        dbc_->conn_attr.erase("PQOPT");
+        if (!mode.empty()) {
+            dbc_->conn_attr.insert_or_assign("SSLMODE", mode);
+        }
+        EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider()) << mode;
+        EXPECT_EQ(nullptr, dbc_->err) << mode;
+    }
+}
+
+// The wrapper keeps one record per handle, and its record hides the base driver's. When psqlODBC has its own
+// warnings (a short output buffer gets 01004), they stay; the override is only logged.
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_KeepsBaseDriverWarnings) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "prefer");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS_WITH_INFO));
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ConnectWithMockProvider());
+    EXPECT_EQ(nullptr, dbc_->err);
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_ERROR));
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    EXPECT_EQ(nullptr, dbc_->err);
+}
+
+// Only the three long names are kept; psqlODBC's short forms (d, a, p, r, vc, vf) are replaced too.
+TEST_F(DsqlAuthPluginTest, TlsOverrideWarning_OnlyForReplacedModes) {
+    for (const std::string mode : {"disable", "allow", "prefer", "d", "vf", "verify-fulll"}) {
+        EXPECT_EQ(OverrideWarning(mode), DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;
+    }
+    EXPECT_EQ(OverrideWarning("allow"), DsqlAuthPlugin::GetTlsOverrideWarning({{"CA", "allow"}}));
+    for (const std::string mode : {"verify-full", "VERIFY-CA", "require", "Require"}) {
+        EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({{"SSLMODE", mode}})) << mode;
+    }
+    EXPECT_EQ("", DsqlAuthPlugin::GetTlsOverrideWarning({}));
+}
+
+// An expired AWS IAM Identity Center (SSO) session is the usual cause with a named profile, so the error says how to
+// renew it.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_NamesTheProfileToLogIn) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dev");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication with the 'AWS_PROFILE' profile 'dev'. If it "
+                 "is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile dev'.", dbc_->err->error_msg);
+}
+
+// The default chain reads the AWS_PROFILE variable too, so that profile is named.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_EnvProfileInHint) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    SetEnvVar("AWS_PROFILE", "env_profile");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_NE(std::string::npos, std::string(dbc_->err->error_msg).find("run 'aws sso login --profile env_profile'"));
+}
+
+// AWS_PROFILE=default exported in the shell names a profile too: an SSO profile called default needs the same login.
+TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_DefaultProfileFromEnvIsNamed) {
+    mock_auth_provider_->mock_has_resolved_credentials = false;
+    SetEnvVar("AWS_PROFILE", "default");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_STREQ("Unable to resolve AWS credentials for DSQL authentication with the 'AWS_PROFILE' profile 'default'. "
+                 "If it is an AWS IAM Identity Center (SSO) profile, run 'aws sso login --profile default'.",
+                 dbc_->err->error_msg);
 }

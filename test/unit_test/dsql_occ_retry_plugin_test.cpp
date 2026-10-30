@@ -1078,3 +1078,58 @@ TEST_F(DsqlOccRetryExecuteTest, EndTran_EndsATrackedTransaction) {
     EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
     EXPECT_EQ(2U, AttemptsForAConflict());
 }
+
+namespace {
+    // No "psql" in it, so the path alone gives no dialect.
+    const char* const FAKE_DRIVER_PATH = "/nonexistent/occ-retry-test-driver.so";
+    const std::string DSQL_ENDPOINT = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
+
+    // The plugin names from the head of the chain down.
+    std::vector<std::string> ChainNames(const BasePlugin* head) {
+        std::vector<std::string> names;
+        for (const BasePlugin* plugin = head; plugin != nullptr; plugin = plugin->GetNextPlugin()) {
+            names.push_back(plugin->GetPluginName());
+        }
+        return names;
+    }
+}  // namespace
+
+// RDS_InitializeConnection without a base driver: the environment already holds a loader for the same path (which
+// doesn't load) and a base environment handle, so the function goes straight to building the plugin chain.
+class DsqlOccRetryChainTest : public testing::Test {
+protected:
+    ENV* env_ = nullptr;
+    DBC* dbc_ = nullptr;
+    int base_env_stand_in_ = 0;
+
+    void SetUp() override {
+        env_ = new ENV();
+        env_->driver_lib_loader = std::make_shared<RdsLibLoader>(FAKE_DRIVER_PATH);
+        env_->wrapped_env = static_cast<SQLHENV>(&base_env_stand_in_);
+        dbc_ = new DBC();
+        dbc_->env = env_;
+        dbc_->conn_attr = {{KEY_BASE_DRIVER, FAKE_DRIVER_PATH}, {KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}};
+    }
+
+    void TearDown() override {
+        delete dbc_;
+        delete env_;
+    }
+};
+
+// The chain on Aurora DSQL: the DSQL error hint plugin outermost, so it sees only the result the application gets,
+// then the OCC retry plugin, then the rest.
+TEST_F(DsqlOccRetryChainTest, DsqlEndpoint_PutsTheOccRetryPluginInsideTheErrorHints) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_ENDPOINT);
+    ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
+    EXPECT_EQ((std::vector<std::string>{"DSQL_OCC_RETRY", "DefaultPlugin"}), ChainNames(dbc_->plugin_head));
+}
+
+TEST_F(DsqlOccRetryChainTest, RetryOff_LeavesItOut) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_ENDPOINT);
+    dbc_->conn_attr.insert_or_assign(KEY_ENABLE_OCC_RETRY, VALUE_BOOL_FALSE);
+    ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
+    const std::vector<std::string> chain = ChainNames(dbc_->plugin_head);
+    ASSERT_FALSE(chain.empty());
+    EXPECT_EQ(chain.end(), std::ranges::find(chain, std::string("DSQL_OCC_RETRY")));
+}

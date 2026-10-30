@@ -27,6 +27,7 @@
 #include "plugin/default_plugin.h"
 #include "plugin/dsql/dsql_auth_plugin.h"
 #include "plugin/dsql/dsql_compatibility.h"
+#include "plugin/dsql/dsql_occ_retry_plugin.h"
 #include "plugin/failover/failover_plugin.h"
 #include "plugin/federated/adfs_auth_plugin.h"
 #include "plugin/federated/aws_sso_auth_plugin.h"
@@ -3055,6 +3056,13 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
                 && dbc->conn_attr.at(KEY_ENABLE_BLUE_GREEN) == VALUE_BOOL_TRUE)
             {
                 plugin_head = std::make_shared<BlueGreenPlugin>(dbc, plugin_head);
+            }
+
+            // Aurora DSQL OCC retry. Inside the DSQL error hint plugin; a retry runs the chain below it again.
+            if (dbc->conn_attr.contains(KEY_ENABLE_OCC_RETRY)
+                && dbc->conn_attr.at(KEY_ENABLE_OCC_RETRY) == VALUE_BOOL_TRUE)
+            {
+                plugin_head = std::make_shared<DsqlOccRetryPlugin>(dbc, plugin_head);
             }
 
             // Finalize and track in DBC

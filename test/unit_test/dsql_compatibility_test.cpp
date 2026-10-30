@@ -351,3 +351,87 @@ TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_DsqlHandleBetweenConnect
     EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
     EXPECT_FALSE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
 }
+
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_SetEveryOption) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+    const std::map<std::string, std::string> expected = {
+        {"IGNORETIMEOUT", "1"}, {"PROTOCOL", "7.4-0"}, {"USEDECLAREFETCH", "0"}, {"USESERVERSIDEPREPARE", "0"}};
+    EXPECT_EQ(expected, conn_attr);
+}
+
+// No "-<level>" means the default level, which sends SAVEPOINT; levels 1 and 2 send it too.
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_OverrideUserProtocol) {
+    for (const char* protocol : {"7.4", "7.4-2", "7.4-1"}) {
+        std::map<std::string, std::string> conn_attr = {{"PROTOCOL", protocol}};
+        DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+        EXPECT_EQ("7.4-0", conn_attr.at("PROTOCOL")) << protocol;
+    }
+    std::map<std::string, std::string> short_form = {{"A1", "7.4-1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(short_form);
+    EXPECT_FALSE(short_form.contains("A1"));
+    EXPECT_EQ("7.4-0", short_form.at("PROTOCOL"));
+}
+
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_OverrideUserIgnoreTimeout) {
+    std::map<std::string, std::string> long_form = {{"IGNORETIMEOUT", "0"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(long_form);
+    EXPECT_EQ("1", long_form.at("IGNORETIMEOUT"));
+
+    std::map<std::string, std::string> short_form = {{"D9", "0"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(short_form);
+    EXPECT_FALSE(short_form.contains("D9"));
+    EXPECT_EQ("1", short_form.at("IGNORETIMEOUT"));
+}
+
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_OverrideUserDeclareFetch) {
+    std::map<std::string, std::string> long_form = {{"USEDECLAREFETCH", "1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(long_form);
+    EXPECT_EQ("0", long_form.at("USEDECLAREFETCH"));
+
+    std::map<std::string, std::string> short_form = {{"B6", "1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(short_form);
+    EXPECT_FALSE(short_form.contains("B6"));
+    EXPECT_EQ("0", short_form.at("USEDECLAREFETCH"));
+}
+
+// What psqlODBC gets: each option once, under its long keyword, after the CX flags.
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_BaseDriverStringHasOnlyLongKeysAfterCx) {
+    std::map<std::string, std::string> conn_attr = {
+        {"A1", "7.4-2"}, {"D9", "0"}, {"B6", "1"}, {"C8", "1"}, {"CX", "1c2305bab"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+    EXPECT_EQ("CX=1c2305bab;IGNORETIMEOUT=1;PROTOCOL=7.4-0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
+              ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
+}
+
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_LogEachOverride) {
+    CapturingLogSink log;
+    std::map<std::string, std::string> user_values = {{"PROTOCOL", "7.4"}, {"IGNORETIMEOUT", "0"}, {"B6", "1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(user_values);
+    std::map<std::string, std::string> already_right = {
+        {"PROTOCOL", "7.4-0"}, {"IGNORETIMEOUT", "1"}, {"USEDECLAREFETCH", "0"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(already_right);
+    EXPECT_EQ(1, log.Count("[DSQL] Overriding Protocol=7.4 with 7.4-0: Aurora DSQL doesn't support savepoints"));
+    EXPECT_EQ(1, log.Count("[DSQL] Overriding IgnoreTimeout=0 with 1: Aurora DSQL doesn't support statement_timeout"));
+    EXPECT_EQ(1, log.Count("[DSQL] Overriding UseDeclareFetch=1 with 0: Aurora DSQL doesn't support cursors"));
+    EXPECT_EQ(3, log.Count("[DSQL] Overriding "));
+}
+
+TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_SetsEveryOption) {
+    UseServer(DSQL_HOST);
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ("7.4-0", dbc_.conn_attr.at("PROTOCOL"));
+    EXPECT_EQ("1", dbc_.conn_attr.at("IGNORETIMEOUT"));
+    EXPECT_EQ("0", dbc_.conn_attr.at("USEDECLAREFETCH"));
+    EXPECT_EQ("0", dbc_.conn_attr.at("USESERVERSIDEPREPARE"));
+}
+
+// A connection string as users write it: psqlODBC's mixed-case keywords and its short forms. The wrapper's parser
+// upper-cases every key, so each form is replaced.
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_ReplaceOptionsAsUsersWriteThem) {
+    std::map<std::string, std::string> conn_attr;
+    ConnectionStringHelper::ParseConnectionString("UseServerSidePrepare=1;Protocol=7.4;usedeclarefetch=1;D9=0;", conn_attr);
+    DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+    EXPECT_EQ("IGNORETIMEOUT=1;PROTOCOL=7.4-0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
+              ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
+}

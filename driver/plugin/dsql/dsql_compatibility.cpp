@@ -42,6 +42,17 @@ namespace {
     };
 
     constexpr std::array FORCED_OPTIONS = {
+        // Rollback level 0: no SAVEPOINT before the second and later statements of a transaction or around psqlODBC's
+        // own queries, and no automatic ROLLBACK. Aurora DSQL rejects SAVEPOINT.
+        ForcedOption{.name = "Protocol", .key = "PROTOCOL", .short_key = "A1", .value = "7.4-0",
+                     .reason = "Aurora DSQL doesn't support savepoints"},
+        // A query timeout makes psqlODBC send SET statement_timeout before the statement. Aurora DSQL rejects that
+        // parameter and enforces its own limits.
+        ForcedOption{.name = "IgnoreTimeout", .key = "IGNORETIMEOUT", .short_key = "D9", .value = "1",
+                     .reason = "Aurora DSQL doesn't support statement_timeout"},
+        // UseDeclareFetch=1 turns every SELECT into DECLARE ... CURSOR WITH HOLD. Aurora DSQL has no cursors.
+        ForcedOption{.name = "UseDeclareFetch", .key = "USEDECLAREFETCH", .short_key = "B6", .value = "0",
+                     .reason = "Aurora DSQL doesn't support cursors"},
         // No named plans, so no DEALLOCATE when a prepared statement is freed or prepared again. psqlODBC wraps that
         // DEALLOCATE in SAVEPOINT (before 18.00.0003 at every rollback level, since then at every level but 0) and
         // ignores its error. Aurora DSQL rejects SAVEPOINT, which aborts the transaction, and the COMMIT after it

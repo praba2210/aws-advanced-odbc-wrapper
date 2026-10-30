@@ -408,6 +408,19 @@ TEST_F(DsqlOccRetryPluginTest, Prepare_KeepsOnlyTextLengthCharacters) {
     EXPECT_EQ("COMMIT", stmt_->prepared_text);
 }
 
+#if UNICODE
+// An app with 4-byte SQLWCHARs gives TextLength in code points: "COMMITX" cut to 6 is a COMMIT, and 0 is no text.
+TEST_F(DsqlOccRetryPluginTest, Prepare_FourByteApp_KeepsOnlyTextLengthCharacters) {
+    env_->use_4_bytes_user_app = true;
+    std::u32string commit = U"COMMITX";
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLPrepare(stmt_, reinterpret_cast<SQLTCHAR*>(commit.data()), 6));
+    EXPECT_EQ("COMMIT", stmt_->prepared_text);
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLPrepare(stmt_, reinterpret_cast<SQLTCHAR*>(commit.data()), 0));
+    EXPECT_EQ("", stmt_->prepared_text);
+    env_->use_4_bytes_user_app = false;
+}
+#endif
+
 TEST_F(DsqlOccRetryPluginTest, Prepare_FailureKeepsNoText) {
     stmt_->prepared_text = "SELECT 1";
     g_prepare_result = SQL_ERROR;

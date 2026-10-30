@@ -435,3 +435,48 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_ReplaceOptionsAsUsersWriteThem) 
     EXPECT_EQ("IGNORETIMEOUT=1;PROTOCOL=7.4-0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
               ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
 }
+
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_Dsql_ReturnsOptionValueChanged) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0));
+    ASSERT_NE(nullptr, stmt_.err);
+    EXPECT_STREQ("01S02", stmt_.err->sqlstate);
+    EXPECT_STREQ("SQL_ATTR_QUERY_TIMEOUT changed to 0: Aurora DSQL doesn't support query timeouts (it limits each "
+                 "transaction to 5 minutes)", stmt_.err->error_msg);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
+    EXPECT_FALSE(stmt_.attr_map.contains(SQL_ATTR_QUERY_TIMEOUT));
+}
+
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_DsqlZero_ReachesBaseDriver) {
+    UseServer(DSQL_HOST);
+    Connect();
+    RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(0), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
+}
+
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_OtherDatabase_ReachesBaseDriver) {
+    UseServer(AURORA_HOST);
+    Connect();
+    RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
+}
+
+// ODBC 2 sets the timeout for later statements on the connection.
+TEST_F(DsqlCompatibilityTest, SetConnectQueryTimeout_Dsql_ReturnsOptionValueChanged) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectOption(&dbc_, SQL_QUERY_TIMEOUT, 30));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("01S02", dbc_.err->sqlstate);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.attr_map.contains(SQL_QUERY_TIMEOUT));
+}
+
+TEST_F(DsqlCompatibilityTest, SetConnectAttr_Dsql_OtherAttributesReachBaseDriver) {
+    UseServer(DSQL_HOST);
+    Connect();
+    RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(SQL_AUTOCOMMIT_OFF), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.auto_commit);
+}

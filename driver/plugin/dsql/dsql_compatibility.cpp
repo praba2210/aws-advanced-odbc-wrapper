@@ -130,6 +130,19 @@ namespace {
         dbc->err = std::make_unique<ErrInfo>(message.c_str(), WARN_OPTION_VALUE_CHANGED);
         return SQL_SUCCESS_WITH_INFO;
     }
+
+    const std::string QUERY_TIMEOUT_CHANGED =
+        "SQL_ATTR_QUERY_TIMEOUT changed to 0: Aurora DSQL doesn't support query timeouts (it limits each transaction to "
+        "5 minutes)";
+
+    // The answer to a non-zero query timeout. psqlODBC isn't called, so it keeps 0 and sends no SET statement_timeout.
+    // INFO, not WARNING: tools set a timeout on every statement.
+    SQLRETURN QueryTimeoutChanged(std::unique_ptr<ErrInfo>& err, SQLULEN requested)
+    {
+        LOG(INFO) << "[DSQL] " << QUERY_TIMEOUT_CHANGED << " (requested " << requested << ")";
+        err = std::make_unique<ErrInfo>(QUERY_TIMEOUT_CHANGED.c_str(), WARN_OPTION_VALUE_CHANGED);
+        return SQL_SUCCESS_WITH_INFO;
+    }
 }  // namespace
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
@@ -175,7 +188,22 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEG
                 return KeepForcedAttribute(dbc, *forced, IntegerValue(value));
             }
             return std::nullopt;
+        case SQL_ATTR_QUERY_TIMEOUT:
+            // ODBC 2 sets the timeout for later statements this way (SQLSetConnectOption).
+            if (const SQLULEN timeout = IntegerValue(value); timeout != 0 && IsDsql(dbc)) {
+                return QueryTimeoutChanged(dbc->err, timeout);
+            }
+            return std::nullopt;
         default:
             return std::nullopt;
     }
+}
+
+std::optional<SQLRETURN> DsqlCompatibility::TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value)
+{
+    if (const SQLULEN timeout = IntegerValue(value);
+        attribute == SQL_ATTR_QUERY_TIMEOUT && timeout != 0 && IsDsql(stmt->dbc)) {
+        return QueryTimeoutChanged(stmt->err, timeout);
+    }
+    return std::nullopt;
 }

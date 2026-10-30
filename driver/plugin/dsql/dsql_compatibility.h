@@ -24,6 +24,7 @@
 #include <string>
 
 struct DBC;
+struct STMT;
 
 // What the wrapper changes so that psqlODBC works on Aurora DSQL. Everything here applies only to connections
 // DsqlConnectionValidator::IsDsqlTarget calls Aurora DSQL.
@@ -44,6 +45,10 @@ namespace DsqlCompatibility {
     // make psqlODBC send a statement Aurora DSQL rejects: the result to return without calling psqlODBC, or nullopt to
     // call it as usual.
     std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
+
+    // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without
+    // calling psqlODBC. nullopt for anything else.
+    std::optional<SQLRETURN> TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value);
 }  // namespace DsqlCompatibility
 
 #endif // DSQL_COMPATIBILITY_H_

@@ -2606,6 +2606,11 @@ SQLRETURN RDS_SQLSetStmtAttr(
             break;
     }
 
+    // A query timeout would make psqlODBC send SET statement_timeout, which Aurora DSQL rejects.
+    if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetStmtAttr(stmt, Attribute, ValuePtr)) {
+        return *dsql_ret;
+    }
+
     if (stmt->wrapped_stmt) {
         const RdsLibResult res = NULL_CHECK_CALL_LIB_FUNC(env->driver_lib_loader, RDS_FP_SQLSetStmtAttr, RDS_STR_SQLSetStmtAttr,
             stmt->wrapped_stmt, Attribute, ValuePtr, StringLength

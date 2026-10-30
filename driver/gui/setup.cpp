@@ -29,10 +29,12 @@
 #include <wchar.h>
 #include <map>
 #include <regex>
+#include <unordered_set>
 #include <vector>
 #include <commdlg.h>
 
 #include "resource.h"
+#include "../util/attribute_validator.h"
 #include "../util/connection_string_keys.h"
 #include "../util/odbc_dsn_helper.h"
 #include "../odbcapi_rds_helper.h"
@@ -709,8 +711,38 @@ void SaveKey(std::string profile, std::string key, std::string value)
     }
 }
 
+// Checks the Aurora DSQL tab with the driver's connect-time validator, so the dialog doesn't save a DSN whose every
+// connect fails. A blank field isn't checked: it stays empty in the DSN and the driver uses the option's default.
+bool DsqlSettingsValid()
+{
+    std::map<std::string, std::string> values;
+    for (const auto& keys : OCC_RETRY_KEYS) {
+        const std::string value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            values.insert_or_assign(keys.first, value);
+        }
+    }
+
+    const std::unordered_set<std::string> invalid = AttributeValidator::ValidateMap(values);
+    if (invalid.empty()) {
+        return true;
+    }
+
+    std::string message = "Invalid value on the Aurora DSQL tab:";
+    for (const std::string& entry : invalid) {
+        message += "\n" + entry;
+    }
+    MessageBox(main_win, RDS_TSTR(message).c_str(), _T("Save DSN"), MB_OK);
+    return false;
+}
+
 bool SaveDsn()
 {
+    // Under SQL_DRIVER_COMPLETE_REQUIRED the tabs are read-only, so the connect reports a bad value instead.
+    if (!disable_optional && !DsqlSettingsValid()) {
+        return false;
+    }
+
     if (driver_connect) {
         connection_str = GetDsn(true);
         out_connection_str = GetDsn(false);

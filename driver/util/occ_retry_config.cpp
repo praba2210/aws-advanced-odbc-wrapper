@@ -83,15 +83,19 @@ std::optional<OccRetryConfig> OccRetryConfig::Parse(const std::map<std::string, 
         config.base_delay_ms = *delay;
     }
 
-    // Checked even when only the base is set: the 5000 ms default cap can be below it.
+    const std::string range = std::string("an integer from ") + KEY_OCC_BASE_DELAY_MS + ", "
+        + std::to_string(config.base_delay_ms) + ", to " + std::to_string(DELAY_LIMIT_MS);
     const std::string* max_delay = FindValue(conn_attr, KEY_OCC_MAX_DELAY_MS);
     if (max_delay != nullptr) {
-        // A value that isn't an integer becomes 0, which fails the range check below.
-        config.max_delay_ms = NumberUtils::ParseInt(*max_delay).value_or(0);
+        const std::optional<int> delay = NumberUtils::ParseInt(*max_delay);
+        if (!delay.has_value()) {
+            error = InvalidValue(KEY_OCC_MAX_DELAY_MS, *max_delay, "use " + range);
+            return std::nullopt;
+        }
+        config.max_delay_ms = *delay;
     }
+    // Checked even when only the base is set: the 5000 ms default cap can be below it.
     if (config.max_delay_ms < config.base_delay_ms || config.max_delay_ms > DELAY_LIMIT_MS) {
-        const std::string range = std::string("an integer from ") + KEY_OCC_BASE_DELAY_MS + ", "
-            + std::to_string(config.base_delay_ms) + ", to " + std::to_string(DELAY_LIMIT_MS);
         error = max_delay != nullptr
             ? InvalidValue(KEY_OCC_MAX_DELAY_MS, *max_delay, "use " + range)
             : InvalidValue(KEY_OCC_MAX_DELAY_MS, std::to_string(DEFAULT_MAX_DELAY_MS), "the default; set it to " + range);

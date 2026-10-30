@@ -46,8 +46,9 @@ namespace DsqlCompatibility {
     // call it as usual.
     std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
 
-    // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without
-    // calling psqlODBC. nullopt for anything else.
+    // SQLSetStmtAttr on an Aurora DSQL connection whose first connect built the Aurora DSQL chain (dbc->dsql_lifetime
+    // is set): a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without calling psqlODBC. nullopt for anything
+    // else.
     std::optional<SQLRETURN> TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value);
 
     // SQLGetConnectAttr(SQL_ATTR_TXN_ISOLATION) on an Aurora DSQL connection whose wrapped handle is allocated: writes

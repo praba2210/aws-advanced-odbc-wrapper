@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -44,9 +43,14 @@ namespace {
     // transaction (OCC conflicts included).
     constexpr std::array<std::string_view, 3> NOT_A_FUNCTION_ERROR_CLASSES = {"00", "08", "40"};
 
+    // Folds A-Z only: std::tolower follows the process locale, and under tr_TR it doesn't turn I into i.
     bool NamesAdvisoryLockFunction(std::string text)
     {
-        std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        for (char& c : text) {
+            if (c >= 'A' && c <= 'Z') {
+                c = static_cast<char>(c - 'A' + 'a');
+            }
+        }
         return std::ranges::any_of(ADVISORY_LOCK_FUNCTION_PREFIXES, [&text](std::string_view prefix) {
             return text.find(prefix) != std::string::npos;
         });
@@ -193,6 +197,8 @@ void DsqlErrorHintPlugin::LogConnectionAgeHint(DBC* dbc, const std::string& sql_
 
 void DsqlErrorHintPlugin::ReadStmtError(STMT* stmt, std::string& sql_state, std::string& message)
 {
+    // Twice the lengths passed: for an app with a 4-byte SQLWCHAR, RDS_SQLGetDiagRec can copy 2 x MAX_SQL_STATE_LEN and
+    // 2 x DIAG_MESSAGE_CHARS SQLTCHARs into them. Smaller buffers would overflow.
     SQLTCHAR state_buffer[MAX_SQL_STATE_LEN * 2] = { 0 };
     SQLTCHAR message_buffer[DIAG_MESSAGE_CHARS * 2] = { 0 };
     SQLINTEGER native_error = 0;

@@ -42,8 +42,9 @@ namespace {
     };
 
     constexpr std::array FORCED_OPTIONS = {
-        // Rollback level 0: no SAVEPOINT before the second and later statements of a transaction or around psqlODBC's
-        // own queries, and no automatic ROLLBACK. Aurora DSQL rejects SAVEPOINT.
+        // Rollback level 0: no SAVEPOINT before the second and later statements of a transaction, none around
+        // psqlODBC's own queries (psqlODBC 18.00.0003 and later), and no automatic ROLLBACK. Aurora DSQL rejects
+        // SAVEPOINT.
         ForcedOption{.name = "Protocol", .key = "PROTOCOL", .short_key = "A1", .value = "7.4-0",
                      .reason = "Aurora DSQL doesn't support savepoints"},
         // A query timeout makes psqlODBC send SET statement_timeout before the statement. Aurora DSQL rejects that
@@ -97,7 +98,9 @@ namespace {
     struct ForcedAttribute {
         SQLINTEGER attribute;
         const char* name;  // psqlODBC's name, for the message
-        bool on;           // the forced setting; psqlODBC reads any non-zero value as on
+        // The forced setting. The wrapper takes any non-zero value as on. psqlODBC reads only the low byte (65539,
+        // 65540) or the low 32 bits (65551), but on Aurora DSQL the value never reaches it.
+        bool on;
         const char* reason;
     };
 
@@ -139,8 +142,9 @@ namespace {
         "SQL_ATTR_QUERY_TIMEOUT changed to 0: Aurora DSQL doesn't support query timeouts (it limits each transaction to "
         "5 minutes)";
 
-    // The answer to a non-zero query timeout. psqlODBC isn't called, so it keeps 0 and sends no SET statement_timeout.
-    // INFO, not WARNING: tools set a timeout on every statement.
+    // The answer to a non-zero query timeout. psqlODBC isn't called, so it keeps the timeout it had: 0, unless a
+    // connection-level timeout set before connect was replayed after it. IgnoreTimeout=1 keeps psqlODBC from sending
+    // SET statement_timeout either way. INFO, not WARNING: tools set a timeout on every statement.
     SQLRETURN QueryTimeoutChanged(std::unique_ptr<ErrInfo>& err, SQLULEN requested)
     {
         LOG(INFO) << "[DSQL] " << QUERY_TIMEOUT_CHANGED << " (requested " << requested << ")";
@@ -256,11 +260,17 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEG
 
 std::optional<SQLRETURN> DsqlCompatibility::TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value)
 {
-    if (const SQLULEN timeout = IntegerValue(value);
-        attribute == SQL_ATTR_QUERY_TIMEOUT && timeout != 0 && IsDsql(stmt->dbc)) {
-        return QueryTimeoutChanged(stmt->err, timeout);
+    const SQLULEN timeout = IntegerValue(value);
+    if (attribute != SQL_ATTR_QUERY_TIMEOUT || timeout == 0) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    // The caller holds only the statement's lock, and failover rewrites SERVER and PORT in conn_attr from another
+    // thread's statement. Only a connection whose first connect built the Aurora DSQL chain has a lifetime, set once
+    // then, and that chain never has failover; on any other connection conn_attr isn't read.
+    if (const DBC* dbc = stmt->dbc; dbc == nullptr || dbc->dsql_lifetime == nullptr || !IsDsql(dbc)) {
+        return std::nullopt;
+    }
+    return QueryTimeoutChanged(stmt->err, timeout);
 }
 
 bool DsqlCompatibility::TryGetConnectAttr(const DBC* dbc, SQLINTEGER attribute, SQLPOINTER value)

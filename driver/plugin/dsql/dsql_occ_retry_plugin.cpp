@@ -227,6 +227,8 @@ namespace {
     // RDS_SQLGetDiagRec, which leaves the record for the application (RDS_SQLError would use up SQLError's one record).
     void ReadDiagnostic(STMT* stmt, std::string& sql_state, std::string& message)
     {
+        // Twice the lengths passed: for an app with a 4-byte SQLWCHAR, RDS_SQLGetDiagRec can copy 2 x MAX_SQL_STATE_LEN
+        // and 2 x DIAG_MESSAGE_CHARS SQLTCHARs into them. Smaller buffers would overflow.
         SQLTCHAR state_buffer[MAX_SQL_STATE_LEN * 2] = {0};
         SQLTCHAR message_buffer[DIAG_MESSAGE_CHARS * 2] = {0};
         SQLINTEGER native_error = 0;

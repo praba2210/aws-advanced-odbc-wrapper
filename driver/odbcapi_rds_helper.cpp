@@ -2669,7 +2669,8 @@ SQLRETURN RDS_SQLSetStmtAttr(
             break;
     }
 
-    // A query timeout would make psqlODBC send SET statement_timeout, which Aurora DSQL rejects.
+    // On Aurora DSQL a non-zero query timeout gets 01S02 and doesn't reach psqlODBC, which wouldn't apply it
+    // (IgnoreTimeout=1): Aurora DSQL rejects SET statement_timeout.
     if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetStmtAttr(stmt, Attribute, ValuePtr)) {
         return *dsql_ret;
     }

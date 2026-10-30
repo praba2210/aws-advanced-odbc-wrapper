@@ -27,9 +27,10 @@
 #include <utility>
 #include <vector>
 
+#include "unicode/uloc.h"
+#include "unicode/utypes.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-#include <unicode/uloc.h>
 
 #include "../../driver/driver.h"
 #include "../../driver/error.h"
@@ -1111,9 +1112,10 @@ TEST_F(DsqlOccRetryExecuteTest, AutocommitSwitchedOn_EndsTheTransaction) {
 }
 
 // SQLEndTran ends a transaction the application opened with BEGIN in autocommit mode: psqlODBC sends the COMMIT
-// (execute.c:1313, statement.c:2149-2155), and the wrapper marks it closed (odbcapi_rds_helper.cpp:327-329).
+// (execute.c:1313, statement.c:2149-2155), and the wrapper's RDS_SQLEndTran marks it closed.
 TEST_F(DsqlOccRetryExecuteTest, EndTran_EndsATrackedTransaction) {
-    Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "\nBEGIN");
+    ASSERT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "\nBEGIN"));
+    ASSERT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT));
     EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
     EXPECT_EQ(2U, AttemptsForAConflict());
@@ -1235,6 +1237,23 @@ TEST(DsqlOccRetryCheckTest, AllowsAuroraDsqlAndRetryOff) {
         EXPECT_TRUE(DsqlConnectionValidator::CheckSettings(&dbc));
         EXPECT_FALSE(dbc.err);
     }
+}
+
+// The authentication type is checked first. An RDS token signed for an Aurora DSQL IAM_HOST gets that message, though
+// SERVER alone doesn't make the connection Aurora DSQL, so the OCC rule would reject it too.
+TEST(DsqlOccRetryCheckTest, RdsTokenForADsqlIamHost_ReportsTheAuthTypeFirst) {
+    DBC dbc;
+    dbc.conn_attr = {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM},
+                     {KEY_IAM_HOST, DSQL_ENDPOINT}, {KEY_SERVER, "localhost"}};
+    ASSERT_FALSE(DsqlConnectionValidator::IsDsqlTarget(dbc.conn_attr));
+    EXPECT_FALSE(DsqlConnectionValidator::CheckSettings(&dbc));
+    ASSERT_TRUE(dbc.err);
+    EXPECT_STREQ("08001", dbc.err->sqlstate);
+    EXPECT_STREQ("RDS_AUTH_TYPE=IAM doesn't work with Aurora DSQL: it signs an RDS IAM token, which Aurora DSQL rejects "
+                 "(IAM_HOST is an Aurora DSQL endpoint). Use RDS_AUTH_TYPE=DSQL, which signs an Aurora DSQL token with "
+                 "the credentials of AWS_PROFILE or the default credential chain; for an AWS IAM Identity Center (SSO) "
+                 "profile, run 'aws sso login' first.",
+                 dbc.err->error_msg);
 }
 
 // A connection that isn't Aurora DSQL keeps today's chain: neither the hint plugin nor the OCC retry plugin is added.

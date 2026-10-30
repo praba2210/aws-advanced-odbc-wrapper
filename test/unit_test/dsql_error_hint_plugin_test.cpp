@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <clocale>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -106,6 +107,8 @@ namespace {
 
         // A record to return instead of reading one; empty reads the real record.
         std::optional<std::pair<std::string, std::string>> diag;
+        // The SQLSTATE and message the last real read returned.
+        std::optional<std::pair<std::string, std::string>> read_record;
         // The base driver's SQL_ATTR_CONNECTION_DEAD; empty asks the real OdbcHelper.
         std::optional<bool> dead = true;
         std::vector<std::string> calls;
@@ -119,6 +122,7 @@ namespace {
                 return;
             }
             DsqlErrorHintPlugin::ReadStmtError(stmt, sql_state, message);
+            read_record = std::make_pair(sql_state, message);
         }
 
         bool IsConnectionDead(DBC* dbc) override {
@@ -210,6 +214,20 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterTheLimit_LogsTheHintO
     ASSERT_TRUE(stmt_->err);
     EXPECT_STREQ("08S01", stmt_->err->sqlstate);
     EXPECT_STREQ(CONNECTION_CLOSED.c_str(), stmt_->err->error_msg);
+}
+
+// The hints match on what the real read returns: the statement's record 1, in both builds.
+TEST_F(DsqlErrorHintPluginTest, Execute_TheRealReadReturnsTheRecordsStateAndMessage) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    next_->execute_err = ERR_COMMUNICATION_LINK_FAILURE;
+    next_->execute_message = CONNECTION_CLOSED;
+
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+
+    ASSERT_TRUE(plugin->read_record.has_value());
+    EXPECT_EQ("08S01", plugin->read_record->first);
+    EXPECT_EQ(CONNECTION_CLOSED, plugin->read_record->second);
 }
 
 // psqlODBC's SQLGetConnectAttr clears its connection error, which the statement's record no longer needs once read.
@@ -396,6 +414,26 @@ TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_FromTheStatementText) {
         "select PG_TRY_ADVISORY_LOCK(1)").empty());
 }
 
+// Hosts such as Python set LC_CTYPE from the environment. Under tr_TR, std::tolower doesn't turn I into i, so the
+// match folds A-Z itself. Needs the tr_TR.UTF-8 locale.
+TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_TurkishCtype_UpperCaseNamesStillMatch) {
+    const std::string saved = std::setlocale(LC_CTYPE, nullptr);
+    if (std::setlocale(LC_CTYPE, "tr_TR.UTF-8") == nullptr) {
+        GTEST_SKIP() << "no tr_TR.UTF-8 locale";
+    }
+    // Puts the C library's LC_CTYPE back when the test ends, also when it fails.
+    struct CtypeGuard {
+        std::string saved;
+        ~CtypeGuard() { std::setlocale(LC_CTYPE, saved.c_str()); }
+    };
+    const CtypeGuard guard{.saved = saved};
+
+    EXPECT_FALSE(DsqlErrorHintPlugin::GetAdvisoryLockHint("42883",
+        "ERROR: function PG_ADVISORY_LOCK(bigint) does not exist", "").empty());
+    EXPECT_FALSE(DsqlErrorHintPlugin::GetAdvisoryLockHint("0A000", "ERROR: unsupported statement",
+        "SELECT PG_TRY_ADVISORY_LOCK(1)").empty());
+}
+
 TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_NoneForOtherErrors) {
     // A rolled-back transaction or a lost connection, even with the function in the text.
     EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("40001",
@@ -495,6 +533,29 @@ TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheAgeBeforeTheConnectAndClearsItO
     next_->connect_ret = SQL_ERROR;
     EXPECT_EQ(SQL_ERROR, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_FALSE(dbc_->dsql_lifetime->Age().has_value());
+}
+
+// Each connect starts the lifetime with the connection's MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD reads.
+TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheLifetimeWithMaxConnectionLifetime) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    // An open connection, as the rest of the chain leaves it.
+    dbc_->wrapped_dbc = static_cast<SQLHDBC>(dbc_);
+    dbc_->conn_status = CONN_CONNECTED;
+
+    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}};
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    now_ += std::chrono::seconds(1800) - std::chrono::milliseconds(1);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+    now_ += std::chrono::milliseconds(1);
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+
+    // Read again on every connect: 0 turns retirement off.
+    dbc_->conn_attr.insert_or_assign(KEY_MAX_CONNECTION_LIFETIME, "0");
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    now_ += std::chrono::hours(24);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+
+    dbc_->wrapped_dbc = SQL_NULL_HDBC;
 }
 
 // The plugin that keeps the age creates it, so SQL_ATTR_CONNECTION_DEAD can read it. Other connections get none.

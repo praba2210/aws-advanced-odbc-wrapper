@@ -32,6 +32,7 @@
 #include "../../driver/plugin/dsql/dsql_compatibility.h"
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_connection_lifetime.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
 
@@ -141,10 +142,14 @@ protected:
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
     }
 
-    // Any non-null handles, so the wrapper treats the connection and the statement as open.
+    // Any non-null handles, so the wrapper treats the connection and the statement as open. On Aurora DSQL, the
+    // connection's lifetime too, which the first connect's chain build creates.
     void Connect() {
         dbc_.wrapped_dbc = static_cast<SQLHDBC>(&dbc_);
         stmt_.wrapped_stmt = static_cast<SQLHSTMT>(&stmt_);
+        if (DsqlCompatibility::IsDsql(&dbc_)) {
+            dbc_.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
+        }
     }
 };
 
@@ -458,6 +463,31 @@ TEST_F(DsqlCompatibilityTest, SetQueryTimeout_DsqlZero_ReachesBaseDriver) {
 TEST_F(DsqlCompatibilityTest, SetQueryTimeout_OtherDatabase_ReachesBaseDriver) {
     UseServer(AURORA_HOST);
     Connect();
+    RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
+}
+
+// SQLSetStmtAttr holds only the statement's lock, and failover rewrites SERVER in conn_attr from another thread's
+// statement. Only an Aurora DSQL chain, which never has failover, gives the connection a lifetime; without one the
+// hook doesn't read conn_attr, even when it names an Aurora DSQL endpoint.
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_NoDsqlLifetime_ReachesBaseDriver) {
+    UseServer(AURORA_HOST);
+    Connect();
+    ASSERT_TRUE(dbc_.dsql_lifetime == nullptr);
+    dbc_.conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
+    ASSERT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
+    EXPECT_NE(SQL_SUCCESS_WITH_INFO, RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0));
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
+    EXPECT_TRUE(stmt_.attr_map.contains(SQL_ATTR_QUERY_TIMEOUT));
+}
+
+// The lifetime stays with a handle whose first connect was Aurora DSQL; connected to another database, it still
+// forwards the timeout.
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_DsqlHandleReusedForOtherDatabase_ReachesBaseDriver) {
+    UseServer(DSQL_HOST);
+    Connect();
+    ASSERT_TRUE(dbc_.dsql_lifetime != nullptr);
+    UseServer(AURORA_HOST);
     RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0);
     EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetStmtAttr));
 }

@@ -25,7 +25,8 @@ struct OccRetryConfig {
     static constexpr int MAX_RETRIES_LIMIT = 100;
     static constexpr int DEFAULT_BASE_DELAY_MS = 100;
     static constexpr int DEFAULT_MAX_DELAY_MS = 5000;
-    // No single wait is longer: the connection is held while the plugin waits.
+    // No single wait is longer before jitter, which adds up to OCC_JITTER_FACTOR times the wait (about 120 s at most
+    // in all): the connection is held while the plugin waits.
     static constexpr int DELAY_LIMIT_MS = 60000;
     static constexpr double DEFAULT_JITTER_FACTOR = 0.25;
 

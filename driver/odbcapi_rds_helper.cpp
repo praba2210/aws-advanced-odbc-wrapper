@@ -26,6 +26,7 @@
 #include "plugin/custom_endpoint/custom_endpoint_plugin.h"
 #include "plugin/default_plugin.h"
 #include "plugin/dsql/dsql_auth_plugin.h"
+#include "plugin/dsql/dsql_compatibility.h"
 #include "plugin/failover/failover_plugin.h"
 #include "plugin/federated/adfs_auth_plugin.h"
 #include "plugin/federated/aws_sso_auth_plugin.h"
@@ -630,6 +631,11 @@ SQLRETURN RDS_SQLSetConnectAttr(
 
     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
     ClearError(dbc);
+
+    // Attributes that would make psqlODBC undo a forced option or send a statement Aurora DSQL rejects are answered here.
+    if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetConnectAttr(dbc, Attribute, ValuePtr)) {
+        return *dsql_ret;
+    }
 
     // If already connected, apply value to underlying DBC, otherwise track and apply on connect
     if (dbc->wrapped_dbc) {

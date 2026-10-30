@@ -255,3 +255,99 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_OtherDatabase_BaseDriverGetsN
         EXPECT_EQ(std::string::npos, captured_conn_str.find(key)) << key;
     }
 }
+
+namespace {
+    // psqlODBC's own connection attributes for three of the forced options (psqlODBC pgapifunc.h).
+    constexpr SQLINTEGER PGOPT_USE_DECLAREFETCH = 65539;
+    constexpr SQLINTEGER PGOPT_SERVER_SIDE_PREPARE = 65540;
+    constexpr SQLINTEGER PGOPT_IGNORETIMEOUT = 65551;
+    const std::string SERVER_SIDE_PREPARE_REASON =
+        "freeing a prepared statement inside a transaction can silently roll the transaction back on Aurora DSQL";
+}  // namespace
+
+// Set on a live connection, the attribute turns server-side prepare back on for new statements, and the wrapper sets
+// it again after every reconnect: the transaction loss would be back.
+TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_Dsql_StaysOff) {
+    UseServer(DSQL_HOST);
+    Connect();
+    CapturingLogSink log;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(1), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("01S02", dbc_.err->sqlstate);
+    EXPECT_EQ("SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE changed to 0: " + SERVER_SIDE_PREPARE_REASON,
+              std::string(dbc_.err->error_msg));
+    EXPECT_EQ(1, log.Count("[DSQL] SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE changed to 0: " + SERVER_SIDE_PREPARE_REASON
+                           + " (requested 1)"));
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
+}
+
+TEST_F(DsqlCompatibilityTest, SetPgoptAttributes_DsqlForcedValues_SucceedLocally) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(0), 0));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, PGOPT_USE_DECLAREFETCH, AsPointer(0), 0));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, PGOPT_IGNORETIMEOUT, AsPointer(1), 0));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_TRUE(dbc_.attr_map.empty());
+}
+
+TEST_F(DsqlCompatibilityTest, SetPgoptDeclareFetchAndIgnoreTimeout_Dsql_KeepTheForcedValues) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectAttr(&dbc_, PGOPT_USE_DECLAREFETCH, AsPointer(1), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("SQL_ATTR_PGOPT_USE_DECLAREFETCH changed to 0: Aurora DSQL doesn't support cursors", dbc_.err->error_msg);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectAttr(&dbc_, PGOPT_IGNORETIMEOUT, AsPointer(0), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("SQL_ATTR_PGOPT_IGNORETIMEOUT changed to 1: Aurora DSQL doesn't support statement_timeout",
+                 dbc_.err->error_msg);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_TRUE(dbc_.attr_map.empty());
+}
+
+TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_OtherDatabase_ReachesBaseDriver) {
+    UseServer(AURORA_HOST);
+    Connect();
+    RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(1), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+}
+
+// Before the first connect nothing says DSQL yet: the value waits in attr_map for PrepareConnect.
+TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_BeforeConnect_IsKept) {
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(1), 0));
+    EXPECT_TRUE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
+}
+
+// DefaultPlugin::Connect would set a value from attr_map again after psqlODBC connects, over USESERVERSIDEPREPARE=0.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_DropsPgoptAttributesSetBeforeConnect) {
+    UseServer(DSQL_HOST);
+    CapturingLogSink log;
+    dbc_.attr_map.insert_or_assign(PGOPT_SERVER_SIDE_PREPARE, std::make_pair(AsPointer(1), 0));
+    dbc_.attr_map.insert_or_assign(PGOPT_USE_DECLAREFETCH, std::make_pair(AsPointer(0), 0));
+    dbc_.attr_map.insert_or_assign(PGOPT_IGNORETIMEOUT, std::make_pair(AsPointer(1), 0));
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_TRUE(dbc_.attr_map.empty());
+    EXPECT_EQ(1, log.Count("[DSQL] Ignoring SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE=1 set before connect: "
+                           + SERVER_SIDE_PREPARE_REASON));
+    EXPECT_EQ(1, log.Count("[DSQL] Ignoring "));
+}
+
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherDatabase_KeepsPgoptAttributes) {
+    UseServer(AURORA_HOST);
+    dbc_.attr_map.insert_or_assign(PGOPT_SERVER_SIDE_PREPARE, std::make_pair(AsPointer(1), 0));
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_TRUE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
+}
+
+// Between SQLDisconnect and the next connect conn_attr still describes the Aurora DSQL connection, so the value is
+// answered as on an open connection and never reaches attr_map, which the next connect would set again.
+TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_DsqlHandleBetweenConnects_IsNotKept) {
+    UseServer(DSQL_HOST);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(1), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("01S02", dbc_.err->sqlstate);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
+}

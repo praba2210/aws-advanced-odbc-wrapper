@@ -14,12 +14,19 @@
 
 #include "dsql_compatibility.h"
 
+#include <sqlext.h>
+
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <initializer_list>
 #include <map>
+#include <memory>
+#include <optional>
 #include <string>
 
 #include "../../driver.h"
+#include "../../error.h"
 #include "../../util/dsql_connection_validator.h"
 #include "../../util/logger_wrapper.h"
 
@@ -62,6 +69,56 @@ namespace {
         }
         conn_attr.emplace(option.key, option.value);
     }
+
+    // An integer attribute value, which ODBC passes in the pointer itself.
+    SQLULEN IntegerValue(SQLPOINTER value)
+    {
+        return static_cast<SQLULEN>(reinterpret_cast<uintptr_t>(value));
+    }
+
+    // psqlODBC's own connection attributes for three of the forced options (psqlODBC pgapifunc.h). Set on a live
+    // connection they change psqlODBC's setting for later statements, and the wrapper keeps every connection
+    // attribute and sets it again after each connect, after the connection string.
+    constexpr SQLINTEGER PGOPT_USE_DECLAREFETCH = 65539;
+    constexpr SQLINTEGER PGOPT_SERVER_SIDE_PREPARE = 65540;
+    constexpr SQLINTEGER PGOPT_IGNORETIMEOUT = 65551;
+
+    struct ForcedAttribute {
+        SQLINTEGER attribute;
+        const char* name;  // psqlODBC's name, for the message
+        bool on;           // the forced setting; psqlODBC reads any non-zero value as on
+        const char* reason;
+    };
+
+    constexpr std::array FORCED_ATTRIBUTES = {
+        ForcedAttribute{.attribute = PGOPT_SERVER_SIDE_PREPARE, .name = "SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE",
+                        .on = false, .reason = "freeing a prepared statement inside a transaction can silently roll "
+                                               "the transaction back on Aurora DSQL"},
+        ForcedAttribute{.attribute = PGOPT_USE_DECLAREFETCH, .name = "SQL_ATTR_PGOPT_USE_DECLAREFETCH", .on = false,
+                        .reason = "Aurora DSQL doesn't support cursors"},
+        ForcedAttribute{.attribute = PGOPT_IGNORETIMEOUT, .name = "SQL_ATTR_PGOPT_IGNORETIMEOUT", .on = true,
+                        .reason = "Aurora DSQL doesn't support statement_timeout"},
+    };
+
+    const ForcedAttribute* FindForcedAttribute(SQLINTEGER attribute)
+    {
+        const auto it = std::ranges::find(FORCED_ATTRIBUTES, attribute, &ForcedAttribute::attribute);
+        return it == FORCED_ATTRIBUTES.end() ? nullptr : &*it;
+    }
+
+    // The answer to the application setting one of FORCED_ATTRIBUTES on an Aurora DSQL connection. psqlODBC isn't
+    // called and the value isn't kept, so psqlODBC keeps the value of the connection string.
+    SQLRETURN KeepForcedAttribute(DBC* dbc, const ForcedAttribute& forced, SQLULEN requested)
+    {
+        if ((requested != 0) == forced.on) {
+            return SQL_SUCCESS;
+        }
+        const std::string message =
+            std::string(forced.name) + " changed to " + (forced.on ? "1" : "0") + ": " + forced.reason;
+        LOG(WARNING) << "[DSQL] " << message << " (requested " << requested << ")";
+        dbc->err = std::make_unique<ErrInfo>(message.c_str(), WARN_OPTION_VALUE_CHANGED);
+        return SQL_SUCCESS_WITH_INFO;
+    }
 }  // namespace
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
@@ -82,4 +139,32 @@ void DsqlCompatibility::PrepareConnect(DBC* dbc)
         return;
     }
     ApplyBaseDriverOptions(dbc->conn_attr);
+
+    // psqlODBC's attributes for the forced options, set before connect, wait in attr_map; DefaultPlugin::Connect would
+    // set them again after psqlODBC connects, over the connection string.
+    for (const ForcedAttribute& forced : FORCED_ATTRIBUTES) {
+        if (const auto it = dbc->attr_map.find(forced.attribute); it != dbc->attr_map.end()) {
+            if (const SQLULEN requested = IntegerValue(it->second.first); (requested != 0) != forced.on) {
+                LOG(WARNING) << "[DSQL] Ignoring " << forced.name << "=" << requested << " set before connect: "
+                             << forced.reason;
+            }
+            dbc->attr_map.erase(it);
+        }
+    }
+}
+
+std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value)
+{
+    switch (attribute) {
+        case PGOPT_USE_DECLAREFETCH:
+        case PGOPT_SERVER_SIDE_PREPARE:
+        case PGOPT_IGNORETIMEOUT:
+            // Never forwarded or kept: psqlODBC keeps the forced value of the connection string.
+            if (const ForcedAttribute* forced = FindForcedAttribute(attribute); forced != nullptr && IsDsql(dbc)) {
+                return KeepForcedAttribute(dbc, *forced, IntegerValue(value));
+            }
+            return std::nullopt;
+        default:
+            return std::nullopt;
+    }
 }

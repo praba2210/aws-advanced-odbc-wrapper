@@ -15,7 +15,12 @@
 #ifndef DSQL_COMPATIBILITY_H_
 #define DSQL_COMPATIBILITY_H_
 
+#include "../../util/windows_headers.h"
+
+#include <sql.h>
+
 #include <map>
+#include <optional>
 #include <string>
 
 struct DBC;
@@ -30,9 +35,15 @@ namespace DsqlCompatibility {
     // replaced, with a warning when it differs. Public for tests.
     void ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr);
 
-    // Called by DefaultPlugin::Connect before it builds the base driver's connection string. Does nothing unless the
-    // connection targets Aurora DSQL.
+    // Called by DefaultPlugin::Connect before it builds the base driver's connection string: sets the forced options
+    // and drops psqlODBC attributes set before connect that would undo them. Does nothing unless the connection
+    // targets Aurora DSQL.
     void PrepareConnect(DBC* dbc);
+
+    // SQLSetConnectAttr on an Aurora DSQL connection, for the attributes that would undo a forced psqlODBC option or
+    // make psqlODBC send a statement Aurora DSQL rejects: the result to return without calling psqlODBC, or nullopt to
+    // call it as usual.
+    std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
 }  // namespace DsqlCompatibility
 
 #endif // DSQL_COMPATIBILITY_H_

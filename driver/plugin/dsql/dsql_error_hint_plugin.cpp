@@ -18,11 +18,13 @@
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "../../odbcapi_rds_helper.h"
+#include "../../util/dsql_connection_lifetime.h"
 #include "../../util/dsql_connection_validator.h"
 #include "../../util/logger_wrapper.h"
 #include "../../util/odbc_helper.h"
@@ -65,10 +67,18 @@ namespace {
     }
 }  // namespace
 
+// MAX_CONNECTION_LIFETIME's default retires a pooled connection at the age from which a failure on a closed connection
+// gets the 60-minute hint.
+static_assert(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME == DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
+
 DsqlErrorHintPlugin::DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin)
     : BasePlugin(dbc, std::move(next_plugin))
 {
     this->plugin_name_ = "DSQL_ERROR_HINT";
+    // The connection's age, which SQLGetConnectAttr(SQL_ATTR_CONNECTION_DEAD) reads too. A lifetime a test set is kept.
+    if (dbc != nullptr && dbc->dsql_lifetime == nullptr) {
+        dbc->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
+    }
 }
 
 SQLRETURN DsqlErrorHintPlugin::Connect(
@@ -79,14 +89,25 @@ SQLRETURN DsqlErrorHintPlugin::Connect(
     SQLSMALLINT *  StringLengthPtr,
     SQLUSMALLINT   DriverCompletion)
 {
+    DBC* dbc = static_cast<DBC*>(ConnectionHandle);
+    // A new connection, or none: it can get the hint once.
+    age_hint_logged_ = false;
+    if (dbc == nullptr || dbc->dsql_lifetime == nullptr) {
+        return ConnectNext(
+            ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
+    }
+    const std::shared_ptr<DsqlConnectionLifetime> lifetime = dbc->dsql_lifetime;
+    // Its age counts from before the connect, so it is never less than the server's.
+    const std::chrono::steady_clock::time_point started_at = lifetime->Now();
+    lifetime->Clear();
     const SQLRETURN ret = ConnectNext(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
-    // A new connection, or none: its age starts now, and it can get the hint once.
-    connected_at_.reset();
     if (SQL_SUCCEEDED(ret)) {
-        connected_at_ = Now();
+        // RDS_InitializeConnection has checked the value, which is read again on every connect.
+        std::string unused_error;
+        lifetime->Start(started_at, DsqlConnectionLifetime::ParseMaxLifetime(dbc->conn_attr, unused_error)
+                                        .value_or(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME));
     }
-    age_hint_logged_ = false;
     return ret;
 }
 
@@ -151,10 +172,15 @@ std::string_view DsqlErrorHintPlugin::GetAdvisoryLockHint(const std::string& sql
 
 void DsqlErrorHintPlugin::LogConnectionAgeHint(DBC* dbc, const std::string& sql_state)
 {
-    if (!connected_at_.has_value() || age_hint_logged_) {
+    const DsqlConnectionLifetime* lifetime = dbc != nullptr ? dbc->dsql_lifetime.get() : nullptr;
+    const std::optional<std::chrono::steady_clock::duration> age =
+        lifetime != nullptr ? lifetime->Age() : std::nullopt;
+    if (!age.has_value() || age_hint_logged_) {
         return;
     }
-    const std::string hint = GetConnectionAgeHint(sql_state, Now() - connected_at_.value());
+    // The threshold is CONNECTION_AGE_HINT_THRESHOLD whatever MAX_CONNECTION_LIFETIME is: a connection younger than
+    // that can't have met Aurora DSQL's 60-minute limit.
+    const std::string hint = GetConnectionAgeHint(sql_state, age.value());
     // The dead check comes last, after the record was read, and only for an old connection: psqlODBC's
     // SQLGetConnectAttr clears its connection error, which the statement's record no longer needs once built.
     if (hint.empty() || !IsConnectionDead(dbc)) {
@@ -188,9 +214,4 @@ bool DsqlErrorHintPlugin::IsConnectionDead(DBC* dbc)
         dbc->plugin_service != nullptr ? dbc->plugin_service->GetOdbcHelper() : nullptr;
     // Without a helper the state is unknown: no hint.
     return odbc_helper != nullptr && odbc_helper->IsClosed(dbc);
-}
-
-std::chrono::steady_clock::time_point DsqlErrorHintPlugin::Now()
-{
-    return std::chrono::steady_clock::now();
 }

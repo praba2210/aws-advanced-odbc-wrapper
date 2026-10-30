@@ -41,6 +41,7 @@
 #include "util/attribute_validator.h"
 #include "util/connection_string_helper.h"
 #include "util/connection_string_keys.h"
+#include "util/dsql_connection_lifetime.h"
 #include "util/dsql_connection_validator.h"
 #include "util/logger_wrapper.h"
 #include "util/map_utils.h"
@@ -577,6 +578,18 @@ SQLRETURN RDS_GetConnectAttr(
 
     // Aurora DSQL has one isolation level, whatever psqlODBC would report.
     if (DsqlCompatibility::TryGetConnectAttr(dbc, Attribute, ValuePtr)) {
+        return SQL_SUCCESS;
+    }
+
+    // An Aurora DSQL connection at its MAX_CONNECTION_LIFETIME reports itself dead, so a driver manager's pool
+    // replaces it. No round trip: the answer comes from the connection's age.
+    if (Attribute == SQL_ATTR_CONNECTION_DEAD && DsqlConnectionLifetime::IsRetired(dbc)) {
+        if (ValuePtr != nullptr) {
+            *static_cast<SQLUINTEGER*>(ValuePtr) = static_cast<SQLUINTEGER>(SQL_CD_TRUE);
+        }
+        if (StringLengthPtr != nullptr) {
+            *StringLengthPtr = static_cast<SQLINTEGER>(sizeof(SQLUINTEGER));
+        }
         return SQL_SUCCESS;
     }
 

@@ -21,7 +21,10 @@
 #include <string>
 #include <utility>
 
+#include "../driver.h"
 #include "connection_string_keys.h"
+#include "dsql_connection_validator.h"
+#include "logger_wrapper.h"
 #include "number_utils.h"
 
 namespace {
@@ -71,12 +74,14 @@ void DsqlConnectionLifetime::Start(std::chrono::steady_clock::time_point started
     const std::lock_guard<std::mutex> lock(mutex_);
     started_at_ = started_at;
     max_lifetime_ = max_lifetime;
+    retirement_logged_ = false;
 }
 
 void DsqlConnectionLifetime::Clear()
 {
     const std::lock_guard<std::mutex> lock(mutex_);
     started_at_.reset();
+    retirement_logged_ = false;
 }
 
 std::optional<std::chrono::steady_clock::duration> DsqlConnectionLifetime::Age() const
@@ -86,4 +91,33 @@ std::optional<std::chrono::steady_clock::duration> DsqlConnectionLifetime::Age()
         return std::nullopt;
     }
     return clock_() - started_at_.value();
+}
+
+bool DsqlConnectionLifetime::IsRetired(const DBC* dbc)
+{
+    if (!HasWrappedHandle(dbc) || dbc->dsql_lifetime == nullptr || dbc->conn_status != CONN_CONNECTED) {
+        return false;
+    }
+    return dbc->dsql_lifetime->CheckRetired(dbc->conn_attr);
+}
+
+bool DsqlConnectionLifetime::CheckRetired(const std::map<std::string, std::string>& conn_attr)
+{
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (!started_at_.has_value() || max_lifetime_.count() == 0) {
+        return false;
+    }
+    const std::chrono::steady_clock::duration age = clock_() - started_at_.value();
+    // The age first: a driver manager asks on every pooled reuse.
+    if (age < max_lifetime_ || !DsqlConnectionValidator::IsDsqlTarget(conn_attr)) {
+        return false;
+    }
+    if (!retirement_logged_) {
+        retirement_logged_ = true;
+        LOG(INFO) << "[DSQL] Retiring the connection after "
+                  << std::chrono::duration_cast<std::chrono::seconds>(age).count() << " seconds ("
+                  << KEY_MAX_CONNECTION_LIFETIME << "=" << max_lifetime_.count()
+                  << "): SQL_ATTR_CONNECTION_DEAD now reports it dead, so a connection pool replaces it.";
+    }
+    return true;
 }

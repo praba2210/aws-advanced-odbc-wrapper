@@ -17,7 +17,6 @@
 
 #include <chrono>
 #include <memory>
-#include <optional>
 #include <string>
 #include <string_view>
 
@@ -62,15 +61,14 @@ public:
 protected:
     // The statement's first diagnostic record, read without consuming it. Virtual for tests.
     virtual void ReadStmtError(STMT* stmt, std::string& sql_state, std::string& message);
-    // Whether the base driver reports the connection dead (SQL_ATTR_CONNECTION_DEAD). Virtual for tests.
+    // Whether the base driver reports the connection dead (SQL_ATTR_CONNECTION_DEAD). It asks psqlODBC directly, so a
+    // connection the driver retired only for its age isn't dead here. Virtual for tests.
     virtual bool IsConnectionDead(DBC* dbc);
-    // Virtual for tests.
-    virtual std::chrono::steady_clock::time_point Now();
 
 private:
     void LogConnectionAgeHint(DBC* dbc, const std::string& sql_state);
 
-    std::optional<std::chrono::steady_clock::time_point> connected_at_;
+    // The connection's age is in dbc->dsql_lifetime, which SQL_ATTR_CONNECTION_DEAD reads too.
     bool age_hint_logged_ = false;
 };
 

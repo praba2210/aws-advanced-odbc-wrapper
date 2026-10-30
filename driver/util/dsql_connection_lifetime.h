@@ -22,6 +22,8 @@
 #include <optional>
 #include <string>
 
+struct DBC;
+
 // How old an Aurora DSQL connection is, and the age at which the driver retires it (MAX_CONNECTION_LIFETIME). Aurora
 // DSQL closes connections at 60 minutes. A driver manager asks SQL_ATTR_CONNECTION_DEAD before it hands out a pooled
 // connection; from MAX_CONNECTION_LIFETIME on, the driver answers SQL_CD_TRUE, so the pool disconnects the connection
@@ -47,6 +49,10 @@ public:
     // True when MAX_CONNECTION_LIFETIME is set to an integer other than 0. The attribute validator checks its range.
     static bool IsSet(const std::map<std::string, std::string>& conn_attr);
 
+    // For SQLGetConnectAttr(SQL_ATTR_CONNECTION_DEAD), without a round trip: true when dbc is an open Aurora DSQL
+    // connection at least MAX_CONNECTION_LIFETIME old. Logs one INFO line per connection, the first time.
+    static bool IsRetired(const DBC* dbc);
+
     [[nodiscard]] std::chrono::steady_clock::time_point Now() const;
 
     // A connect that began at started_at succeeded. A max_lifetime of 0 never retires the connection.
@@ -59,10 +65,14 @@ public:
     [[nodiscard]] std::optional<std::chrono::steady_clock::duration> Age() const;
 
 private:
+    // True from MAX_CONNECTION_LIFETIME on, on an Aurora DSQL connection; logs the INFO line the first time.
+    bool CheckRetired(const std::map<std::string, std::string>& conn_attr);
+
     Clock clock_;
     mutable std::mutex mutex_;
     std::optional<std::chrono::steady_clock::time_point> started_at_;
     std::chrono::seconds max_lifetime_ = DEFAULT_MAX_LIFETIME;
+    bool retirement_logged_ = false;
 };
 
 #endif // DSQL_CONNECTION_LIFETIME_H_

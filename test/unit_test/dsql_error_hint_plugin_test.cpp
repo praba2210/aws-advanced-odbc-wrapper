@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -30,6 +31,7 @@
 #include "../../driver/plugin/base_plugin.h"
 #include "../../driver/plugin/dsql/dsql_error_hint_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_connection_lifetime.h"
 #include "../../driver/util/logger_wrapper.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_strings.h"
@@ -73,6 +75,9 @@ namespace {
         SQLRETURN Connect(SQLHDBC /*ConnectionHandle*/, SQLHWND /*WindowHandle*/, SQLTCHAR* /*OutConnectionString*/,
                           SQLSMALLINT /*BufferLength*/, SQLSMALLINT* /*StringLengthPtr*/,
                           SQLUSMALLINT /*DriverCompletion*/) override {
+            if (during_connect) {
+                during_connect();
+            }
             return connect_ret;
         }
 
@@ -86,18 +91,19 @@ namespace {
         }
 
         SQLRETURN connect_ret = SQL_SUCCESS;
+        // Runs inside Connect, for example to move the clock while the connect takes time.
+        std::function<void()> during_connect;
         SQLRETURN execute_ret = SQL_SUCCESS;
         std::optional<SQL_STATE_CODE> execute_err;
         std::string execute_message;
     };
 
-    // Controls the clock and the connection state, records diagnostic reads and dead checks in order, and can stand in
-    // a record for SQLSTATEs ErrInfo can't carry.
+    // Controls the connection state, records diagnostic reads and dead checks in order, and can stand in a record for
+    // SQLSTATEs ErrInfo can't carry. The fixture's lifetime holds the clock.
     class TestHintPlugin : public DsqlErrorHintPlugin {
     public:
         TestHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next) : DsqlErrorHintPlugin(dbc, std::move(next)) {}
 
-        std::chrono::steady_clock::time_point now{};
         // A record to return instead of reading one; empty reads the real record.
         std::optional<std::pair<std::string, std::string>> diag;
         // The base driver's SQL_ATTR_CONNECTION_DEAD; empty asks the real OdbcHelper.
@@ -119,8 +125,6 @@ namespace {
             calls.emplace_back("dead");
             return dead.has_value() ? dead.value() : DsqlErrorHintPlugin::IsConnectionDead(dbc);
         }
-
-        std::chrono::steady_clock::time_point Now() override { return now; }
     };
 }  // namespace
 
@@ -148,11 +152,14 @@ protected:
     DBC* dbc_ = nullptr;
     STMT* stmt_ = nullptr;
     std::shared_ptr<FakeNextPlugin> next_;
+    // The clock of the connection's lifetime, which the plugin keeps.
+    std::chrono::steady_clock::time_point now_{};
 
     void SetUp() override {
         env_ = new ENV();
         dbc_ = new DBC();
         dbc_->env = env_;
+        dbc_->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
         // Unicode builds of RDS_SQLGetDiagRec reach the OdbcHelper through the plugin service. This one has none.
         dbc_->plugin_service = std::make_shared<PluginService>();
         stmt_ = new STMT();
@@ -186,7 +193,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterTheLimit_LogsTheHintO
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     EXPECT_EQ(1, sink.Count(AGE_HINT));
@@ -194,7 +201,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterTheLimit_LogsTheHintO
 
     // A new connection can get its own hint.
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(58);
+    now_ += std::chrono::minutes(58);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(2, sink.Count(AGE_HINT));
@@ -212,7 +219,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ChecksTheConnectionOnlyAfterReadingTheRe
     plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
 
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ((std::vector<std::string>{"read", "dead"}), plugin->calls);
@@ -226,7 +233,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostEarly_LogsNothingAndLeaves
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(10);
+    now_ += std::chrono::minutes(10);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count("[DSQL]"));
@@ -243,7 +250,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_FailureOnALiveConnection_LogsNothing) {
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -256,7 +263,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_MessageLimitError_LogsNothing) {
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -271,12 +278,12 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostWithoutASuccessfulConnect_
     next_->execute_message = CONNECTION_CLOSED;
 
     CapturingLogSink sink;
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     next_->connect_ret = SQL_ERROR;
     EXPECT_EQ(SQL_ERROR, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -291,7 +298,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_WrapperDiagnostic_LogsNothing) {
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count("[DSQL]"));
@@ -308,7 +315,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_UnknownConnectionState_LogsNothing) {
 
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -350,7 +357,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_LeavesTheRecordForSqlError) {
     next_->execute_message = CONNECTION_CLOSED;
 
     ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    plugin->now += std::chrono::minutes(61);
+    now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
@@ -435,4 +442,70 @@ TEST_F(DsqlErrorHintPluginTest, Execute_AdvisoryLockInTheStatementText_LogsTheHi
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, reinterpret_cast<SQLTCHAR*>(text.data()), SQL_NTS));
 
     EXPECT_EQ(1, sink.Count(ADVISORY_HINT));
+}
+
+// A shorter MAX_CONNECTION_LIFETIME retires pooled connections earlier, but a failure before the threshold can't be
+// Aurora DSQL's 60-minute limit: the hint keeps its threshold.
+TEST_F(DsqlErrorHintPluginTest, Execute_ShorterLifetime_TheHintKeepsItsThreshold) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
+    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}};
+
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    now_ += std::chrono::minutes(31);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+    EXPECT_EQ(0, sink.Count(AGE_HINT));
+
+    now_ += DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD - std::chrono::minutes(31);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+    EXPECT_EQ(1, sink.Count("recycle pooled connections before "
+                            + std::to_string(DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD.count()) + " minutes."));
+}
+
+// With retirement off, the age is still kept, and the hint keeps its threshold.
+TEST_F(DsqlErrorHintPluginTest, Execute_LifetimeOff_TheHintKeepsItsThreshold) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
+    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "0"}};
+
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    now_ += DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD - std::chrono::seconds(1);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+    EXPECT_EQ(0, sink.Count(AGE_HINT));
+
+    now_ += std::chrono::seconds(1);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+    EXPECT_EQ(1, sink.Count(AGE_HINT));
+}
+
+// The age counts from before the connect, so it is never less than the server's; a failed connect leaves none.
+TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheAgeBeforeTheConnectAndClearsItOnFailure) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->during_connect = [this] { now_ += std::chrono::seconds(5); };
+
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const std::optional<std::chrono::steady_clock::duration> age = dbc_->dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(5, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+
+    next_->connect_ret = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_FALSE(dbc_->dsql_lifetime->Age().has_value());
+}
+
+// The plugin that keeps the age creates it, so SQL_ATTR_CONNECTION_DEAD can read it. Other connections get none.
+TEST_F(DsqlErrorHintPluginTest, AddToChain_GivesOnlyAuroraDsqlConnectionsALifetime) {
+    const std::shared_ptr<BasePlugin> head = next_;
+    dbc_->dsql_lifetime = nullptr;
+    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
+    EXPECT_TRUE(DsqlErrorHintPlugin::AddToChain(dbc_, head) == head);
+    EXPECT_TRUE(dbc_->dsql_lifetime == nullptr);
+
+    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}};
+    EXPECT_FALSE(DsqlErrorHintPlugin::AddToChain(dbc_, head) == head);
+    EXPECT_TRUE(dbc_->dsql_lifetime != nullptr);
 }

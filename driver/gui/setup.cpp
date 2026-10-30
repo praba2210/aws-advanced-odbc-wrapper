@@ -267,6 +267,11 @@ const std::map<std::string, std::pair<int, ControlType>> OCC_RETRY_KEYS = {
     {KEY_OCC_JITTER_FACTOR, {IDC_OCC_JITTER_FACTOR, EDIT_TEXT}}
 };
 
+// Read on every Aurora DSQL connection, whether or not OCC retry is on, so the OCC check box doesn't disable it.
+const std::map<std::string, std::pair<int, ControlType>> CONNECTION_LIFETIME_KEYS = {
+    {KEY_MAX_CONNECTION_LIFETIME, {IDC_MAX_CONNECTION_LIFETIME, EDIT_TEXT}}
+};
+
 const std::vector<std::pair<std::string, std::string>> AWS_AUTH_MODES = {
     {"Database", ""},
     {"IAM", VALUE_AUTH_IAM},
@@ -653,6 +658,13 @@ std::string GetDsn(bool test_conn)
         }
     }
 
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+        value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            conn_str = AddKeyToConnectionString(conn_str, keys.first, value, test_conn);
+        }
+    }
+
     conn_str = AddKeyToConnectionString(conn_str, KEY_RDS_TEST_CONN, VALUE_BOOL_TRUE, test_conn);
 
     return conn_str;
@@ -717,6 +729,12 @@ bool DsqlSettingsValid()
 {
     std::map<std::string, std::string> values;
     for (const auto& keys : OCC_RETRY_KEYS) {
+        const std::string value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            values.insert_or_assign(keys.first, value);
+        }
+    }
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
         const std::string value = GetControlValue(dsql_settings_tab, keys.second);
         if (!value.empty()) {
             values.insert_or_assign(keys.first, value);
@@ -823,6 +841,9 @@ bool SaveDsn()
                 SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(rw_splitting_tab, keys.second).c_str());
             }
             for (const auto& keys : OCC_RETRY_KEYS) {
+                SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(dsql_settings_tab, keys.second).c_str());
+            }
+            for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
                 SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(dsql_settings_tab, keys.second).c_str());
             }
         } catch (const std::runtime_error e) {
@@ -1220,6 +1241,9 @@ BOOL DsqlSettingsTabInit(HWND hwnd, HWND hwndFocus, LPARAM lParam)
         } else {
             SetInitialEditTextValue(hwnd, keys.second.first, keys.first, "");
         }
+    }
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+        SetInitialEditTextValue(hwnd, keys.second.first, keys.first, "");
     }
 
     HandleEnableOccRetry(hwnd);

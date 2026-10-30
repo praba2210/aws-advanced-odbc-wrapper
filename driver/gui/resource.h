@@ -167,6 +167,7 @@
 #define IDC_OCC_BASE_DELAY              1148
 #define IDC_OCC_MAX_DELAY               1149
 #define IDC_OCC_JITTER_FACTOR           1150
+#define IDC_MAX_CONNECTION_LIFETIME     1151
 
 // Next default values for new objects
 //
@@ -174,7 +175,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        129
 #define _APS_NEXT_COMMAND_VALUE         40001
-#define _APS_NEXT_CONTROL_VALUE         1151
+#define _APS_NEXT_CONTROL_VALUE         1152
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

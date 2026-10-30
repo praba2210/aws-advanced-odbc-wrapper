@@ -573,6 +573,11 @@ SQLRETURN RDS_GetConnectAttr(
     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
     ClearError(dbc);
 
+    // Aurora DSQL has one isolation level, whatever psqlODBC would report.
+    if (DsqlCompatibility::TryGetConnectAttr(dbc, Attribute, ValuePtr)) {
+        return SQL_SUCCESS;
+    }
+
     SQLRETURN ret = SQL_ERROR;
 
     // If already connected, query value from underlying DBC
@@ -2090,6 +2095,11 @@ SQLRETURN RDS_SQLGetInfo(
 
     if (dbc == nullptr) {
         return SQL_INVALID_HANDLE;
+    }
+
+    // Aurora DSQL has one isolation level; psqlODBC reports PostgreSQL's four.
+    if (DsqlCompatibility::TryGetInfo(dbc, InfoType, InfoValuePtr, StringLengthPtr)) {
+        return SQL_SUCCESS;
     }
 
     // Naming and version for Wrapper

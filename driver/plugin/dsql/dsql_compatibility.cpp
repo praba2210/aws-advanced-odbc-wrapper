@@ -22,6 +22,7 @@
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -143,6 +144,41 @@ namespace {
         err = std::make_unique<ErrInfo>(QUERY_TIMEOUT_CHANGED.c_str(), WARN_OPTION_VALUE_CHANGED);
         return SQL_SUCCESS_WITH_INFO;
     }
+
+    // Aurora DSQL's only isolation level: snapshot isolation, reported as REPEATABLE READ.
+    constexpr SQLUINTEGER DSQL_ISOLATION = SQL_TXN_REPEATABLE_READ;
+
+    const std::string ISOLATION_CHANGED =
+        "SQL_ATTR_TXN_ISOLATION changed to SQL_TXN_REPEATABLE_READ: Aurora DSQL runs every transaction at REPEATABLE "
+        "READ";
+    const std::string SERIALIZABLE_NOT_SUPPORTED =
+        "SQL_TXN_SERIALIZABLE isn't supported: Aurora DSQL runs every transaction at REPEATABLE READ (snapshot "
+        "isolation)";
+
+    // ODBC lets a driver substitute a higher isolation level, never a lower one; DSQL's REPEATABLE READ allows write
+    // skew, which SERIALIZABLE forbids.
+    SQLRETURN SetIsolation(DBC* dbc, SQLPOINTER value)
+    {
+        switch (const auto level = static_cast<SQLUINTEGER>(IntegerValue(value))) {
+            case DSQL_ISOLATION:
+                return SQL_SUCCESS;
+            case SQL_TXN_READ_UNCOMMITTED:
+            case SQL_TXN_READ_COMMITTED:
+                LOG(WARNING) << "[DSQL] " << ISOLATION_CHANGED << " (requested " << level << ")";
+                dbc->err = std::make_unique<ErrInfo>(ISOLATION_CHANGED.c_str(), WARN_OPTION_VALUE_CHANGED);
+                return SQL_SUCCESS_WITH_INFO;
+            case SQL_TXN_SERIALIZABLE:
+                LOG(ERROR) << "[DSQL] " << SERIALIZABLE_NOT_SUPPORTED;
+                dbc->err = std::make_unique<ErrInfo>(SERIALIZABLE_NOT_SUPPORTED.c_str(), ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            default: {
+                const std::string message = "Invalid SQL_ATTR_TXN_ISOLATION value " + std::to_string(level);
+                LOG(ERROR) << "[DSQL] " << message;
+                dbc->err = std::make_unique<ErrInfo>(message.c_str(), ERR_INVALID_ATTRIBUTE_VALUE);
+                return SQL_ERROR;
+            }
+        }
+    }
 }  // namespace
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
@@ -163,6 +199,16 @@ void DsqlCompatibility::PrepareConnect(DBC* dbc)
         return;
     }
     ApplyBaseDriverOptions(dbc->conn_attr);
+
+    // A level set before connect waits in attr_map; DefaultPlugin::Connect would replay it after psqlODBC connects,
+    // and psqlODBC would send SET SESSION CHARACTERISTICS.
+    if (const auto it = dbc->attr_map.find(SQL_ATTR_TXN_ISOLATION); it != dbc->attr_map.end()) {
+        if (const auto level = static_cast<SQLUINTEGER>(IntegerValue(it->second.first)); level != DSQL_ISOLATION) {
+            LOG(WARNING) << "[DSQL] Ignoring SQL_ATTR_TXN_ISOLATION=" << level
+                         << " set before connect: Aurora DSQL runs every transaction at REPEATABLE READ";
+        }
+        dbc->attr_map.erase(it);
+    }
 
     // psqlODBC's attributes for the forced options, set before connect, wait in attr_map; DefaultPlugin::Connect would
     // set them again after psqlODBC connects, over the connection string.
@@ -194,6 +240,12 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEG
                 return QueryTimeoutChanged(dbc->err, timeout);
             }
             return std::nullopt;
+        case SQL_ATTR_TXN_ISOLATION:
+            // Never forwarded: psqlODBC would send SET SESSION CHARACTERISTICS, which Aurora DSQL rejects.
+            if (IsDsql(dbc)) {
+                return SetIsolation(dbc, value);
+            }
+            return std::nullopt;
         default:
             return std::nullopt;
     }
@@ -206,4 +258,35 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetStmtAttr(STMT* stmt, SQLINTEGE
         return QueryTimeoutChanged(stmt->err, timeout);
     }
     return std::nullopt;
+}
+
+bool DsqlCompatibility::TryGetConnectAttr(const DBC* dbc, SQLINTEGER attribute, SQLPOINTER value)
+{
+    if (attribute != SQL_ATTR_TXN_ISOLATION || !HasWrappedHandle(dbc) || !IsDsql(dbc)) {
+        return false;
+    }
+    if (value != nullptr) {
+        *static_cast<SQLUINTEGER*>(value) = DSQL_ISOLATION;
+    }
+    return true;
+}
+
+bool DsqlCompatibility::TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER value, SQLSMALLINT* length)
+{
+    if (dbc == nullptr || (info_type != SQL_DEFAULT_TXN_ISOLATION && info_type != SQL_TXN_ISOLATION_OPTION)) {
+        return false;
+    }
+    const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
+    if (!HasWrappedHandle(dbc) || !IsDsql(dbc)) {
+        return false;
+    }
+    ClearError(dbc);
+    // SQL_TXN_ISOLATION_OPTION is a bitmask of the supported levels; Aurora DSQL has one.
+    if (value != nullptr) {
+        *static_cast<SQLUINTEGER*>(value) = DSQL_ISOLATION;
+    }
+    if (length != nullptr) {
+        *length = static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER));
+    }
+    return true;
 }

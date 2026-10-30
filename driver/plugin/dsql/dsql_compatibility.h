@@ -49,6 +49,14 @@ namespace DsqlCompatibility {
     // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without
     // calling psqlODBC. nullopt for anything else.
     std::optional<SQLRETURN> TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value);
+
+    // SQLGetConnectAttr(SQL_ATTR_TXN_ISOLATION) on an Aurora DSQL connection whose wrapped handle is allocated: writes
+    // SQL_TXN_REPEATABLE_READ and returns true. False for any other attribute or connection.
+    bool TryGetConnectAttr(const DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
+
+    // SQLGetInfo(SQL_DEFAULT_TXN_ISOLATION or SQL_TXN_ISOLATION_OPTION) on an Aurora DSQL connection whose wrapped
+    // handle is allocated: writes SQL_TXN_REPEATABLE_READ and returns true. False for anything else.
+    bool TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER value, SQLSMALLINT* length);
 }  // namespace DsqlCompatibility
 
 #endif // DSQL_COMPATIBILITY_H_

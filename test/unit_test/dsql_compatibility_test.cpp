@@ -480,3 +480,131 @@ TEST_F(DsqlCompatibilityTest, SetConnectAttr_Dsql_OtherAttributesReachBaseDriver
     EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
     EXPECT_FALSE(dbc_.auto_commit);
 }
+
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_Dsql_RepeatableReadSucceedsLocally) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(SQL_TXN_REPEATABLE_READ), 0));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.attr_map.contains(SQL_ATTR_TXN_ISOLATION));
+}
+
+// A higher level than requested, which ODBC lets a driver substitute.
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_Dsql_LowerLevelsReturnOptionValueChanged) {
+    UseServer(DSQL_HOST);
+    Connect();
+    for (const SQLULEN level : std::initializer_list<SQLULEN>{SQL_TXN_READ_UNCOMMITTED, SQL_TXN_READ_COMMITTED}) {
+        EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(level), 0))
+            << level;
+        ASSERT_NE(nullptr, dbc_.err) << level;
+        EXPECT_STREQ("01S02", dbc_.err->sqlstate) << level;
+        EXPECT_STREQ("SQL_ATTR_TXN_ISOLATION changed to SQL_TXN_REPEATABLE_READ: Aurora DSQL runs every transaction at "
+                     "REPEATABLE READ", dbc_.err->error_msg) << level;
+    }
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+    EXPECT_FALSE(dbc_.attr_map.contains(SQL_ATTR_TXN_ISOLATION));
+}
+
+// REPEATABLE READ is lower than SERIALIZABLE (it allows write skew), which ODBC doesn't let a driver substitute.
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_Dsql_SerializableIsHy024) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_ERROR, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(SQL_TXN_SERIALIZABLE), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("HY024", dbc_.err->sqlstate);
+    EXPECT_STREQ("SQL_TXN_SERIALIZABLE isn't supported: Aurora DSQL runs every transaction at REPEATABLE READ "
+                 "(snapshot isolation)", dbc_.err->error_msg);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+}
+
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_Dsql_InvalidLevelIsHy024) {
+    UseServer(DSQL_HOST);
+    Connect();
+    const SQLULEN not_a_level = 3;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(not_a_level), 0));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("HY024", dbc_.err->sqlstate);
+    EXPECT_STREQ("Invalid SQL_ATTR_TXN_ISOLATION value 3", dbc_.err->error_msg);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+}
+
+// Before the first connect nothing says DSQL yet: the value waits in attr_map for PrepareConnect.
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_BeforeConnect_IsKept) {
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(SQL_TXN_SERIALIZABLE), 0));
+    EXPECT_TRUE(dbc_.attr_map.contains(SQL_ATTR_TXN_ISOLATION));
+}
+
+TEST_F(DsqlCompatibilityTest, SetTxnIsolation_OtherDatabase_ReachesBaseDriver) {
+    UseServer(AURORA_HOST);
+    Connect();
+    RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(SQL_TXN_SERIALIZABLE), 0);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+}
+
+TEST_F(DsqlCompatibilityTest, SetConnectOption_Dsql_TxnIsolationIsAnsweredLocally) {
+    UseServer(DSQL_HOST);
+    Connect();
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, RDS_SQLSetConnectOption(&dbc_, SQL_TXN_ISOLATION, SQL_TXN_READ_COMMITTED));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_STREQ("01S02", dbc_.err->sqlstate);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLSetConnectAttr));
+}
+
+TEST_F(DsqlCompatibilityTest, GetTxnIsolation_Dsql_IsRepeatableRead) {
+    UseServer(DSQL_HOST);
+    Connect();
+    SQLUINTEGER level = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, &level, 0, nullptr));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_REPEATABLE_READ), level);
+    SQLUINTEGER option_level = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectOption(&dbc_, SQL_TXN_ISOLATION, &option_level));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_REPEATABLE_READ), option_level);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLGetConnectAttr));
+}
+
+TEST_F(DsqlCompatibilityTest, GetInfo_Dsql_ReportsOnlyRepeatableRead) {
+    UseServer(DSQL_HOST);
+    Connect();
+    for (const SQLUSMALLINT info_type :
+         std::initializer_list<SQLUSMALLINT>{SQL_DEFAULT_TXN_ISOLATION, SQL_TXN_ISOLATION_OPTION}) {
+        SQLUINTEGER value = 0;
+        SQLSMALLINT length = 0;
+        EXPECT_EQ(SQL_SUCCESS,
+                  RDS_SQLGetInfo(&dbc_, info_type, &value, static_cast<SQLSMALLINT>(sizeof(value)), &length))
+            << info_type;
+        EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_REPEATABLE_READ), value) << info_type;
+        EXPECT_EQ(static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER)), length) << info_type;
+    }
+    // StringLengthPtr is optional.
+    SQLUINTEGER value = 0;
+    EXPECT_EQ(SQL_SUCCESS,
+              RDS_SQLGetInfo(&dbc_, SQL_TXN_ISOLATION_OPTION, &value, static_cast<SQLSMALLINT>(sizeof(value)), nullptr));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_REPEATABLE_READ), value);
+    EXPECT_FALSE(base_driver_->Requested(RDS_STR_SQLGetInfo));
+}
+
+TEST_F(DsqlCompatibilityTest, GetInfo_OtherDatabase_ReachesBaseDriver) {
+    UseServer(AURORA_HOST);
+    Connect();
+    SQLUINTEGER value = 0;
+    RDS_SQLGetInfo(&dbc_, SQL_TXN_ISOLATION_OPTION, &value, static_cast<SQLSMALLINT>(sizeof(value)), nullptr);
+    EXPECT_TRUE(base_driver_->Requested(RDS_STR_SQLGetInfo));
+}
+
+TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_DropsIsolationSetBeforeConnect) {
+    UseServer(DSQL_HOST);
+    CapturingLogSink log;
+    dbc_.attr_map.insert_or_assign(SQL_ATTR_TXN_ISOLATION, std::make_pair(AsPointer(SQL_TXN_SERIALIZABLE), 0));
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_FALSE(dbc_.attr_map.contains(SQL_ATTR_TXN_ISOLATION));
+    EXPECT_EQ(1, log.Count("[DSQL] Ignoring SQL_ATTR_TXN_ISOLATION=8 set before connect: Aurora DSQL runs every "
+                           "transaction at REPEATABLE READ"));
+}
+
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherDatabase_KeepsIsolationSetBeforeConnect) {
+    UseServer(AURORA_HOST);
+    dbc_.attr_map.insert_or_assign(SQL_ATTR_TXN_ISOLATION, std::make_pair(AsPointer(SQL_TXN_SERIALIZABLE), 0));
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_TRUE(dbc_.attr_map.contains(SQL_ATTR_TXN_ISOLATION));
+}

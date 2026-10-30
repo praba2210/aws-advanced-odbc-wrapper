@@ -29,10 +29,12 @@
 #include <wchar.h>
 #include <map>
 #include <regex>
+#include <unordered_set>
 #include <vector>
 #include <commdlg.h>
 
 #include "resource.h"
+#include "../util/attribute_validator.h"
 #include "../util/connection_string_keys.h"
 #include "../util/odbc_dsn_helper.h"
 #include "../odbcapi_rds_helper.h"
@@ -51,7 +53,8 @@ enum TabSelection {
     CUSTOM_ENDPOINT,
     AURORA_INITIAL_CONNECTION_STRATEGY,
     BLUE_GREEN,
-    RW_SPLITTING
+    RW_SPLITTING,
+    DSQL_SETTINGS
 };
 
 enum AuthModeSelection {
@@ -256,6 +259,19 @@ const std::map<std::string, std::pair<int, ControlType>> SRW_SPLITTING_KEYS = {
     {KEY_SRW_CONN_INTERVAL_MS, {IDC_SRW_CONN_INTERVAL, EDIT_TEXT}}
 };
 
+const std::map<std::string, std::pair<int, ControlType>> OCC_RETRY_KEYS = {
+    {KEY_ENABLE_OCC_RETRY, {IDC_ENABLE_OCC_RETRY, CHECK}},
+    {KEY_OCC_MAX_RETRIES, {IDC_OCC_MAX_RETRIES, EDIT_TEXT}},
+    {KEY_OCC_BASE_DELAY_MS, {IDC_OCC_BASE_DELAY, EDIT_TEXT}},
+    {KEY_OCC_MAX_DELAY_MS, {IDC_OCC_MAX_DELAY, EDIT_TEXT}},
+    {KEY_OCC_JITTER_FACTOR, {IDC_OCC_JITTER_FACTOR, EDIT_TEXT}}
+};
+
+// Read on every Aurora DSQL connection, whether or not OCC retry is on, so the OCC check box doesn't disable it.
+const std::map<std::string, std::pair<int, ControlType>> CONNECTION_LIFETIME_KEYS = {
+    {KEY_MAX_CONNECTION_LIFETIME, {IDC_MAX_CONNECTION_LIFETIME, EDIT_TEXT}}
+};
+
 const std::vector<std::pair<std::string, std::string>> AWS_AUTH_MODES = {
     {"Database", ""},
     {"IAM", VALUE_AUTH_IAM},
@@ -328,6 +344,7 @@ HWND custom_endpoint_tab;
 HWND aurora_initial_connection_strategy_tab;
 HWND blue_green_tab;
 HWND rw_splitting_tab;
+HWND dsql_settings_tab;
 HWND main_win;
 
 std::string driver;
@@ -634,6 +651,20 @@ std::string GetDsn(bool test_conn)
         }
     }
 
+    for (const auto& keys : OCC_RETRY_KEYS) {
+        value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            conn_str = AddKeyToConnectionString(conn_str, keys.first, value, test_conn);
+        }
+    }
+
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+        value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            conn_str = AddKeyToConnectionString(conn_str, keys.first, value, test_conn);
+        }
+    }
+
     conn_str = AddKeyToConnectionString(conn_str, KEY_RDS_TEST_CONN, VALUE_BOOL_TRUE, test_conn);
 
     return conn_str;
@@ -692,8 +723,44 @@ void SaveKey(std::string profile, std::string key, std::string value)
     }
 }
 
+// Checks the Aurora DSQL tab with the driver's connect-time validator, so the dialog doesn't save a DSN whose every
+// connect fails. A blank field isn't checked: it stays empty in the DSN and the driver uses the option's default.
+bool DsqlSettingsValid()
+{
+    std::map<std::string, std::string> values;
+    for (const auto& keys : OCC_RETRY_KEYS) {
+        const std::string value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            values.insert_or_assign(keys.first, value);
+        }
+    }
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+        const std::string value = GetControlValue(dsql_settings_tab, keys.second);
+        if (!value.empty()) {
+            values.insert_or_assign(keys.first, value);
+        }
+    }
+
+    const std::unordered_set<std::string> invalid = AttributeValidator::ValidateMap(values);
+    if (invalid.empty()) {
+        return true;
+    }
+
+    std::string message = "Invalid value on the Aurora DSQL tab:";
+    for (const std::string& entry : invalid) {
+        message += "\n" + entry;
+    }
+    MessageBox(main_win, RDS_TSTR(message).c_str(), _T("Save DSN"), MB_OK);
+    return false;
+}
+
 bool SaveDsn()
 {
+    // Under SQL_DRIVER_COMPLETE_REQUIRED the tabs are read-only, so the connect reports a bad value instead.
+    if (!disable_optional && !DsqlSettingsValid()) {
+        return false;
+    }
+
     if (driver_connect) {
         connection_str = GetDsn(true);
         out_connection_str = GetDsn(false);
@@ -772,6 +839,12 @@ bool SaveDsn()
             }
             for (const auto& keys : SRW_SPLITTING_KEYS) {
                 SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(rw_splitting_tab, keys.second).c_str());
+            }
+            for (const auto& keys : OCC_RETRY_KEYS) {
+                SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(dsql_settings_tab, keys.second).c_str());
+            }
+            for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+                SaveKey(dsn.c_str(), keys.first.c_str(), GetControlValue(dsql_settings_tab, keys.second).c_str());
             }
         } catch (const std::runtime_error e) {
             MessageBox(main_win, _T("Failed to save DSN"), _T("Save DSN"), MB_OK);
@@ -1133,6 +1206,63 @@ BOOL RwSplitDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     return false;
 }
 
+void HandleEnableOccRetry(HWND hwnd) {
+    HWND check_box = GetDlgItem(hwnd, IDC_ENABLE_OCC_RETRY);
+    LRESULT state = Button_GetCheck(check_box);
+    bool show_all = false;
+    if (state == BST_CHECKED) {
+        show_all = true;
+    }
+
+    for (const auto& keys : OCC_RETRY_KEYS) {
+        if (keys.first != KEY_ENABLE_OCC_RETRY) {
+            HWND ctrl = GetDlgItem(hwnd, keys.second.first);
+            EnableWindow(ctrl, (show_all) ? TRUE : FALSE);
+        }
+    }
+}
+
+void HandleDsqlSettingsInteraction(HWND hwnd, int id, HWND hwndCtl, UINT codeNotify)
+{
+    switch (id) {
+        case IDC_ENABLE_OCC_RETRY:
+            HandleEnableOccRetry(hwnd);
+            break;
+        default:
+            break;
+    }
+}
+
+BOOL DsqlSettingsTabInit(HWND hwnd, HWND hwndFocus, LPARAM lParam)
+{
+    for (const auto& keys : OCC_RETRY_KEYS) {
+        if (keys.second.second == CHECK) {
+            SetInitialCheckBoxValue(hwnd, keys.second.first, keys.first);
+        } else {
+            SetInitialEditTextValue(hwnd, keys.second.first, keys.first, "");
+        }
+    }
+    for (const auto& keys : CONNECTION_LIFETIME_KEYS) {
+        SetInitialEditTextValue(hwnd, keys.second.first, keys.first, "");
+    }
+
+    HandleEnableOccRetry(hwnd);
+
+    return false;
+}
+
+BOOL DsqlSettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+        HANDLE_MSG(hwnd, WM_INITDIALOG, DsqlSettingsTabInit);
+        HANDLE_MSG(hwnd, WM_COMMAND, HandleDsqlSettingsInteraction);
+        default:
+            break;
+    }
+
+    return false;
+}
+
 void HandleEnableFailover(HWND hwnd) {
     HWND check_box = GetDlgItem(hwnd, IDC_ENABLE_FAILOVER);
     LRESULT state = Button_GetCheck(check_box);
@@ -1370,6 +1500,7 @@ void OnSelChange(HWND hwnd)
     ShowWindow(aurora_initial_connection_strategy_tab, (selection == AURORA_INITIAL_CONNECTION_STRATEGY) ? SW_SHOW : SW_HIDE);
     ShowWindow(blue_green_tab, (selection == BLUE_GREEN) ? SW_SHOW : SW_HIDE);
     ShowWindow(rw_splitting_tab, (selection == RW_SPLITTING) ? SW_SHOW : SW_HIDE);
+    ShowWindow(dsql_settings_tab, (selection == DSQL_SETTINGS) ? SW_SHOW : SW_HIDE);
 }
 
 BOOL FormMainInit(HWND hwnd, HWND hwndFocus, LPARAM lParam)
@@ -1382,6 +1513,7 @@ BOOL FormMainInit(HWND hwnd, HWND hwndFocus, LPARAM lParam)
     aurora_initial_connection_strategy_tab = CreateDialog(ghInstance, MAKEINTRESOURCE(IDC_TAB_AURORA_INITIAL_CONNECTION_STRATEGY), tab_control, (DLGPROC)AuroraInitialConnectionStrategyDlgProc);
     blue_green_tab = CreateDialog(ghInstance, MAKEINTRESOURCE(IDC_TAB_BLUE_GREEN), tab_control, (DLGPROC)BlueGreenDlgProc);
     rw_splitting_tab = CreateDialog(ghInstance, MAKEINTRESOURCE(IDC_TAB_RW_SPLITTING), tab_control, (DLGPROC)RwSplitDlgProc);
+    dsql_settings_tab = CreateDialog(ghInstance, MAKEINTRESOURCE(IDC_TAB_DSQL_SETTINGS), tab_control, (DLGPROC)DsqlSettingsDlgProc);
 
     if (driver_connect) {
         HWND dsn_text = GetDlgItem(hwnd, IDC_DSN_NAME);
@@ -1413,6 +1545,7 @@ BOOL FormMainInit(HWND hwnd, HWND hwndFocus, LPARAM lParam)
     AddTabToTabControl("Aurora Initial Connection Strategy", tab_control, AURORA_INITIAL_CONNECTION_STRATEGY);
     AddTabToTabControl("Blue Green", tab_control, BLUE_GREEN);
     AddTabToTabControl("Read/Write Splitting", tab_control, RW_SPLITTING);
+    AddTabToTabControl("Aurora DSQL", tab_control, DSQL_SETTINGS);
 
     SendMessage(tab_control, TCM_SETCURSEL, 0, 0);
     OnSelChange(hwnd);

@@ -19,7 +19,9 @@
 #include <unordered_set>
 
 #include "connection_string_keys.h"
+#include "dsql_connection_lifetime.h"
 #include "number_utils.h"
+#include "occ_retry_config.h"
 #include "rds_strings.h"
 
 bool AttributeValidator::ShouldKeyBeUnsignedInt(const std::string& key) {
@@ -75,6 +77,15 @@ std::unordered_set<std::string> AttributeValidator::ValidateMap(const std::map<s
         if (ShouldKeyBeUnsignedInt(key) && !IsValueUnsignedInt(value)) {
             invalid_keys.insert(key);
         }
+    }
+
+    // The OCC retry options have ranges, so their entry also says what to use.
+    if (std::string occ_error; !OccRetryConfig::Parse(conn_attr, occ_error).has_value()) {
+        invalid_keys.insert(occ_error);
+    }
+    // MAX_CONNECTION_LIFETIME has a range too.
+    if (std::string lifetime_error; !DsqlConnectionLifetime::ParseMaxLifetime(conn_attr, lifetime_error).has_value()) {
+        invalid_keys.insert(lifetime_error);
     }
     return invalid_keys;
 }

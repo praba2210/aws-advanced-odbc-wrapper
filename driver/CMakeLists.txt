@@ -82,6 +82,9 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.h
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_error_hint_plugin.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_occ_retry_plugin.h
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.h
     ## Secrets Manager
@@ -106,9 +109,12 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_keys.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_lifetime.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_validator.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/occ_retry_config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_dsn_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/plugin_chain_builder.h
@@ -197,6 +203,9 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.cpp
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_error_hint_plugin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_occ_retry_plugin.cpp
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.cpp
     ## Secrets Manager
@@ -218,9 +227,12 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cluster_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_lifetime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_validator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/occ_retry_config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_dsn_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/plugin_chain_builder.cpp

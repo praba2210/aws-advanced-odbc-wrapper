@@ -19,13 +19,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "../../driver.h"
 #include "../base_plugin.h"
 
-// Logs a hint when a statement fails on an Aurora DSQL limit the driver can't work around: the 60-minute connection
-// limit. It looks at a statement only when it fails, and passes the return code and the base driver's diagnostics
-// through untouched.
+// Logs a hint when a statement fails on an Aurora DSQL limit the driver can't work around: advisory locks, and the
+// 60-minute connection limit. It looks at a statement only when it fails, and passes the return code and the base
+// driver's diagnostics through untouched.
 class DsqlErrorHintPlugin : public BasePlugin {
 public:
     DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin);
@@ -49,6 +50,11 @@ public:
     // The hint for a statement that failed on a closed connection of this age, or "" when none applies. Public for
     // tests.
     static std::string GetConnectionAgeHint(const std::string& sql_state, std::chrono::steady_clock::duration age);
+
+    // The hint for a failed statement whose record or statement text names an advisory-lock function, or "". Public
+    // for tests.
+    static std::string_view GetAdvisoryLockHint(const std::string& sql_state, const std::string& message,
+                                                const std::string& statement);
 
     // Aurora DSQL closes connections at 60 minutes, with jitter. A closed connection from this age on gets the hint.
     static constexpr std::chrono::minutes CONNECTION_AGE_HINT_THRESHOLD{55};

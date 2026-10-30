@@ -14,8 +14,12 @@
 
 #include "dsql_error_hint_plugin.h"
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "../../odbcapi_rds_helper.h"
@@ -32,6 +36,33 @@ namespace {
     // from the first read with a buffer; 512 keeps it at psqlODBC's own default of 511 (DRVMNGRDIV, environ.c), so an
     // app sees the same records as without this read. 511 characters are plenty to match on.
     constexpr SQLSMALLINT DIAG_MESSAGE_CHARS = 512;
+    // pg_advisory_lock, pg_advisory_xact_lock, pg_advisory_unlock_all, pg_try_advisory_lock and their variants.
+    constexpr std::array<std::string_view, 2> ADVISORY_LOCK_FUNCTION_PREFIXES = {"pg_advisory_", "pg_try_advisory_"};
+    // SQLSTATE classes whose errors aren't about the function called: no record, a lost connection, a rolled-back
+    // transaction (OCC conflicts included).
+    constexpr std::array<std::string_view, 3> NOT_A_FUNCTION_ERROR_CLASSES = {"00", "08", "40"};
+
+    bool NamesAdvisoryLockFunction(std::string text)
+    {
+        std::ranges::transform(text, text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return std::ranges::any_of(ADVISORY_LOCK_FUNCTION_PREFIXES, [&text](std::string_view prefix) {
+            return text.find(prefix) != std::string::npos;
+        });
+    }
+
+    // The statement text the chain got from SQLExecDirect, as UTF-8, to its terminator: DefaultPlugin runs it that way
+    // (SQL_NTS), whatever TextLength says. SQLExecute passes none.
+    std::string StatementTextToUtf8(SQLTCHAR* text)
+    {
+        if (text == nullptr) {
+            return "";
+        }
+#if UNICODE
+        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(text));
+#else
+        return reinterpret_cast<const char*>(text);
+#endif
+    }
 }  // namespace
 
 DsqlErrorHintPlugin::DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin)
@@ -74,6 +105,11 @@ SQLRETURN DsqlErrorHintPlugin::Execute(
     std::string sql_state;
     std::string message;
     ReadStmtError(stmt, sql_state, message);
+    if (const std::string_view hint = GetAdvisoryLockHint(sql_state, message,
+                                                          StatementTextToUtf8(StatementText));
+        !hint.empty()) {
+        LOG(WARNING) << hint;
+    }
     LogConnectionAgeHint(stmt->dbc, sql_state);
     return ret;
 }
@@ -96,6 +132,21 @@ std::string DsqlErrorHintPlugin::GetConnectionAgeHint(const std::string& sql_sta
     return "[DSQL] The connection failed after " + std::to_string(minutes) + " minutes. This may be Aurora DSQL's "
            "60-minute connection limit. Disconnect and connect again, and recycle pooled connections before "
            + std::to_string(CONNECTION_AGE_HINT_THRESHOLD.count()) + " minutes.";
+}
+
+std::string_view DsqlErrorHintPlugin::GetAdvisoryLockHint(const std::string& sql_state, const std::string& message,
+                                                          const std::string& statement)
+{
+    if (sql_state.empty() || std::ranges::any_of(NOT_A_FUNCTION_ERROR_CLASSES, [&sql_state](std::string_view error_class) {
+            return sql_state.starts_with(error_class);
+        })) {
+        return "";
+    }
+    if (!NamesAdvisoryLockFunction(message) && !NamesAdvisoryLockFunction(statement)) {
+        return "";
+    }
+    return "[DSQL] Aurora DSQL doesn't support advisory locks (pg_advisory_lock and related functions), and the driver "
+           "doesn't emulate them. Remove the lock call, or coordinate through a table row instead.";
 }
 
 void DsqlErrorHintPlugin::LogConnectionAgeHint(DBC* dbc, const std::string& sql_state)

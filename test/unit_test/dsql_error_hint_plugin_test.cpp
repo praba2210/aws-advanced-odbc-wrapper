@@ -32,6 +32,7 @@
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/logger_wrapper.h"
 #include "../../driver/util/plugin_service.h"
+#include "../../driver/util/rds_strings.h"
 
 namespace {
     const std::string DSQL_HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-west-2.on.aws";
@@ -360,4 +361,78 @@ TEST_F(DsqlErrorHintPluginTest, Execute_LeavesTheRecordForSqlError) {
               RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
     EXPECT_EQ(SQL_NO_DATA,
               RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
+}
+
+namespace {
+    const std::string ADVISORY_HINT = "Aurora DSQL doesn't support advisory locks";
+}  // namespace
+
+TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_FromTheMessage) {
+    for (const std::string sql_state : {"42883", "0A000", "42501", "XX000"}) {
+        for (const std::string message : {
+                 "ERROR: function pg_advisory_lock(bigint) does not exist",
+                 "ERROR: function pg_try_advisory_lock(integer) does not exist",
+                 "ERROR: function pg_advisory_xact_lock(bigint) does not exist",
+                 "ERROR: function pg_advisory_unlock_all() does not exist",
+                 "ERROR: unsupported function PG_ADVISORY_LOCK_SHARED"}) {
+            EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint(sql_state, message, "").starts_with(
+                "[DSQL] " + ADVISORY_HINT)) << sql_state << " " << message;
+        }
+    }
+}
+
+// DSQL's message may not name the function; SQLExecDirect's text does.
+TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_FromTheStatementText) {
+    EXPECT_FALSE(DsqlErrorHintPlugin::GetAdvisoryLockHint("0A000", "ERROR: unsupported statement",
+        "SELECT pg_advisory_lock(1)").empty());
+    EXPECT_FALSE(DsqlErrorHintPlugin::GetAdvisoryLockHint("0A000", "ERROR: unsupported statement",
+        "select PG_TRY_ADVISORY_LOCK(1)").empty());
+}
+
+TEST(DsqlErrorHintPluginHintTest, AdvisoryLockHint_NoneForOtherErrors) {
+    // A rolled-back transaction or a lost connection, even with the function in the text.
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("40001",
+        "ERROR: change conflicts with another transaction (OC000)", "SELECT pg_advisory_lock(1)").empty());
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("08S01", CONNECTION_CLOSED,
+        "SELECT pg_advisory_lock(1)").empty());
+    // No record.
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("00000", "", "SELECT pg_advisory_lock(1)").empty());
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("", "", "SELECT pg_advisory_lock(1)").empty());
+    // Another function, or a name that only contains "advisory".
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("42883", "ERROR: function lower(integer) does not exist",
+        "SELECT lower(1)").empty());
+    EXPECT_TRUE(DsqlErrorHintPlugin::GetAdvisoryLockHint("42P01", "ERROR: relation \"advisory_notes\" does not exist",
+        "SELECT * FROM advisory_notes").empty());
+}
+
+TEST_F(DsqlErrorHintPluginTest, Execute_AdvisoryLockError_LogsTheHintAndPassesTheErrorThrough) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("42883"),
+                                  std::string("ERROR: function pg_advisory_lock(bigint) does not exist"));
+
+    CapturingLogSink sink;
+    const SQLRETURN ret = plugin->Execute(stmt_, nullptr, SQL_NTS);
+
+    EXPECT_EQ(SQL_ERROR, ret);
+    EXPECT_EQ((std::vector<std::string>{"read"}), plugin->calls);
+    EXPECT_EQ(1, sink.Count(ADVISORY_HINT));
+    // No wrapper diagnostic: the app reads the base driver's record.
+    EXPECT_FALSE(stmt_->err);
+}
+
+TEST_F(DsqlErrorHintPluginTest, Execute_AdvisoryLockInTheStatementText_LogsTheHint) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("0A000"), std::string("ERROR: unsupported statement"));
+#if UNICODE
+    std::vector<uint16_t> text = ConvertUTF8ToUTF16("SELECT pg_advisory_lock(1)");
+#else
+    std::string text = "SELECT pg_advisory_lock(1)";
+#endif
+
+    CapturingLogSink sink;
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, reinterpret_cast<SQLTCHAR*>(text.data()), SQL_NTS));
+
+    EXPECT_EQ(1, sink.Count(ADVISORY_HINT));
 }

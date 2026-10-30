@@ -75,7 +75,7 @@ psqlODBC doesn't tell the wrapper whether a transaction is open, so while autoco
 - A transaction opens when a statement starts with `BEGIN` or `START`, or with `COMMIT`, `END`, `ABORT` or `ROLLBACK` and `AND CHAIN`. This holds in any form: prepared, after whitespace or comments, or after a `;` in a batch such as `SELECT 1; BEGIN`. It holds even when the statement fails.
 - The transaction ends with a statement that is only `COMMIT`, `END`, `ABORT` or `ROLLBACK`, optionally with `WORK`, `TRANSACTION` or `AND NO CHAIN`, when that statement succeeds. It also ends with `SQLEndTran`, when autocommit is set off and back on, and when the handle connects again.
 
-A `BEGIN` after a `;` inside a string literal or a comment counts as opening a transaction. A `COMMIT` followed by `;` and a comment, a `COMMIT` in a batch and a `COMMIT` that failed don't end one. Either way, retries stay off until the transaction ends in one of the ways above.
+A `BEGIN` after a `;` inside a string literal or a comment counts as opening a transaction. A `COMMIT` that failed doesn't end one, and a `COMMIT` followed by `;` and a comment, or in a batch, may not. Either way, retries stay off until the transaction ends in one of the ways above.
 
 For transactions, set `SQL_ATTR_AUTOCOMMIT` to `SQL_AUTOCOMMIT_OFF` with `SQLSetConnectAttr` and end them with `SQLEndTran`, rather than sending `BEGIN` and `COMMIT`.
 
@@ -147,6 +147,8 @@ SQLRETURN Transfer(SQLHDBC dbc, SQLHSTMT stmt)
     }
 }
 ```
+
+The sample uses the ANSI ODBC functions, so on Windows build it without `UNICODE` defined, or pass `SQLWCHAR` text to the `W` functions.
 
 > [!WARNING]\
 > Don't put autocommit statements in your own retry loop while the plugin is on. The attempts multiply: up to your loop's attempts × (1 + `OCC_MAX_RETRIES`). Use your loop for transactions only, or set `ENABLE_OCC_RETRY=0`.

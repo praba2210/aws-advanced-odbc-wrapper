@@ -1035,3 +1035,33 @@ TEST_F(DsqlOccRetryExecuteTest, NonAsciiText_IsClassifiedAsTheBaseDriverRunsIt) 
     EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
     EXPECT_EQ(1U, AttemptsForAConflict());
 }
+
+// psqlODBC does nothing when autocommit is set on while it is already on (options.c:372-373), so a transaction opened
+// with BEGIN stays open on the server, and the wrapper must keep saying so.
+TEST_F(DsqlOccRetryExecuteTest, AutocommitSetOnAgain_KeepsATrackedTransactionOpen) {
+    Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "\nBEGIN");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                                 reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0));
+    EXPECT_TRUE(dbc_->auto_commit);
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// Switching autocommit on from off makes psqlODBC commit an open transaction (connection.c:528-545).
+TEST_F(DsqlOccRetryExecuteTest, AutocommitSwitchedOn_EndsTheTransaction) {
+    dbc_->auto_commit = false;
+    dbc_->transaction_status = TRANSACTION_OPEN;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(dbc_, SQL_ATTR_AUTOCOMMIT,
+                                                 reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0));
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
+    EXPECT_EQ(2U, AttemptsForAConflict());
+}
+
+// SQLEndTran ends a transaction the application opened with BEGIN in autocommit mode: psqlODBC sends the COMMIT
+// (execute.c:1313, statement.c:2149-2155), and the wrapper marks it closed (odbcapi_rds_helper.cpp:327-329).
+TEST_F(DsqlOccRetryExecuteTest, EndTran_EndsATrackedTransaction) {
+    Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "\nBEGIN");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT));
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
+    EXPECT_EQ(2U, AttemptsForAConflict());
+}

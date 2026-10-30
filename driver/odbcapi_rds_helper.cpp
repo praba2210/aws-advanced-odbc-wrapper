@@ -38,6 +38,7 @@
 #include "util/attribute_validator.h"
 #include "util/connection_string_helper.h"
 #include "util/connection_string_keys.h"
+#include "util/dsql_connection_validator.h"
 #include "util/logger_wrapper.h"
 #include "util/map_utils.h"
 #include "util/odbc_dsn_helper.h"
@@ -2816,6 +2817,12 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         LOG(ERROR) << invalid_message;
         ClearError(dbc);
         dbc->err = std::make_unique<ErrInfo>(invalid_message.c_str(), WARN_INVALID_CONNECTION_STRING_ATTRIBUTE);
+        return SQL_ERROR;
+    }
+
+    // Settings that can't work with Aurora DSQL fail before the base driver is loaded or the plugin service exists,
+    // so a rejected handle keeps no state.
+    if (!DsqlConnectionValidator::CheckSettings(dbc)) {
         return SQL_ERROR;
     }
 

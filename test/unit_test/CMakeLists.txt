@@ -44,6 +44,7 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/custom_endpoint_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_provider_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_connection_validator_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_occ_retry_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/failover_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/highest_weight_host_selector_test.cpp

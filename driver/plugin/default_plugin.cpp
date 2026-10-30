@@ -22,6 +22,7 @@
 #include "../util/plugin_service.h"
 #include "../util/rds_lib_loader.h"
 #include "../util/sql_query_analyzer.h"
+#include "dsql/dsql_compatibility.h"
 
 DefaultPlugin::DefaultPlugin(DBC *dbc) : DefaultPlugin(dbc, nullptr) {}
 
@@ -74,6 +75,9 @@ SQLRETURN DefaultPlugin::Connect(
             );
         }
     }
+
+    // Keep psqlODBC from doing what Aurora DSQL can't handle. Does nothing on other connections.
+    DsqlCompatibility::PrepareConnect(dbc);
 
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver

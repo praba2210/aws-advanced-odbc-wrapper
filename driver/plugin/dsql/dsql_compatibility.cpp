@@ -16,7 +16,6 @@
 
 #include <sqlext.h>
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <initializer_list>
@@ -114,8 +113,12 @@ namespace {
 
     const ForcedAttribute* FindForcedAttribute(SQLINTEGER attribute)
     {
-        const auto it = std::ranges::find(FORCED_ATTRIBUTES, attribute, &ForcedAttribute::attribute);
-        return it == FORCED_ATTRIBUTES.end() ? nullptr : &*it;
+        for (const ForcedAttribute& forced : FORCED_ATTRIBUTES) {
+            if (forced.attribute == attribute) {
+                return &forced;
+            }
+        }
+        return nullptr;
     }
 
     // The answer to the application setting one of FORCED_ATTRIBUTES on an Aurora DSQL connection. psqlODBC isn't

@@ -54,13 +54,14 @@ namespace {
 
     // The statement text the chain got from SQLExecDirect, as UTF-8, to its terminator: DefaultPlugin runs it that way
     // (SQL_NTS), whatever TextLength says. SQLExecute passes none.
-    std::string StatementTextToUtf8(SQLTCHAR* text)
+    std::string StatementTextToUtf8(const SQLTCHAR* text)
     {
         if (text == nullptr) {
             return "";
         }
 #if UNICODE
-        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(text));
+        // ConvertUTF16ToUTF8 takes a non-const pointer but only reads the text.
+        return ConvertUTF16ToUTF8(const_cast<uint16_t*>(reinterpret_cast<const uint16_t*>(text)));
 #else
         return reinterpret_cast<const char*>(text);
 #endif

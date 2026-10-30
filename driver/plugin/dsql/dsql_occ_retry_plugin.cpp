@@ -199,10 +199,11 @@ namespace {
 
     // The statement text as UTF-8, to its terminator: what DefaultPlugin runs (it passes SQL_NTS whatever TextLength
     // says). Unicode builds get RDS_SQLExecDirect's NUL-terminated UTF-16 copy.
-    std::string StatementTextToUtf8(SQLTCHAR* text)
+    std::string StatementTextToUtf8(const SQLTCHAR* text)
     {
 #if UNICODE
-        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(text));
+        // ConvertUTF16ToUTF8 takes a non-const pointer but only reads the text.
+        return ConvertUTF16ToUTF8(const_cast<uint16_t*>(reinterpret_cast<const uint16_t*>(text)));
 #else
         return reinterpret_cast<const char*>(text);
 #endif

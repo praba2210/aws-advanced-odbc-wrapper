@@ -1162,7 +1162,8 @@ protected:
 TEST_F(DsqlOccRetryChainTest, DsqlEndpoint_PutsTheOccRetryPluginInsideTheErrorHints) {
     dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_ENDPOINT);
     ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
-    EXPECT_EQ((std::vector<std::string>{"DSQL_OCC_RETRY", "DefaultPlugin"}), ChainNames(dbc_->plugin_head));
+    EXPECT_EQ((std::vector<std::string>{"DSQL_ERROR_HINT", "DSQL_OCC_RETRY", "DefaultPlugin"}),
+              ChainNames(dbc_->plugin_head));
 }
 
 TEST_F(DsqlOccRetryChainTest, RetryOff_LeavesItOut) {
@@ -1234,4 +1235,12 @@ TEST(DsqlOccRetryCheckTest, AllowsAuroraDsqlAndRetryOff) {
         EXPECT_TRUE(DsqlConnectionValidator::CheckSettings(&dbc));
         EXPECT_FALSE(dbc.err);
     }
+}
+
+// A connection that isn't Aurora DSQL keeps today's chain: neither the hint plugin nor the OCC retry plugin is added.
+TEST_F(DsqlOccRetryChainTest, NotDsqlWithRetryOff_TheChainIsUnchanged) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "localhost");
+    dbc_->conn_attr.insert_or_assign(KEY_ENABLE_OCC_RETRY, VALUE_BOOL_FALSE);
+    ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
+    EXPECT_EQ((std::vector<std::string>{"DefaultPlugin"}), ChainNames(dbc_->plugin_head));
 }

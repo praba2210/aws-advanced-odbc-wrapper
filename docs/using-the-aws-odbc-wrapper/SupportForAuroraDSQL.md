@@ -168,6 +168,8 @@ Once a connection is `MAX_CONNECTION_LIFETIME` seconds old, counted from the sta
 |---------------------------|---------------------------------------------------------------------------------------------------------|-------------------------|---------|
 | `MAX_CONNECTION_LIFETIME` | The age in seconds from which `SQL_ATTR_CONNECTION_DEAD` reports a connection dead. `0` turns this off. | `0`, or `120` to `3300` | `3300`  |
 
+In a Windows DSN, set `MAX_CONNECTION_LIFETIME` in the DSN setup dialog, on the **Aurora DSQL** tab under **Connection Lifetime**. A blank field uses the default, and the dialog checks the value when it saves the DSN.
+
 A value outside that range fails the connect with SQLSTATE `01S00`, for example `MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)`. The wrapper reads the option on every connect. To turn retirement off, set it to `0`, also on a reused connection handle. On a connection that isn't Aurora DSQL, see [Connection Lifetime Outside Aurora DSQL](#connection-lifetime-outside-aurora-dsql).
 
 Turn on the driver manager's pool, and keep its idle timeout at 600 seconds or less, as the Aurora DSQL connectors do:

@@ -35,6 +35,7 @@
 #include "../../driver/odbcapi.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/base_plugin.h"
+#include "../../driver/plugin/dsql/dsql_occ_retry_plugin.h"
 #include "../../driver/util/attribute_validator.h"
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
@@ -423,4 +424,614 @@ TEST_F(DsqlOccRetryPluginTest, ExecDirect_DropsThePreparedText) {
     TestText text("SELECT 1");
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLExecDirect(stmt_, text.Get(), SQL_NTS));
     EXPECT_TRUE(stmt_->prepared_text.empty());
+}
+
+namespace {
+    // The messages Aurora DSQL sends with SQLSTATE 40001 (DSQL user guide, "Concurrency control in Aurora DSQL").
+    const std::string OC000_MESSAGE = "ERROR: change conflicts with another transaction (OC000)";
+    const std::string OC001_MESSAGE = "ERROR: schema has been updated by another transaction (OC001)";
+    const std::string UPDATE_STATEMENT = "UPDATE t SET v = v + 1 WHERE id = 1";
+
+    Step Occ(const std::string& message) { return {SQL_ERROR, ERR_SERIALIZATION_FAILURE, "40001", message}; }
+    Step Fail(SQL_STATE_CODE code, const std::string& state, const std::string& message) {
+        return {SQL_ERROR, code, state, message};
+    }
+
+    // Collects log lines, so a test can count what the plugin logged.
+    class OccLogSink : public nglog::LogSink {
+    public:
+        void send(nglog::LogSeverity /*severity*/, const char* /*full_filename*/, const char* /*base_filename*/,
+                  int /*line*/, const nglog::LogMessageTime& /*time*/, const char* message, size_t message_len) override {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            messages_.emplace_back(message, message_len);
+        }
+
+        long Count(const std::string& text) {
+            const std::lock_guard<std::mutex> lock(mutex_);
+            return std::ranges::count_if(messages_, [&text](const std::string& m) { return m.find(text) != std::string::npos; });
+        }
+
+    private:
+        std::mutex mutex_;
+        std::vector<std::string> messages_;
+    };
+
+    using Change = DsqlOccRetryPlugin::TransactionChange;
+}  // namespace
+
+TEST(DsqlOccRetryRuleTest, OccConflicts_AreMatchedBySqlState) {
+    for (const std::string state : {"40001", "OC000", "OC001"}) {
+        EXPECT_TRUE(DsqlOccRetryPlugin::IsOccConflict(state)) << state;
+    }
+}
+
+// The message never decides on its own (XX000 can carry "(OC000)" and may have committed), as in Go and Rust.
+TEST(DsqlOccRetryRuleTest, OtherErrors_AreNot) {
+    for (const std::string state : {"23505", "40P01", "08S01", "XX000", "25P02", "0A000", ""}) {
+        EXPECT_FALSE(DsqlOccRetryPlugin::IsOccConflict(state)) << state;
+    }
+}
+
+TEST(DsqlOccRetryStatementTest, SingleStatements_AreRetryable) {
+    for (const std::string statement : {
+             "UPDATE t SET v = v + 1 WHERE id = 1",
+             "update t set v = 1;",
+             "  INSERT INTO t VALUES (1)  ;  \n",
+             "-- bump the counter\nUPDATE t SET v = v + 1",
+             "-- bump the counter\rUPDATE t SET v = v + 1",
+             "/* outer /* nested */ still a comment */ DELETE FROM t WHERE id = 1",
+             "WITH x AS (SELECT 1) SELECT * FROM x",
+             "(SELECT 1)",
+             "CREATE INDEX ASYNC t_v ON t (v)",
+             "SELECT 1;;",
+             "INSERT INTO commit_log VALUES (1)",
+         }) {
+        EXPECT_TRUE(DsqlOccRetryPlugin::IsRetryableStatement(statement)) << statement;
+    }
+}
+
+TEST(DsqlOccRetryStatementTest, TransactionControlAndBatches_AreNot) {
+    for (const std::string statement : {
+             "",
+             "   ",
+             ";",
+             "-- only a comment",
+             "/* unterminated comment UPDATE t SET v = 1",
+             "BEGIN",
+             "begin transaction",
+             "START TRANSACTION",
+             "COMMIT",
+             "  commit;",
+             "-- done\nCOMMIT",
+             "-- done\rCOMMIT",
+             "/* done */ROLLBACK",
+             "ROLLBACK TO SAVEPOINT s1",
+             "END",
+             "ABORT",
+             "SAVEPOINT s1",
+             "RELEASE SAVEPOINT s1",
+             "PREPARE TRANSACTION 'tx1'",
+             "SET search_path TO app",
+             "UPDATE a SET v = 1; UPDATE b SET v = 1",
+             // A ';' in a literal or before a trailing comment also counts as a batch, so no batch is ever retried.
+             "UPDATE t SET note = 'a;b' WHERE id = 1",
+             "UPDATE t SET v = 1; -- trailing note",
+         }) {
+        EXPECT_FALSE(DsqlOccRetryPlugin::IsRetryableStatement(statement)) << statement;
+    }
+}
+
+TEST(DsqlOccRetryStatementTest, TransactionChange_Opens) {
+    for (const std::string statement : {
+             "BEGIN",
+             "begin;",
+             "\nBEGIN",
+             "\tBEGIN ISOLATION LEVEL REPEATABLE READ",
+             "-- open\nBEGIN",
+             "-- open\rBEGIN",
+             "/* open */START TRANSACTION",
+             "/* a /* nested */ b */ BEGIN",
+             "SELECT 1; BEGIN",
+             "SELECT 1;BEGIN",
+             "SELECT 1;\n-- then\nBEGIN",
+             "SELECT 1; /* a ; b */ BEGIN",
+             "UPDATE t SET v = 1; START TRANSACTION",
+             "COMMIT; BEGIN",
+             "COMMIT AND CHAIN",
+             "ROLLBACK WORK AND CHAIN",
+             // After a ';' inside a literal: a transaction that isn't there, which is the safe direction.
+             "SELECT 'x;begin'",
+         }) {
+        EXPECT_EQ(Change::OPENS, DsqlOccRetryPlugin::GetTransactionChange(statement)) << statement;
+    }
+}
+
+TEST(DsqlOccRetryStatementTest, TransactionChange_Closes) {
+    for (const std::string statement : {
+             "COMMIT",
+             "commit;",
+             "  COMMIT  ;  ",
+             "\nCOMMIT",
+             "-- done\nCOMMIT",
+             "-- done\rCOMMIT",
+             "COMMIT -- done",
+             "/* done */ ROLLBACK",
+             "END",
+             "end transaction",
+             "ABORT",
+             "ROLLBACK WORK",
+             "COMMIT AND NO CHAIN",
+             "COMMIT TRANSACTION AND NO CHAIN",
+         }) {
+        EXPECT_EQ(Change::CLOSES, DsqlOccRetryPlugin::GetTransactionChange(statement)) << statement;
+    }
+}
+
+TEST(DsqlOccRetryStatementTest, TransactionChange_None) {
+    for (const std::string statement : {
+             "",
+             ";",
+             "UPDATE t SET v = 1",
+             "SELECT begin_date FROM t",
+             "INSERT INTO commit_log VALUES (1)",
+             "BEGINNING",
+             "-- BEGIN",
+             "/* BEGIN */ SELECT 1",
+             // Only a single statement that does nothing else closes; these leave the state as it was.
+             "SELECT 1; COMMIT",
+             "COMMIT; SELECT 1",
+             "COMMIT; -- done",
+             "INSERT INTO t VALUES ('x;commit')",
+             "ROLLBACK TO SAVEPOINT s1",
+             "COMMIT PREPARED 'tx1'",
+         }) {
+        EXPECT_EQ(Change::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement)) << statement;
+    }
+}
+
+TEST(DsqlOccRetryBackoffTest, DoublesFromTheBaseUpToTheCap) {
+    const OccRetryConfig config;
+    const std::vector<int64_t> expected = {100, 200, 400, 800, 1600, 3200, 5000, 5000};
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const int retry = static_cast<int>(i) + 1;
+        EXPECT_EQ(expected[i], DsqlOccRetryPlugin::GetBackoffDelay(config, retry, 0.0).count()) << retry;
+    }
+}
+
+TEST(DsqlOccRetryBackoffTest, AddsUpToTheJitterFactor) {
+    const OccRetryConfig config;
+    EXPECT_EQ(124, DsqlOccRetryPlugin::GetBackoffDelay(config, 1, 0.999).count());   // 100 + 24.975
+    EXPECT_EQ(6248, DsqlOccRetryPlugin::GetBackoffDelay(config, 7, 0.999).count());  // jitter on the 5000 ms cap
+    OccRetryConfig no_jitter;
+    no_jitter.jitter_factor = 0.0;
+    EXPECT_EQ(400, DsqlOccRetryPlugin::GetBackoffDelay(no_jitter, 3, 0.999).count());
+}
+
+TEST(DsqlOccRetryBackoffTest, ManyRetriesDoNotOverflow) {
+    OccRetryConfig config;
+    config.base_delay_ms = 1;
+    config.max_delay_ms = INT_MAX;
+    config.jitter_factor = 0.0;
+    EXPECT_EQ(INT_MAX, DsqlOccRetryPlugin::GetBackoffDelay(config, 100, 0.0).count());
+    config.base_delay_ms = INT_MAX;
+    EXPECT_EQ(INT_MAX, DsqlOccRetryPlugin::GetBackoffDelay(config, 100, 0.0).count());
+}
+
+// The plugin with a sleep that records each delay and a fixed random number.
+class DsqlOccRetryExecuteTest : public DsqlOccRetryPluginTest {
+protected:
+    std::vector<int64_t> sleeps_ms_;
+    double random_unit_ = 0.0;
+
+    std::shared_ptr<DsqlOccRetryPlugin> MakePlugin(const std::shared_ptr<BasePlugin>& next,
+                                                   const std::map<std::string, std::string>& options = {}) {
+        dbc_->conn_attr = options;
+        dbc_->conn_attr.insert_or_assign(KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE);
+        return std::make_shared<DsqlOccRetryPlugin>(dbc_, next,
+            [this](std::chrono::milliseconds delay) { sleeps_ms_.push_back(delay.count()); },
+            [this] { return random_unit_; });
+    }
+
+    // Runs one statement through a new plugin, starting with clear diagnostics as SQLExecDirect does. The transaction
+    // state lives on the DBC, so it carries over from one run to the next.
+    SQLRETURN Run(const std::shared_ptr<ScriptedPlugin>& chain, const std::string& statement,
+                  const std::map<std::string, std::string>& options = {}) {
+        ClearError(stmt_);
+        TestText text(statement);
+        return MakePlugin(chain, options)->Execute(stmt_, text.Get(), SQL_NTS);
+    }
+
+    // Runs a prepared statement: SQLExecute passes no text.
+    SQLRETURN RunPrepared(const std::shared_ptr<ScriptedPlugin>& chain, const std::string& prepared_text) {
+        ClearError(stmt_);
+        stmt_->prepared_text = prepared_text;
+        return MakePlugin(chain)->Execute(stmt_, nullptr, SQL_NTS);
+    }
+
+    // An UPDATE that conflicts once: 2 attempts when the plugin retried it, 1 when it didn't.
+    size_t AttemptsForAConflict() {
+        const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+        Run(chain, UPDATE_STATEMENT);
+        return chain->calls;
+    }
+};
+
+TEST_F(DsqlOccRetryExecuteTest, SucceedsFirstTime_RunsOnce) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()});
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(1U, chain->calls);
+    EXPECT_TRUE(sleeps_ms_.empty());
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ConflictThenSuccess_RunsAgainOnTheSameHandle) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    TestText text(UPDATE_STATEMENT);
+    EXPECT_EQ(SQL_SUCCESS, MakePlugin(chain)->Execute(stmt_, text.Get(), SQL_NTS));
+    EXPECT_EQ((std::vector<SQLHSTMT>{stmt_, stmt_}), chain->handles);
+    EXPECT_EQ((std::vector<SQLTCHAR*>{text.Get(), text.Get()}), chain->texts);
+    EXPECT_EQ((std::vector<int64_t>{100}), sleeps_ms_);
+    EXPECT_EQ(nullptr, stmt_->err);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, SchemaConflict_IsRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC001_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, "INSERT INTO t VALUES (1, 0)"));
+    EXPECT_EQ(2U, chain->calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ConflictEveryTime_ReturnsTheLastError) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Occ(OC000_MESSAGE + " 1"), Occ(OC000_MESSAGE + " 2"), Occ(OC000_MESSAGE + " 3"), Occ(OC000_MESSAGE + " 4")});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(4U, chain->calls);
+    EXPECT_EQ((std::vector<int64_t>{100, 200, 400}), sleeps_ms_);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_STREQ("40001", stmt_->err->sqlstate);
+    EXPECT_EQ(OC000_MESSAGE + " 4", stmt_->err->error_msg);
+    // The plugin's reads didn't use up SQLError's one record: the application gets it once.
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS,
+              RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
+    EXPECT_EQ("40001", ToUtf8(state));
+    EXPECT_EQ(SQL_NO_DATA,
+              RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, FollowsTheConfiguredBackoff) {
+    random_unit_ = 0.5;
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE)});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT, {{KEY_OCC_MAX_RETRIES, "4"}, {KEY_OCC_BASE_DELAY_MS, "10"},
+                                                      {KEY_OCC_MAX_DELAY_MS, "30"}, {KEY_OCC_JITTER_FACTOR, "0.5"}}));
+    EXPECT_EQ(5U, chain->calls);
+    // 10, 20, then the 30 ms cap; each plus 0.5 x 0.5 of itself, rounded down.
+    EXPECT_EQ((std::vector<int64_t>{12, 25, 37, 37}), sleeps_ms_);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ZeroMaxRetries_RunsOnce) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT, {{KEY_OCC_MAX_RETRIES, "0"}}));
+    EXPECT_EQ(1U, chain->calls);
+    EXPECT_TRUE(sleeps_ms_.empty());
+    EXPECT_EQ(0, g_get_stmt_attr_calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, OtherError_IsNotRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Fail(ERR_INTEGRITY_CONSTRAINT_VIOLATION, "23505", "duplicate key value violates unique constraint"), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(1U, chain->calls);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_STREQ("23000", stmt_->err->sqlstate);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, OtherErrorOnARetry_IsReturnedAtOnce) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Occ(OC000_MESSAGE), Fail(ERR_COMMUNICATION_LINK_FAILURE, "08S01", "server closed the connection unexpectedly"),
+        Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(2U, chain->calls);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_STREQ("08S01", stmt_->err->sqlstate);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, OtherResults_PassThrough) {
+    for (const SQLRETURN result :
+         {SQL_SUCCESS_WITH_INFO, SQL_NO_DATA, SQL_NEED_DATA, SQL_STILL_EXECUTING, SQL_INVALID_HANDLE}) {
+        const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{{result, ERR_GENERAL_ERROR, "", ""}, Ok()});
+        EXPECT_EQ(result, Run(chain, UPDATE_STATEMENT));
+        EXPECT_EQ(1U, chain->calls) << result;
+    }
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ManualCommit_IsNotRetried) {
+    dbc_->auto_commit = false;
+    dbc_->transaction_status = TRANSACTION_OPEN;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// SQLEndTran marks the transaction closed, but with autocommit off the next statement opens another one.
+TEST_F(DsqlOccRetryExecuteTest, ManualCommitAfterEndTran_IsNotRetried) {
+    dbc_->auto_commit = false;
+    dbc_->transaction_status = TRANSACTION_CLOSED;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// A BEGIN run through SQLExecDirect leaves autocommit on with a transaction open.
+TEST_F(DsqlOccRetryExecuteTest, OpenTransaction_IsNotRetried) {
+    dbc_->transaction_status = TRANSACTION_OPEN;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+    dbc_->transaction_status = TRANSACTION_ERROR;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+TEST_F(DsqlOccRetryExecuteTest, TransactionControl_IsNotRetried) {
+    for (const std::string statement : {"COMMIT", "  commit;", "-- end the transaction\nCOMMIT", "/* done */ROLLBACK",
+                                        "END", "ABORT", "RELEASE SAVEPOINT s1"}) {
+        dbc_->transaction_status = TRANSACTION_CLOSED;
+        const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+        EXPECT_EQ(SQL_ERROR, Run(chain, statement)) << statement;
+        EXPECT_EQ(1U, chain->calls) << statement;
+    }
+}
+
+TEST_F(DsqlOccRetryExecuteTest, Batch_IsNotRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, "UPDATE a SET v = 1; UPDATE b SET v = 1"));
+    EXPECT_EQ(1U, chain->calls);
+}
+
+// The base driver runs a direct statement to its terminator whatever TextLength says (DefaultPlugin passes SQL_NTS), so
+// the whole text is classified, here a batch.
+TEST_F(DsqlOccRetryExecuteTest, TextAfterTextLength_CountsToo) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    ClearError(stmt_);
+    TestText text("UPDATE a SET v = 1; UPDATE b SET v = 1");
+    EXPECT_EQ(SQL_ERROR, MakePlugin(chain)->Execute(stmt_, text.Get(), 18));
+    EXPECT_EQ(1U, chain->calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ParameterArray_IsNotRetried) {
+    g_paramset_size = 10;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// psqlODBC clears the statement's diagnostics on SQLGetStmtAttr, so asking after a failure would lose them.
+TEST_F(DsqlOccRetryExecuteTest, ParameterSetSize_IsAskedOnceBeforeTheFirstAttempt) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ((std::vector<int>{1, 1, 1}), chain->stmt_attr_calls_seen);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, NoBaseStatement_IsNotRetried) {
+    stmt_->wrapped_stmt = nullptr;
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+TEST_F(DsqlOccRetryExecuteTest, PreparedStatement_IsRetriedWithItsKeptText) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_SUCCESS, RunPrepared(chain, "UPDATE t SET v = v + 1 WHERE id = ?"));
+    EXPECT_EQ((std::vector<SQLTCHAR*>{nullptr, nullptr}), chain->texts);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, PreparedTransactionControl_IsNotRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, RunPrepared(chain, "COMMIT"));
+    EXPECT_EQ(1U, chain->calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, PreparedWithoutKeptText_IsNotRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, RunPrepared(chain, ""));
+    EXPECT_EQ(1U, chain->calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, LogsEachRetryAndWhenRetriesRunOut) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE)});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC conflict (OC000, SQLSTATE 40001): retry 1/3 in 100 ms"));
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC conflict (OC000, SQLSTATE 40001): retry 2/3 in 200 ms"));
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC conflict (OC000, SQLSTATE 40001): retry 3/3 in 400 ms"));
+    EXPECT_EQ(3, sink.Count("): retry "));
+    EXPECT_EQ(1, sink.Count(
+        "[DSQL] OCC conflict (OC000, SQLSTATE 40001) persisted after 3 retries; returning the error"));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, SuccessfulRetry_LogsNoGiveUpLine) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC001_MESSAGE), Ok()});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC conflict (OC001, SQLSTATE 40001): retry 1/3 in 100 ms"));
+    EXPECT_EQ(0, sink.Count("persisted after"));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, ConflictWithoutAnOcCode_LogsTheSqlState) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Occ("could not serialize access due to concurrent update"), Ok()});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC conflict (SQLSTATE 40001): retry 1/3 in 100 ms"));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, NotRetried_LogsNothing) {
+    dbc_->auto_commit = false;
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE)});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(0, sink.Count("[DSQL] OCC conflict"));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, BadOption_IsRejected) {
+    dbc_->conn_attr = {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_OCC_MAX_RETRIES, "101"}};
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()});
+    try {
+        const DsqlOccRetryPlugin plugin(dbc_, chain, nullptr, nullptr);
+        FAIL() << "the plugin accepted OCC_MAX_RETRIES=101";
+    } catch (const std::invalid_argument& ex) {
+        EXPECT_STREQ("Invalid value specified for connection string attribute: "
+                     "OCC_MAX_RETRIES=101 (use an integer from 0 to 100)", ex.what());
+    }
+}
+
+// psqlODBC's own record, read through SQLGetDiagRec as in production (DefaultPlugin sets no wrapper record).
+TEST_F(DsqlOccRetryExecuteTest, BaseRecord_ConflictThenSuccess_IsRetried) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()},
+                                                        Report::BASE_RECORD);
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(2U, chain->calls);
+}
+
+TEST_F(DsqlOccRetryExecuteTest, BaseRecord_RetriesRunOut_TheAppReadsTheLastConflict) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Occ(OC000_MESSAGE + " 1"), Occ(OC000_MESSAGE + " 2"), Occ(OC000_MESSAGE + " 3"), Occ(OC000_MESSAGE + " 4")},
+        Report::BASE_RECORD);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(4U, chain->calls);
+    // No wrapper record hides psqlODBC's.
+    EXPECT_EQ(nullptr, stmt_->err);
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_EQ("40001", ToUtf8(state));
+    EXPECT_EQ(OC000_MESSAGE + " 4", ToUtf8(message));
+    EXPECT_EQ(SQL_SUCCESS,
+              RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
+    EXPECT_EQ("40001", ToUtf8(state));
+    // SQLError then asks for record 0, which the fake answers with SQL_NO_DATA.
+    EXPECT_EQ(SQL_NO_DATA,
+              RDS_SQLError(nullptr, nullptr, stmt_, state, &native_error, message, MAX_MSG_LEN, &length, false));
+}
+
+TEST_F(DsqlOccRetryExecuteTest, BaseRecord_OtherErrorAfterAConflict_IsReturnedAtOnce) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Occ(OC000_MESSAGE), Fail(ERR_COMMUNICATION_LINK_FAILURE, "08S01", "server closed the connection unexpectedly"),
+        Ok()}, Report::BASE_RECORD);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(2U, chain->calls);
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_EQ("08S01", ToUtf8(state));
+}
+
+// A transaction DefaultPlugin doesn't record (it reads only direct text, trims only spaces and /* */
+// comments, and looks at the first statement) must still stop retries: after DSQL rolled the transaction back, a retry
+// would commit the statement on its own.
+TEST_F(DsqlOccRetryExecuteTest, BeginInAnyForm_StopsRetries) {
+    for (const std::string begin : {"\nBEGIN", "\tbegin", "-- open\nBEGIN", "-- open\rBEGIN",
+                                    "/* open */\nSTART TRANSACTION", "SELECT 1; BEGIN", "SELECT 1;\nBEGIN",
+                                    "SELECT 1; /* a ; b */ BEGIN", "COMMIT AND CHAIN"}) {
+        dbc_->transaction_status = TRANSACTION_CLOSED;
+        EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), begin)) << begin;
+        EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status) << begin;
+        EXPECT_EQ(1U, AttemptsForAConflict()) << begin;
+    }
+}
+
+TEST_F(DsqlOccRetryExecuteTest, PreparedBegin_StopsRetries) {
+    EXPECT_EQ(SQL_SUCCESS, RunPrepared(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "BEGIN"));
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// The safe direction: a batch can fail after its BEGIN ran, and a batch waiting for data at execution runs its BEGIN
+// when SQLParamData sends it, which never reaches the plugin.
+TEST_F(DsqlOccRetryExecuteTest, FailedBegin_StillStopsRetries) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
+        Fail(ERR_COMMUNICATION_LINK_FAILURE, "08S01", "server closed the connection unexpectedly")});
+    EXPECT_EQ(SQL_ERROR, Run(chain, "BEGIN; UPDATE t SET v = 1"));
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+    dbc_->transaction_status = TRANSACTION_CLOSED;
+    const auto need_data =
+        std::make_shared<ScriptedPlugin>(std::vector<Step>{{SQL_NEED_DATA, ERR_GENERAL_ERROR, "", ""}, Ok()});
+    EXPECT_EQ(SQL_NEED_DATA, Run(need_data, "BEGIN; INSERT INTO t VALUES (?)"));
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+    EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+TEST_F(DsqlOccRetryExecuteTest, PlainClose_EndsATrackedTransaction) {
+    for (const std::string close : {"\nCOMMIT", "-- done\nCOMMIT;", "end", "ROLLBACK", "ABORT WORK",
+                                    "COMMIT AND NO CHAIN"}) {
+        dbc_->transaction_status = TRANSACTION_OPEN;
+        EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), close)) << close;
+        EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status) << close;
+        EXPECT_EQ(2U, AttemptsForAConflict()) << close;
+    }
+}
+
+// Text that only looks like an end: a COMMIT inside a literal, a savepoint rollback, a COMMIT inside a batch, and a
+// COMMIT that failed (DSQL may have ended the transaction then, but the plugin doesn't assume it).
+TEST_F(DsqlOccRetryExecuteTest, OtherText_LeavesATrackedTransactionOpen) {
+    const std::vector<std::pair<std::string, Step>> cases = {
+        {"INSERT INTO t VALUES ('x;commit')", Ok()},
+        {"ROLLBACK TO SAVEPOINT s1", Ok()},
+        {"SELECT 1; COMMIT", Ok()},
+        {"COMMIT", Occ(OC000_MESSAGE)},
+    };
+    for (const auto& [statement, step] : cases) {
+        dbc_->transaction_status = TRANSACTION_OPEN;
+        Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{step}), statement);
+        EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status) << statement;
+        EXPECT_EQ(1U, AttemptsForAConflict()) << statement;
+    }
+}
+
+// With autocommit off the plugin leaves the transaction state to DefaultPlugin, SQLEndTran and the autocommit switch.
+TEST_F(DsqlOccRetryExecuteTest, ManualCommit_TransactionTextIsNotFollowed) {
+    dbc_->auto_commit = false;
+    dbc_->transaction_status = TRANSACTION_OPEN;
+    Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "COMMIT");
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+}
+
+namespace {
+    // The rest of a chain whose connect succeeded with a warning record, as the DSQL auth plugin's 01S02.
+    class WarningConnectPlugin : public BasePlugin {
+    public:
+        WarningConnectPlugin() : BasePlugin(nullptr) {}
+        SQLRETURN Connect(SQLHDBC ConnectionHandle, SQLHWND /*WindowHandle*/, SQLTCHAR* /*OutConnectionString*/,
+                          SQLSMALLINT /*BufferLength*/, SQLSMALLINT* /*StringLengthPtr*/,
+                          SQLUSMALLINT /*DriverCompletion*/) override {
+            DBC* dbc = static_cast<DBC*>(ConnectionHandle);
+            ClearError(dbc);
+            dbc->err = std::make_unique<ErrInfo>("SSLmode=disable was changed to verify-full", WARN_OPTION_VALUE_CHANGED);
+            return SQL_SUCCESS_WITH_INFO;
+        }
+    };
+}  // namespace
+
+// A successful connect's warning reaches the application untouched.
+TEST_F(DsqlOccRetryPluginTest, Connect_PassesAWarningAndItsRecordThrough) {
+    DsqlOccRetryPlugin plugin(dbc_, std::make_shared<WarningConnectPlugin>());
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_TRUE(dbc_->err);
+    EXPECT_STREQ("01S02", dbc_->err->sqlstate);
+}
+
+// Text outside ASCII, as UTF-16 from SQLExecDirectW in Unicode builds and as UTF-8 bytes in ANSI builds: an UPDATE is
+// still one retryable statement, and a BEGIN after a non-ASCII comment still opens a transaction.
+TEST_F(DsqlOccRetryExecuteTest, NonAsciiText_IsClassifiedAsTheBaseDriverRunsIt) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_SUCCESS, Run(chain, "UPDATE t SET name = 'Zoë Ångström' WHERE id = 1"));
+    EXPECT_EQ(2U, chain->calls);
+    EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "-- café\nBEGIN"));
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
+    EXPECT_EQ(1U, AttemptsForAConflict());
 }

@@ -83,6 +83,7 @@ set(INC
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.h
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_occ_retry_plugin.h
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.h
     ## Secrets Manager
@@ -201,6 +202,7 @@ set(SRC
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_occ_retry_plugin.cpp
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.cpp
     ## Secrets Manager

@@ -119,6 +119,17 @@ namespace {
         return pos;
     }
 
+    // PostgreSQL matches keywords with ASCII-only folding, and ICU's default locale would turn i into İ under tr/az.
+    std::string AsciiUpper(std::string word)
+    {
+        for (char& c : word) {
+            if (c >= 'a' && c <= 'z') {
+                c = static_cast<char>(c - 'a' + 'A');
+            }
+        }
+        return word;
+    }
+
     // Up to MAX_CONTROL_WORDS upper-cased words from pos, separated by whitespace and comments. Reading stops at the
     // first other character; end is set to where it stopped.
     std::vector<std::string> ReadWords(const std::string& text, size_t pos, size_t& end)
@@ -130,7 +141,7 @@ namespace {
             while (pos < text.size() && IsWordChar(text[pos])) {
                 ++pos;
             }
-            words.push_back(RDS_STR_UPPER(text.substr(start, pos - start)));
+            words.push_back(AsciiUpper(text.substr(start, pos - start)));
             pos = SkipSpaceAndComments(text, pos);
         }
         end = pos;

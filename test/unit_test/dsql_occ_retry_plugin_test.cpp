@@ -29,6 +29,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <unicode/uloc.h>
 
 #include "../../driver/driver.h"
 #include "../../driver/error.h"
@@ -1047,6 +1048,44 @@ TEST_F(DsqlOccRetryExecuteTest, NonAsciiText_IsClassifiedAsTheBaseDriverRunsIt) 
     EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "-- café\nBEGIN"));
     EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status);
     EXPECT_EQ(1U, AttemptsForAConflict());
+}
+
+// PostgreSQL folds keywords in ASCII only, so the server runs them whatever the client's locale. ICU's Turkish
+// upper-casing turns i into İ, so a locale-aware fold would miss a lowercase begin and retry a commit that failed.
+TEST_F(DsqlOccRetryExecuteTest, TurkishDefaultLocale_LowercaseKeywordsStillMatch) {
+    // Puts ICU's default locale back when the test ends, also when it fails.
+    struct DefaultLocaleGuard {
+        std::string saved;
+        ~DefaultLocaleGuard() {
+            UErrorCode status = U_ZERO_ERROR;
+            uloc_setDefault(saved.c_str(), &status);
+        }
+    };
+    const DefaultLocaleGuard guard{.saved = uloc_getDefault()};
+    UErrorCode status = U_ZERO_ERROR;
+    uloc_setDefault("tr", &status);
+    ASSERT_TRUE(U_SUCCESS(status)) << u_errorName(status);
+
+    EXPECT_EQ(Change::OPENS, DsqlOccRetryPlugin::GetTransactionChange("begin"));
+    EXPECT_EQ(Change::OPENS, DsqlOccRetryPlugin::GetTransactionChange("commit and chain"));
+    EXPECT_EQ(Change::CLOSES, DsqlOccRetryPlugin::GetTransactionChange("commit"));
+    EXPECT_FALSE(DsqlOccRetryPlugin::IsRetryableStatement("commit"));
+
+    for (const std::string begin : {"begin", "commit and chain"}) {
+        dbc_->transaction_status = TRANSACTION_CLOSED;
+        EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), begin)) << begin;
+        EXPECT_EQ(TRANSACTION_OPEN, dbc_->transaction_status) << begin;
+        EXPECT_EQ(1U, AttemptsForAConflict()) << begin;
+    }
+    // A commit that conflicts runs once and returns the conflict; one that succeeds ends the tracked transaction.
+    dbc_->transaction_status = TRANSACTION_CLOSED;
+    const auto conflict = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(conflict, "commit"));
+    EXPECT_EQ(1U, conflict->calls);
+    dbc_->transaction_status = TRANSACTION_OPEN;
+    EXPECT_EQ(SQL_SUCCESS, Run(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "commit"));
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
+    EXPECT_EQ(2U, AttemptsForAConflict());
 }
 
 // psqlODBC does nothing when autocommit is set on while it is already on (options.c:372-373), so a transaction opened

@@ -45,6 +45,7 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_provider_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_compatibility_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_connection_lifetime_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_connection_validator_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_error_hint_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_occ_retry_plugin_test.cpp

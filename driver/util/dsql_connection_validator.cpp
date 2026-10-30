@@ -23,6 +23,7 @@
 #include "../driver.h"
 #include "../error.h"
 #include "connection_string_keys.h"
+#include "dsql_connection_lifetime.h"
 #include "logger_wrapper.h"
 #include "map_utils.h"
 #include "rds_strings.h"
@@ -139,6 +140,13 @@ bool DsqlConnectionValidator::CheckSettings(DBC* dbc)
         error = KEY_ENABLE_OCC_RETRY "=1 works only with Aurora DSQL. Use an Aurora DSQL endpoint as SERVER, or set "
                 KEY_AUTH_TYPE "=" VALUE_AUTH_DSQL " or " KEY_DATABASE_DIALECT "=" VALUE_DB_DIALECT_AURORA_DSQL
                 "; otherwise set " KEY_ENABLE_OCC_RETRY "=0.";
+    }
+    // So does a MAX_CONNECTION_LIFETIME other than 0: the driver retires only Aurora DSQL connections.
+    if (error.empty() && DsqlConnectionLifetime::IsSet(dbc->conn_attr) && !IsDsqlTarget(dbc->conn_attr)) {
+        error = KEY_MAX_CONNECTION_LIFETIME "=" + dbc->conn_attr.at(KEY_MAX_CONNECTION_LIFETIME)
+                + " works only with Aurora DSQL. Use an Aurora DSQL endpoint as SERVER, or set " KEY_AUTH_TYPE "="
+                  VALUE_AUTH_DSQL " or " KEY_DATABASE_DIALECT "=" VALUE_DB_DIALECT_AURORA_DSQL "; otherwise set "
+                  KEY_MAX_CONNECTION_LIFETIME "=0.";
     }
     if (error.empty()) {
         return true;

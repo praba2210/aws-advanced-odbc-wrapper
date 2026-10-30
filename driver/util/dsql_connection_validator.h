@@ -32,8 +32,8 @@ namespace DsqlConnectionValidator {
     // an INFO line for RDS_AUTH_TYPE=SECRETS_MANAGER and a WARNING for an explicit non-DSQL DATABASE_DIALECT.
     std::string Validate(const std::map<std::string, std::string>& conn_attr);
 
-    // Validate, plus ENABLE_OCC_RETRY=1 needing Aurora DSQL, for RDS_InitializeConnection: on a problem, logs it, sets
-    // the 08001 diagnostic on dbc and returns false.
+    // Validate, plus ENABLE_OCC_RETRY=1 and a MAX_CONNECTION_LIFETIME other than 0 needing Aurora DSQL, for
+    // RDS_InitializeConnection: on a problem, logs it, sets the 08001 diagnostic on dbc and returns false.
     bool CheckSettings(DBC* dbc);
 }  // namespace DsqlConnectionValidator
 

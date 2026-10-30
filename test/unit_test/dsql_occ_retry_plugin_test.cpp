@@ -40,6 +40,7 @@
 #include "../../driver/util/attribute_validator.h"
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/logger_wrapper.h"
 #include "../../driver/util/occ_retry_config.h"
 #include "../../driver/util/odbc_helper.h"
@@ -1171,4 +1172,66 @@ TEST_F(DsqlOccRetryChainTest, RetryOff_LeavesItOut) {
     const std::vector<std::string> chain = ChainNames(dbc_->plugin_head);
     ASSERT_FALSE(chain.empty());
     EXPECT_EQ(chain.end(), std::ranges::find(chain, std::string("DSQL_OCC_RETRY")));
+}
+
+namespace {
+    const char* const OCC_NEEDS_DSQL_MESSAGE =
+        "ENABLE_OCC_RETRY=1 works only with Aurora DSQL. Use an Aurora DSQL endpoint as SERVER, or set "
+        "RDS_AUTH_TYPE=DSQL or DATABASE_DIALECT=AURORA_DSQL; otherwise set ENABLE_OCC_RETRY=0.";
+}  // namespace
+
+// Checked before the base driver loads or the plugin service exists, so the rejected handle keeps nothing.
+TEST_F(DsqlOccRetryChainTest, NotDsql_FailsTheConnectWith08001) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "localhost");
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+    ASSERT_TRUE(dbc_->err);
+    EXPECT_STREQ("08001", dbc_->err->sqlstate);
+    EXPECT_STREQ(OCC_NEEDS_DSQL_MESSAGE, dbc_->err->error_msg);
+    EXPECT_EQ(nullptr, dbc_->plugin_service);
+    EXPECT_EQ(nullptr, dbc_->plugin_head);
+}
+
+// The fix the message asks for works on the same handle.
+TEST_F(DsqlOccRetryChainTest, RejectedHandle_ConnectsOnceTheConnectionIsDsql) {
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "localhost");
+    ASSERT_EQ(SQL_ERROR, RDS_InitializeConnection(dbc_, ""));
+    dbc_->conn_attr.insert_or_assign(KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL);
+    ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
+    const std::vector<std::string> chain = ChainNames(dbc_->plugin_head);
+    EXPECT_NE(chain.end(), std::ranges::find(chain, std::string("DSQL_OCC_RETRY")));
+}
+
+TEST(DsqlOccRetryCheckTest, RejectsConnectionsThatArentDsql) {
+    const std::vector<std::map<std::string, std::string>> cases = {
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}},
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_SERVER, "my-cluster.cluster-abc.us-east-1.rds.amazonaws.com"}},
+        // A PrivateLink name is Aurora DSQL only with RDS_AUTH_TYPE=DSQL or DATABASE_DIALECT=AURORA_DSQL.
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE},
+         {KEY_SERVER, "vpce-0123456789abcdef0-abcdefgh.vpce-svc-0123456789abcdef0.us-east-1.vpce.amazonaws.com"}},
+    };
+    for (const auto& conn_attr : cases) {
+        DBC dbc;
+        dbc.conn_attr = conn_attr;
+        EXPECT_FALSE(DsqlConnectionValidator::CheckSettings(&dbc));
+        ASSERT_TRUE(dbc.err);
+        EXPECT_STREQ("08001", dbc.err->sqlstate);
+        EXPECT_STREQ(OCC_NEEDS_DSQL_MESSAGE, dbc.err->error_msg);
+    }
+}
+
+TEST(DsqlOccRetryCheckTest, AllowsAuroraDsqlAndRetryOff) {
+    const std::vector<std::map<std::string, std::string>> cases = {
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_SERVER, DSQL_ENDPOINT}},
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {KEY_SERVER, "10.0.0.5"}},
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL},
+         {KEY_SERVER, "10.0.0.5"}},
+        {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_FALSE}, {KEY_SERVER, "localhost"}},
+        {{KEY_SERVER, "localhost"}},
+    };
+    for (const auto& conn_attr : cases) {
+        DBC dbc;
+        dbc.conn_attr = conn_attr;
+        EXPECT_TRUE(DsqlConnectionValidator::CheckSettings(&dbc));
+        EXPECT_FALSE(dbc.err);
+    }
 }

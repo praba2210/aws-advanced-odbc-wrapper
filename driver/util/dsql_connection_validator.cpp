@@ -132,7 +132,14 @@ std::string DsqlConnectionValidator::Validate(const std::map<std::string, std::s
 
 bool DsqlConnectionValidator::CheckSettings(DBC* dbc)
 {
-    const std::string error = Validate(dbc->conn_attr);
+    std::string error = Validate(dbc->conn_attr);
+    // The OCC retry plugin works only with Aurora DSQL. Validate returns early off Aurora DSQL, so the rule is here.
+    if (error.empty() && MapUtils::GetStringValue(dbc->conn_attr, KEY_ENABLE_OCC_RETRY, "") == VALUE_BOOL_TRUE
+        && !IsDsqlTarget(dbc->conn_attr)) {
+        error = KEY_ENABLE_OCC_RETRY "=1 works only with Aurora DSQL. Use an Aurora DSQL endpoint as SERVER, or set "
+                KEY_AUTH_TYPE "=" VALUE_AUTH_DSQL " or " KEY_DATABASE_DIALECT "=" VALUE_DB_DIALECT_AURORA_DSQL
+                "; otherwise set " KEY_ENABLE_OCC_RETRY "=0.";
+    }
     if (error.empty()) {
         return true;
     }

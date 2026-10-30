@@ -1247,6 +1247,8 @@ SQLRETURN RDS_SQLExecDirect(
     const std::lock_guard<std::recursive_mutex> lock_guard_dbc(dbc->lock);
     const std::lock_guard<std::recursive_mutex> lock_guard(stmt->lock);
     ClearError(stmt);
+    // A direct execute replaces any prepared statement on the handle.
+    stmt->prepared_text.clear();
 
     SQLTCHAR* stmt_text = StatementText;
 #if UNICODE
@@ -2369,7 +2371,30 @@ SQLRETURN RDS_SQLPrepare(
             stmt_converted.tchar_ptr,
             TextLength
     );
-    return RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    // Kept for SQLExecute, which passes no text down the plugin chain: what the base driver prepared, TextLength
+    // characters unless that is SQL_NTS.
+    stmt->prepared_text.clear();
+    if (SQL_SUCCEEDED(ret) && StatementText != nullptr) {
+#if UNICODE
+        if (odbc_helper->GetUse4BytesUserApp()) {
+            stmt->prepared_text = ConvertUserAppToUTF8(true, StatementText, TextLength);
+        } else {
+            const uint16_t* units = reinterpret_cast<const uint16_t*>(StatementText);
+            size_t count = 0;
+            while ((TextLength < 0 || count < static_cast<size_t>(TextLength)) && units[count] != 0) {
+                ++count;
+            }
+            std::vector<uint16_t> prepared(units, units + count);
+            prepared.push_back(0);
+            stmt->prepared_text = ConvertUTF16ToUTF8(prepared.data());
+        }
+#else
+        const char* chars = reinterpret_cast<const char*>(StatementText);
+        stmt->prepared_text = TextLength >= 0 ? std::string(chars, static_cast<size_t>(TextLength)) : std::string(chars);
+#endif
+    }
+    return ret;
 }
 
 SQLRETURN RDS_SQLPrimaryKeys(

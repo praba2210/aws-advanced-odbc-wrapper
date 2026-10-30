@@ -177,3 +177,250 @@ TEST(DsqlOccRetryConfigTest, InitializeConnection_BadOccOptionFailsTheConnect) {
     EXPECT_STREQ("01S00", dbc.err->sqlstate);
     EXPECT_NE(nullptr, std::strstr(dbc.err->error_msg, "OCC_JITTER_FACTOR=2 (use a number from 0.0 to 1.0)"));
 }
+
+namespace {
+    // What the fake base driver answers.
+    SQLRETURN g_prepare_result = SQL_SUCCESS;
+    SQLULEN g_paramset_size = 1;
+    int g_get_stmt_attr_calls = 0;
+    // The base driver's diagnostic record 1 for the statement, as psqlODBC keeps it; an empty SQLSTATE means none.
+    std::string g_base_state;
+    std::string g_base_message;
+
+    // Writes text into an ODBC character buffer of buffer_chars characters, terminated, as a driver does.
+    void WriteText(SQLTCHAR* buffer, size_t buffer_chars, const std::string& text) {
+        if (buffer == nullptr || buffer_chars == 0) {
+            return;
+        }
+#if UNICODE
+        const std::vector<uint16_t> utf16 = ConvertUTF8ToUTF16(text);
+        const size_t count = std::min(utf16.size() - 1, buffer_chars - 1);
+        std::copy_n(utf16.begin(), count, reinterpret_cast<uint16_t*>(buffer));
+        reinterpret_cast<uint16_t*>(buffer)[count] = 0;
+#else
+        const size_t count = std::min(text.size(), buffer_chars - 1);
+        std::copy_n(text.begin(), count, reinterpret_cast<char*>(buffer));
+        reinterpret_cast<char*>(buffer)[count] = 0;
+#endif
+    }
+
+    // An ODBC character buffer as UTF-8.
+    std::string ToUtf8(SQLTCHAR* text) {
+#if UNICODE
+        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(text));
+#else
+        return reinterpret_cast<const char*>(text);
+#endif
+    }
+
+    SQLRETURN FakeSQLPrepare(SQLHSTMT /*statement*/, SQLTCHAR* /*text*/, SQLINTEGER /*length*/) {
+        return g_prepare_result;
+    }
+
+    SQLRETURN FakeSQLGetStmtAttr(SQLHSTMT /*statement*/, SQLINTEGER attribute, SQLPOINTER value,
+                                 SQLINTEGER /*buffer_length*/, SQLINTEGER* /*string_length*/) {
+        ++g_get_stmt_attr_calls;
+        if (attribute == SQL_ATTR_PARAMSET_SIZE && value) {
+            *static_cast<SQLULEN*>(value) = g_paramset_size;
+        }
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeSQLGetDiagRec(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT record,
+                                SQLTCHAR* state, SQLINTEGER* native_error, SQLTCHAR* message,
+                                SQLSMALLINT buffer_length, SQLSMALLINT* text_length) {
+        if (record != 1 || g_base_state.empty()) {
+            return SQL_NO_DATA;
+        }
+        WriteText(state, MAX_SQL_STATE_LEN, g_base_state);
+        WriteText(message, static_cast<size_t>(buffer_length), g_base_message);
+        if (native_error) {
+            *native_error = 0;
+        }
+        if (text_length) {
+            *text_length = static_cast<SQLSMALLINT>(g_base_message.size());
+        }
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeSQLSetConnectAttr(SQLHDBC /*connection*/, SQLINTEGER /*attribute*/, SQLPOINTER /*value*/,
+                                    SQLINTEGER /*length*/) {
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeSQLEndTran(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT /*completion*/) {
+        return SQL_SUCCESS;
+    }
+
+    // A base driver with only the calls these tests make.
+    class FakeBaseDriver : public RdsLibLoader {
+    public:
+        // A dummy path, so the base constructor sets up the function cache.
+        FakeBaseDriver() : RdsLibLoader("") {}
+
+        FUNC_HANDLE GetFunction(const std::string& function_name) override {
+            if (function_name == RDS_STR_SQLPrepare) {
+                return reinterpret_cast<FUNC_HANDLE>(&FakeSQLPrepare);
+            }
+            if (function_name == RDS_STR_SQLGetStmtAttr) {
+                return reinterpret_cast<FUNC_HANDLE>(&FakeSQLGetStmtAttr);
+            }
+            if (function_name == RDS_STR_SQLGetDiagRec) {
+                return reinterpret_cast<FUNC_HANDLE>(&FakeSQLGetDiagRec);
+            }
+            if (function_name == RDS_STR_SQLSetConnectAttr) {
+                return reinterpret_cast<FUNC_HANDLE>(&FakeSQLSetConnectAttr);
+            }
+            if (function_name == RDS_STR_SQLEndTran) {
+                return reinterpret_cast<FUNC_HANDLE>(&FakeSQLEndTran);
+            }
+            return nullptr;
+        }
+    };
+
+    // Statement text as the RDS_ helpers and the plugin chain get it: UTF-16 in Unicode builds, bytes in ANSI builds.
+    class TestText {
+    public:
+#if UNICODE
+        explicit TestText(const std::string& text) : buffer_(ConvertUTF8ToUTF16(text)) {}
+#else
+        explicit TestText(const std::string& text) : buffer_(text) {}
+#endif
+        SQLTCHAR* Get() { return reinterpret_cast<SQLTCHAR*>(buffer_.data()); }
+
+    private:
+#if UNICODE
+        std::vector<uint16_t> buffer_;
+#else
+        std::string buffer_;
+#endif
+    };
+
+    // One scripted result of the rest of the chain. code is the wrapper's error code, state the base driver's SQLSTATE.
+    struct Step {
+        SQLRETURN ret;
+        SQL_STATE_CODE code;
+        std::string state;
+        std::string message;
+    };
+
+    Step Ok() { return {SQL_SUCCESS, ERR_GENERAL_ERROR, "", ""}; }
+
+    // How a scripted failure is reported: as the wrapper's own record (stmt->err), or as the base driver's record,
+    // which RDS_SQLGetDiagRec reads through SQLGetDiagRec, as for every psqlODBC error in production.
+    enum class Report : std::uint8_t { WRAPPER_RECORD, BASE_RECORD };
+
+    // The rest of the plugin chain: returns the scripted results in order (the last one repeats) and reports each
+    // SQL_ERROR the way chosen.
+    class ScriptedPlugin : public BasePlugin {
+    public:
+        explicit ScriptedPlugin(std::vector<Step> steps, Report report = Report::WRAPPER_RECORD)
+            : steps_(std::move(steps)), report_(report) {}
+
+        SQLRETURN Execute(SQLHSTMT StatementHandle, SQLTCHAR* StatementText, SQLINTEGER /*TextLength*/) override {
+            STMT* stmt = static_cast<STMT*>(StatementHandle);
+            // Every attempt must start with the statement's diagnostics cleared.
+            EXPECT_EQ(nullptr, stmt->err) << "attempt " << (calls + 1) << " started with a stale error";
+            handles.push_back(StatementHandle);
+            texts.push_back(StatementText);
+            stmt_attr_calls_seen.push_back(g_get_stmt_attr_calls);
+            const Step& step = steps_.at(std::min(calls, steps_.size() - 1));
+            ++calls;
+            // Like psqlODBC, every execution starts with no record of its own.
+            g_base_state.clear();
+            g_base_message.clear();
+            if (step.ret == SQL_ERROR) {
+                if (report_ == Report::BASE_RECORD) {
+                    g_base_state = step.state;
+                    g_base_message = step.message;
+                } else {
+                    stmt->err = std::make_unique<ErrInfo>(step.message.c_str(), step.code);
+                }
+            }
+            return step.ret;
+        }
+
+        size_t calls = 0;
+        std::vector<SQLHSTMT> handles;
+        std::vector<SQLTCHAR*> texts;
+        std::vector<int> stmt_attr_calls_seen;
+
+    private:
+        std::vector<Step> steps_;
+        Report report_;
+    };
+}  // namespace
+
+// A connected statement in autocommit mode with no transaction open, over the fake base driver.
+class DsqlOccRetryPluginTest : public testing::Test {
+protected:
+    ENV* env_ = nullptr;
+    DBC* dbc_ = nullptr;
+    STMT* stmt_ = nullptr;
+    int base_dbc_stand_in_ = 0;
+    int base_stmt_stand_in_ = 0;
+    std::shared_ptr<FakeBaseDriver> lib_loader_;
+
+    void SetUp() override {
+        g_prepare_result = SQL_SUCCESS;
+        g_paramset_size = 1;
+        g_get_stmt_attr_calls = 0;
+        g_base_state.clear();
+        g_base_message.clear();
+        lib_loader_ = std::make_shared<FakeBaseDriver>();
+        env_ = new ENV();
+        env_->driver_lib_loader = lib_loader_;
+        dbc_ = new DBC();
+        dbc_->env = env_;
+        dbc_->wrapped_dbc = static_cast<SQLHDBC>(&base_dbc_stand_in_);
+        const auto plugin_service = std::make_shared<testing::NiceMock<MockPluginService>>();
+        ON_CALL(*plugin_service, GetOdbcHelper())
+            .WillByDefault(testing::Return(std::make_shared<OdbcHelper>(lib_loader_, env_)));
+        dbc_->plugin_service = plugin_service;
+        dbc_->auto_commit = true;
+        dbc_->transaction_status = TRANSACTION_CLOSED;
+        stmt_ = new STMT();
+        stmt_->dbc = dbc_;
+        stmt_->wrapped_stmt = static_cast<SQLHSTMT>(&base_stmt_stand_in_);
+    }
+
+    void TearDown() override {
+        delete stmt_;
+        delete dbc_;
+        delete env_;
+    }
+};
+
+TEST_F(DsqlOccRetryPluginTest, Prepare_KeepsTheStatementText) {
+    TestText text("UPDATE t SET v = v + 1 WHERE id = ?");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLPrepare(stmt_, text.Get(), SQL_NTS));
+    EXPECT_EQ("UPDATE t SET v = v + 1 WHERE id = ?", stmt_->prepared_text);
+}
+
+// psqlODBC prepares TextLength characters, so that's what is classified: "COMMITX" cut to 6 is a COMMIT.
+TEST_F(DsqlOccRetryPluginTest, Prepare_KeepsOnlyTextLengthCharacters) {
+    TestText text("UPDATE t SET v = 1 WHERE id = ?; trailing bytes");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLPrepare(stmt_, text.Get(), 31));
+    EXPECT_EQ("UPDATE t SET v = 1 WHERE id = ?", stmt_->prepared_text);
+    TestText commit("COMMITX");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLPrepare(stmt_, commit.Get(), 6));
+    EXPECT_EQ("COMMIT", stmt_->prepared_text);
+}
+
+TEST_F(DsqlOccRetryPluginTest, Prepare_FailureKeepsNoText) {
+    stmt_->prepared_text = "SELECT 1";
+    g_prepare_result = SQL_ERROR;
+    TestText text("UPDATE t SET v = 1");
+    EXPECT_EQ(SQL_ERROR, RDS_SQLPrepare(stmt_, text.Get(), SQL_NTS));
+    EXPECT_TRUE(stmt_->prepared_text.empty());
+}
+
+// A direct execute replaces the prepared statement on the handle.
+TEST_F(DsqlOccRetryPluginTest, ExecDirect_DropsThePreparedText) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()});
+    dbc_->plugin_head = chain.get();
+    stmt_->prepared_text = "UPDATE t SET v = 1";
+    TestText text("SELECT 1");
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLExecDirect(stmt_, text.Get(), SQL_NTS));
+    EXPECT_TRUE(stmt_->prepared_text.empty());
+}

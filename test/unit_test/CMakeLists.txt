@@ -42,6 +42,7 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_stack_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/connection_string_helper_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/custom_endpoint_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/default_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_provider_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_compatibility_test.cpp

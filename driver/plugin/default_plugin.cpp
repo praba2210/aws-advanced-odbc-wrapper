@@ -14,6 +14,10 @@
 
 #include "default_plugin.h"
 
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
 #include "../driver.h"
 #include "../odbcapi.h"
 #include "../util/connection_string_helper.h"
@@ -23,6 +27,12 @@
 #include "../util/rds_lib_loader.h"
 #include "../util/sql_query_analyzer.h"
 #include "dsql/dsql_compatibility.h"
+
+namespace {
+    // psqlODBC builds its output connection string in a MAX_CONNECT_STRING (4096) byte buffer, so a buffer of
+    // this many characters always holds what it writes, and psqlODBC never reports it truncated.
+    constexpr SQLSMALLINT BASE_DRIVER_OUT_CONN_STR_LEN = 4096;
+}  // namespace
 
 DefaultPlugin::DefaultPlugin(DBC *dbc) : DefaultPlugin(dbc, nullptr) {}
 
@@ -92,8 +102,31 @@ SQLRETURN DefaultPlugin::Connect(
 #else
     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(conn_in.c_str()));
 #endif
+    // psqlODBC writes its own output connection string, PWD included, into the buffer it gets, and may warn that it
+    // doesn't fit. The application gets the wrapper's string from RDS_SQLDriverConnect, so the base driver writes into
+    // a buffer of the wrapper's (4 bytes a character, for a base driver with a 4-byte SQLWCHAR); the application's
+    // buffer starts as an empty string. Without an application buffer, the arguments pass through.
+    std::vector<uint32_t> base_out_conn_str;
+    SQLSMALLINT base_out_len = 0;
+    SQLTCHAR* out_conn_str = OutConnectionString;
+    SQLSMALLINT out_buffer_len = BufferLength;
+    SQLSMALLINT* out_len_ptr = StringLengthPtr;
+    if (OutConnectionString) {
+        if (BufferLength > 0) {
+#if UNICODE
+            const size_t char_size = env->use_4_bytes_user_app.load() ? sizeof(uint32_t) : sizeof(SQLTCHAR);
+#else
+            const size_t char_size = sizeof(SQLTCHAR);
+#endif
+            std::memset(OutConnectionString, 0, char_size);
+        }
+        base_out_conn_str.resize(static_cast<size_t>(BASE_DRIVER_OUT_CONN_STR_LEN), 0);
+        out_conn_str = reinterpret_cast<SQLTCHAR*>(base_out_conn_str.data());
+        out_buffer_len = BASE_DRIVER_OUT_CONN_STR_LEN;
+        out_len_ptr = &base_out_len;
+    }
     res = NULL_CHECK_CALL_LIB_FUNC(env->driver_lib_loader, RDS_FP_SQLDriverConnect, RDS_STR_SQLDriverConnect,
-        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion
+        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, out_conn_str, out_buffer_len, out_len_ptr, DriverCompletion
     );
 
     if (res.fn_load_success) {
@@ -121,7 +154,7 @@ SQLRETURN DefaultPlugin::Connect(
                     const std::wstring wide_conn = ConvertUTF8ToWString(conn_in);
                     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(wide_conn.c_str()));
                     res = NULL_CHECK_CALL_LIB_FUNC(env->driver_lib_loader, RDS_FP_SQLDriverConnect, RDS_STR_SQLDriverConnect,
-                        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion
+                        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, out_conn_str, out_buffer_len, out_len_ptr, DriverCompletion
                     );
                     ret = res.fn_result;
                 }

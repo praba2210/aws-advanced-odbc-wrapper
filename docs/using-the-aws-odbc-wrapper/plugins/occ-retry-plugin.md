@@ -28,7 +28,7 @@ The wrapper checks all five options on every connect, also when `ENABLE_OCC_RETR
 The wrapper reads the options when a connection handle connects for the first time. To change them, use a new connection handle.
 
 > [!NOTE]\
-> The Windows DSN setup dialog has no fields for these options. Set them in the connection string, in `odbc.ini` on Linux and macOS, or, in a Windows DSN, in **Base Driver Connection String**, for example `ENABLE_OCC_RETRY=1;OCC_MAX_RETRIES=5`.
+> In the Windows DSN setup dialog, these options are on the **Aurora DSQL** tab, under **OCC Retry**. **Enable OCC Retry** turns retries on and makes the other four fields editable; a blank field uses the default. The dialog checks the values when it saves the DSN. Don't also set these options in **Base Driver Connection String**: a connection through the DSN may then use either value.
 
 ### Requirements
 

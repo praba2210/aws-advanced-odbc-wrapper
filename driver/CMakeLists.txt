@@ -111,6 +111,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/occ_retry_config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_dsn_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/plugin_chain_builder.h
@@ -225,6 +226,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/logger_wrapper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/map_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/number_utils.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/occ_retry_config.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_dsn_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/odbc_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/plugin_chain_builder.cpp

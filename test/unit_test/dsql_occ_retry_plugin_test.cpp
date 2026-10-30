@@ -39,6 +39,7 @@
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/logger_wrapper.h"
+#include "../../driver/util/occ_retry_config.h"
 #include "../../driver/util/odbc_helper.h"
 #include "../../driver/util/rds_lib_loader.h"
 #include "../../driver/util/rds_strings.h"
@@ -79,4 +80,100 @@ TEST(DsqlConnectionLifetimeSetupTest, MaxConnectionLifetime_IsAWrapperKey) {
 TEST(DsqlConnectionLifetimeSetupTest, Connection_StartsWithoutALifetime) {
     const DBC dbc{};
     EXPECT_TRUE(dbc.dsql_lifetime == nullptr);
+}
+
+TEST(DsqlOccRetryConfigTest, Parse_Defaults) {
+    std::string error;
+    const std::optional<OccRetryConfig> config = OccRetryConfig::Parse({}, error);
+    ASSERT_TRUE(config.has_value());
+    EXPECT_FALSE(config->enabled);
+    EXPECT_EQ(3, config->max_retries);
+    EXPECT_EQ(100, config->base_delay_ms);
+    EXPECT_EQ(5000, config->max_delay_ms);
+    EXPECT_DOUBLE_EQ(0.25, config->jitter_factor);
+    EXPECT_TRUE(error.empty());
+}
+
+TEST(DsqlOccRetryConfigTest, Parse_ReadsEveryOption) {
+    std::string error;
+    const std::optional<OccRetryConfig> config = OccRetryConfig::Parse({
+        {KEY_ENABLE_OCC_RETRY, "1"}, {KEY_OCC_MAX_RETRIES, "10"}, {KEY_OCC_BASE_DELAY_MS, "1"},
+        {KEY_OCC_MAX_DELAY_MS, "100"}, {KEY_OCC_JITTER_FACTOR, "0.5"}}, error);
+    ASSERT_TRUE(config.has_value()) << error;
+    EXPECT_TRUE(config->enabled);
+    EXPECT_EQ(10, config->max_retries);
+    EXPECT_EQ(1, config->base_delay_ms);
+    EXPECT_EQ(100, config->max_delay_ms);
+    EXPECT_DOUBLE_EQ(0.5, config->jitter_factor);
+}
+
+TEST(DsqlOccRetryConfigTest, Parse_AcceptsRangeEnds) {
+    const std::vector<std::map<std::string, std::string>> cases = {
+        {{KEY_ENABLE_OCC_RETRY, "0"}},
+        {{KEY_OCC_MAX_RETRIES, "0"}},
+        {{KEY_OCC_MAX_RETRIES, "100"}},
+        {{KEY_OCC_MAX_RETRIES, " +7 "}},
+        {{KEY_OCC_BASE_DELAY_MS, "1"}},
+        {{KEY_OCC_BASE_DELAY_MS, "250"}, {KEY_OCC_MAX_DELAY_MS, "250"}},
+        {{KEY_OCC_BASE_DELAY_MS, "60000"}, {KEY_OCC_MAX_DELAY_MS, "60000"}},
+        {{KEY_OCC_JITTER_FACTOR, "0"}},
+        {{KEY_OCC_JITTER_FACTOR, "1.0"}},
+        {{KEY_OCC_JITTER_FACTOR, " 0.5 "}},
+    };
+    for (const auto& conn_attr : cases) {
+        std::string error;
+        EXPECT_TRUE(OccRetryConfig::Parse(conn_attr, error).has_value()) << error;
+    }
+}
+
+TEST(DsqlOccRetryConfigTest, Parse_RejectsBadValuesWithWhatToUse) {
+    const std::vector<std::pair<std::map<std::string, std::string>, std::string>> cases = {
+        {{{KEY_ENABLE_OCC_RETRY, "yes"}}, "ENABLE_OCC_RETRY=yes (use 0 or 1)"},
+        {{{KEY_OCC_MAX_RETRIES, "101"}}, "OCC_MAX_RETRIES=101 (use an integer from 0 to 100)"},
+        {{{KEY_OCC_MAX_RETRIES, "-1"}}, "OCC_MAX_RETRIES=-1 (use an integer from 0 to 100)"},
+        {{{KEY_OCC_MAX_RETRIES, "three"}}, "OCC_MAX_RETRIES=three (use an integer from 0 to 100)"},
+        {{{KEY_OCC_BASE_DELAY_MS, "0"}}, "OCC_BASE_DELAY_MS=0 (use an integer from 1 to 60000)"},
+        {{{KEY_OCC_BASE_DELAY_MS, "1.5"}}, "OCC_BASE_DELAY_MS=1.5 (use an integer from 1 to 60000)"},
+        {{{KEY_OCC_BASE_DELAY_MS, "60001"}}, "OCC_BASE_DELAY_MS=60001 (use an integer from 1 to 60000)"},
+        {{{KEY_OCC_MAX_DELAY_MS, "50"}},
+         "OCC_MAX_DELAY_MS=50 (use an integer from OCC_BASE_DELAY_MS, 100, to 60000)"},
+        {{{KEY_OCC_MAX_DELAY_MS, "soon"}},
+         "OCC_MAX_DELAY_MS=soon (use an integer from OCC_BASE_DELAY_MS, 100, to 60000)"},
+        {{{KEY_OCC_MAX_DELAY_MS, "60001"}},
+         "OCC_MAX_DELAY_MS=60001 (use an integer from OCC_BASE_DELAY_MS, 100, to 60000)"},
+        // The 5000 ms default cap is below this base, so the cap has to be set too: the entry says it's the default.
+        {{{KEY_OCC_BASE_DELAY_MS, "10000"}},
+         "OCC_MAX_DELAY_MS=5000 (the default; set it to an integer from OCC_BASE_DELAY_MS, 10000, to 60000)"},
+        {{{KEY_OCC_JITTER_FACTOR, "1.5"}}, "OCC_JITTER_FACTOR=1.5 (use a number from 0.0 to 1.0)"},
+        {{{KEY_OCC_JITTER_FACTOR, "-0.1"}}, "OCC_JITTER_FACTOR=-0.1 (use a number from 0.0 to 1.0)"},
+        // A decimal comma is never read, whatever locale the application set.
+        {{{KEY_OCC_JITTER_FACTOR, "0,25"}}, "OCC_JITTER_FACTOR=0,25 (use a number from 0.0 to 1.0)"},
+        {{{KEY_OCC_JITTER_FACTOR, "nan"}}, "OCC_JITTER_FACTOR=nan (use a number from 0.0 to 1.0)"},
+        {{{KEY_OCC_JITTER_FACTOR, ""}}, "OCC_JITTER_FACTOR= (use a number from 0.0 to 1.0)"},
+    };
+    for (const auto& [conn_attr, expected] : cases) {
+        std::string error;
+        EXPECT_FALSE(OccRetryConfig::Parse(conn_attr, error).has_value()) << expected;
+        EXPECT_EQ(expected, error);
+    }
+}
+
+TEST(DsqlOccRetryConfigTest, ValidateMap_ReportsTheBadOccOption) {
+    EXPECT_EQ((std::unordered_set<std::string>{"OCC_MAX_RETRIES=101 (use an integer from 0 to 100)"}),
+              AttributeValidator::ValidateMap({{KEY_OCC_MAX_RETRIES, "101"}, {KEY_PORT, "5432"}}));
+    EXPECT_TRUE(AttributeValidator::ValidateMap({{KEY_OCC_MAX_RETRIES, "3"}, {KEY_ENABLE_OCC_RETRY, "0"}}).empty());
+}
+
+// Checked at every connect, before the base driver loads, whether or not ENABLE_OCC_RETRY is on.
+TEST(DsqlOccRetryConfigTest, InitializeConnection_BadOccOptionFailsTheConnect) {
+    ENV env;
+    DBC dbc;
+    dbc.env = &env;
+    dbc.conn_attr = {{KEY_OCC_JITTER_FACTOR, "2"}};
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(&dbc, ""));
+
+    ASSERT_TRUE(dbc.err);
+    EXPECT_STREQ("01S00", dbc.err->sqlstate);
+    EXPECT_NE(nullptr, std::strstr(dbc.err->error_msg, "OCC_JITTER_FACTOR=2 (use a number from 0.0 to 1.0)"));
 }

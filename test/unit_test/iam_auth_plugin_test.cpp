@@ -104,7 +104,7 @@ TEST_F(IamAuthPluginTest, Connect_DefaultChain_CredentialFail) {
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
-    EXPECT_STREQ("Unable to resolve AWS credentials from the default credential chain (such as environment "
+    EXPECT_EQ("Unable to resolve AWS credentials from the default credential chain (such as environment "
         "variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container or instance role)",
         dbc_->err->error_msg);
 }
@@ -289,7 +289,7 @@ TEST_F(IamAuthPluginTest, Connect_EmptyToken_Fails) {
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
-    EXPECT_STREQ("Failed to generate IAM authentication token. See the driver log for the cause.",
+    EXPECT_EQ("Failed to generate IAM authentication token. See the driver log for the cause.",
         dbc_->err->error_msg);
 }
 
@@ -312,6 +312,6 @@ TEST_F(IamAuthPluginTest, Connect_CacheHit_AccessError_EmptyFreshToken_Fails) {
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
-    EXPECT_STREQ("Failed to generate IAM authentication token. See the driver log for the cause.",
+    EXPECT_EQ("Failed to generate IAM authentication token. See the driver log for the cause.",
         dbc_->err->error_msg);
 }

@@ -215,7 +215,7 @@ bool BaseTokenAuthPlugin::ValidateRequiredParams(DBC* dbc, const std::string& ia
         }
         LOG(ERROR) << error_msg;
         ClearError(dbc);
-        dbc->err = std::make_unique<ErrInfo>(error_msg.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        dbc->err = std::make_unique<ErrInfo>(error_msg, ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
         return false;
     }
 

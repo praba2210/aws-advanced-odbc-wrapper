@@ -35,7 +35,7 @@ namespace {
     // Records every base-driver function the wrapper looks up, and returns nullptr so nothing is called.
     class RecordingRdsLibLoader : public RdsLibLoader {
     public:
-        FUNC_HANDLE GetFunction(const std::string& function_name) override {
+        RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
             requested_functions.push_back(function_name);
             return nullptr;
         }

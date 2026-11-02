@@ -87,7 +87,7 @@ TEST_F(IamAuthPluginTest, Connect_SSO_CredentialFail) {
     SQLRETURN ret = plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT);
     EXPECT_EQ(SQL_ERROR, ret);
     EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
-    EXPECT_NE(std::string(dbc_->err->error_msg).find("aws sso login"), std::string::npos);
+    EXPECT_NE(dbc_->err->error_msg.find("aws sso login"), std::string::npos);
 }
 
 // With no AWS_PROFILE key the credentials come from the default chain, so the error names that, not a profile.

@@ -96,8 +96,6 @@ In ODBC Data Source Administrator (64-bit), add a DSN for `AWS Advanced ODBC Wra
 8. On the **Authentication** tab, choose **Aurora DSQL** as the **Authentication Mode**. The tab then shows **AWS Region**, **Expire Time** and **IAM Host**. Set **AWS Region** when **Server** is a cluster ID and no environment variable or AWS profile gives the region (see [Region](#region)). **Expire Time** is in seconds; leave it blank for 900. Leave **IAM Host** blank unless you use [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns).
 9. Choose **Test**, then **Save** and **OK**.
 
-Write `RDS_AUTH_TYPE=DSQL` in upper case in a DSN you'll open in the dialog, for example one created with `Add-OdbcDsn`: the dialog doesn't recognize a lowercase value, and saving the DSN from it then clears the value.
-
 ### Region
 
 The token is signed for the cluster's region. The plugin uses the first region it finds:

@@ -39,6 +39,7 @@ The wrapper reads the options when a connection handle connects for the first ti
   ```
 
 - psqlODBC as the underlying driver.
+- For `RDS_AUTH_TYPE=DSQL` and its options, see the [Aurora DSQL Authentication Plugin](./aurora-dsql-authentication-plugin.md).
 
 ### When a Statement Is Retried
 

@@ -4,6 +4,8 @@
 
 The plugin works with [psqlODBC](https://github.com/postgresql-interfaces/psqlodbc) as the underlying driver: it sets psqlODBC's `SSLmode` and `pqopt` options.
 
+For Aurora DSQL behaviors such as OCC retries, see [Support for Amazon Aurora DSQL](../SupportForAuroraDSQL.md) and the [OCC Retry Plugin](./occ-retry-plugin.md).
+
 ### Prerequisites
 
 1. An Aurora DSQL cluster, and its endpoint (`<cluster-id>.dsql.<region>.on.aws`) or its cluster ID.
@@ -189,7 +191,7 @@ The wrapper picks the Aurora DSQL dialect when `RDS_AUTH_TYPE=DSQL` or the host 
 
 The plugin signs a new token for each new connection; it doesn't cache tokens. An open connection stays open after its token expires.
 
-Aurora DSQL closes every connection after 60 minutes ([Cluster quotas and database limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)), and the wrapper doesn't reopen it. Set your connection pool's maximum connection lifetime under 55 minutes, so the pool replaces connections before Aurora DSQL closes them. Windows driver-manager connection pooling has no such setting: its `CPTimeout` closes only connections that stay unused, so a pooled connection in steady use stays open until Aurora DSQL closes it.
+Aurora DSQL closes every connection after 60 minutes ([Cluster quotas and database limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)), and the wrapper doesn't reopen it. Set your connection pool's maximum connection lifetime under 55 minutes, so the pool replaces connections before Aurora DSQL closes them. Windows driver-manager connection pooling has no such setting: its `CPTimeout` closes only connections that stay unused, so a pooled connection in steady use stays open until Aurora DSQL closes it. When a statement fails because Aurora DSQL closed the connection, the wrapper logs a hint; see [60-Minute Connection Limit](../SupportForAuroraDSQL.md#60-minute-connection-limit).
 
 ### AWS PrivateLink Without Private DNS
 

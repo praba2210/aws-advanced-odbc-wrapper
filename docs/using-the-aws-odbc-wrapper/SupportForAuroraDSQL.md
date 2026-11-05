@@ -12,7 +12,7 @@ Sample connection string, with the Unicode wrapper on Linux:
 DRIVER={AWS Advanced ODBC Wrapper Unicode};SERVER=abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws;RDS_AUTH_TYPE=DSQL;BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;
 ```
 
-`RDS_AUTH_TYPE=DSQL` makes the wrapper sign an Aurora DSQL authentication token for each connection. To retry statements that fail with an optimistic concurrency control (OCC) conflict, see the [OCC Retry Plugin](./plugins/occ-retry-plugin.md).
+`RDS_AUTH_TYPE=DSQL` makes the wrapper sign an Aurora DSQL authentication token for each connection. For its options, TLS, region and cluster IDs, see the [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md). To retry statements that fail with an optimistic concurrency control (OCC) conflict, see the [OCC Retry Plugin](./plugins/occ-retry-plugin.md).
 
 The warnings and hints on this page go to the wrapper's log, in the `aws-odbc-wrapper` folder of the user's temporary directory (see [Logging](./using-the-aws-odbc-wrapper.md#logging)).
 

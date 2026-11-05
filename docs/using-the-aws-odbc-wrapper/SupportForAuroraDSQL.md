@@ -76,9 +76,6 @@ With `UseDeclareFetch=0`, psqlODBC reads a query's whole result into memory when
 
 On an open Aurora DSQL connection, the wrapper answers some calls itself, so that psqlODBC doesn't send statements Aurora DSQL rejects.
 
-> [!NOTE]\
-> On an open connection, `SQLGetDiagField` returns psqlODBC's diagnostics instead of the wrapper's records described in this section, with the Windows driver manager and with unixODBC. Read them with `SQLGetDiagRec` or `SQLError`.
-
 ### Query Timeout
 
 | Call                                                                                                                  | Result                                                                                                                                                                                                                                                                                                                                                            |

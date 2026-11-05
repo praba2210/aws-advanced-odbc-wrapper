@@ -1144,7 +1144,7 @@ TEST_F(DsqlAuthPluginTest, Connect_KeptOrDefaultSslMode_NoWarning) {
 }
 
 // The wrapper keeps one record per handle, and its record hides the base driver's. When psqlODBC has its own
-// warnings (a short output buffer gets 01004), they stay; the override is only logged.
+// warnings, they stay; the override is only logged.
 TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_KeepsBaseDriverWarnings) {
     dbc_->conn_attr.insert_or_assign("SSLMODE", "prefer");
     EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,

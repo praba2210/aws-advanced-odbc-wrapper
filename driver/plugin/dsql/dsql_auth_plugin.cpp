@@ -553,7 +553,7 @@ SQLRETURN DsqlAuthPlugin::Connect(
         dbc->conn_attr.erase(password);
     }
     // The wrapper keeps one diagnostic record per handle, and it hides the base driver's. Report the override only
-    // when the base driver has nothing to report (a short output buffer, for one, gets psqlODBC's 01004).
+    // when the base driver has nothing to report.
     if (ret != SQL_SUCCESS || tls_warning.empty()) {
         return ret;
     }

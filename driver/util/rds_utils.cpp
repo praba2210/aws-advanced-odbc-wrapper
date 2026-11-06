@@ -16,8 +16,6 @@
 
 #include "windows_headers.h"
 
-#include <algorithm>
-#include <cctype>
 #include <regex>
 #include <string>
 
@@ -246,7 +244,5 @@ std::string RdsUtils::GetDsqlRegion(const std::string& host) {
         return "";
     }
     // SigV4 region names are lowercase; a token signed for "US-EAST-1" never authenticates.
-    std::string region = m.str(1);
-    std::ranges::transform(region, region.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return region;
+    return AsciiLower(m.str(1));
 }

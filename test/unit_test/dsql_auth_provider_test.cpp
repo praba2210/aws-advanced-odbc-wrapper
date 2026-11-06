@@ -16,12 +16,17 @@
 #include <gtest/gtest.h>
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/client/GenericClientConfiguration.h>
 #include <aws/core/utils/DateTime.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <type_traits>
+
+#include "scoped_ctype_locale.h"
+#include "scoped_env_vars.h"
 
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/dsql_auth_provider.h"
@@ -35,36 +40,6 @@ namespace {
     const std::string REGION = "us-east-1";
     const std::string PORT = "5432";
     const std::chrono::milliseconds EXPIRATION = std::chrono::seconds(900);
-
-    // Sets or unsets an environment variable for one scope and restores the old value afterwards.
-    class ScopedEnvVar {
-    public:
-        ScopedEnvVar(const char* name, const std::optional<std::string>& value) : name_(name) {
-            if (const char* old = std::getenv(name)) {
-                saved_ = old;
-            }
-            Set(value);
-        }
-        ~ScopedEnvVar() { Set(saved_); }
-        ScopedEnvVar(const ScopedEnvVar&) = delete;
-        ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
-    private:
-        void Set(const std::optional<std::string>& value) const {
-#ifdef _WIN32
-            _putenv_s(name_, value ? value->c_str() : "");
-#else
-            if (value) {
-                setenv(name_, value->c_str(), 1);
-            } else {
-                unsetenv(name_);
-            }
-#endif
-        }
-
-        const char* name_;
-        std::optional<std::string> saved_;
-    };
 }  // namespace
 
 // DSQL tokens are presigned locally, so these tests run the real SDK with fake keys and never reach AWS.
@@ -147,6 +122,19 @@ TEST_F(DsqlAuthProviderTest, GetToken_UppercaseHost_SignsLowercase) {
     EXPECT_TRUE(token.starts_with(HOST));
 }
 
+// Under tr_TR.UTF-8, glibc's std::tolower leaves I as I, so the host is folded in ASCII. Needs the tr_TR.UTF-8 locale.
+TEST_F(DsqlAuthProviderTest, GetToken_TurkishCtype_SignsLowercaseHost) {
+    const ScopedCtypeLocale ctype("tr_TR.UTF-8");
+    if (!ctype.IsSet()) {
+        SKIP_OR_FAIL_WITHOUT_TURKISH_LOCALE();
+    }
+    DsqlAuthProvider provider(REGION, TestCredentials());
+    const std::string token =
+        provider.GetToken("ABCDEFGHIJKLMNOPQRSTUVWXYZ.DSQL.US-EAST-1.ON.AWS", REGION, PORT, "admin", true, false, EXPIRATION).first;
+    // Only the host part of the token is printed.
+    EXPECT_TRUE(token.starts_with(HOST)) << token.substr(0, HOST.size());
+}
+
 // With empty credentials the C++ SigV4 presigner skips signing ("don't sign anonymous requests") and returns an
 // unsigned URL, which the server would reject as a bad password. The provider must refuse instead.
 TEST_F(DsqlAuthProviderTest, GetToken_NoCredentials_ReturnsEmpty) {
@@ -182,14 +170,38 @@ TEST_F(DsqlAuthProviderTest, GetToken_MissingSecretKey_ReturnsEmpty) {
 // seconds. The SDK's DateTime overflows on that value, so the expiration reads as at or before 1970. Those
 // credentials are valid and must still sign.
 TEST_F(DsqlAuthProviderTest, ProfileStaticCredentials_AreResolved) {
-    const ScopedEnvVar credentials_file("AWS_SHARED_CREDENTIALS_FILE",
+    const ScopedEnvVars credentials_file("AWS_SHARED_CREDENTIALS_FILE",
         std::string(AWS_PROFILE_TEST_RESOURCES_DIR) + "/aws_credentials");
     // CI exports role credentials; the environment provider would answer before the profile one.
-    const ScopedEnvVar access_key("AWS_ACCESS_KEY_ID", std::nullopt);
-    const ScopedEnvVar secret_key("AWS_SECRET_ACCESS_KEY", std::nullopt);
-    const ScopedEnvVar session_token("AWS_SESSION_TOKEN", std::nullopt);
+    const ScopedEnvVars access_key("AWS_ACCESS_KEY_ID", std::nullopt);
+    const ScopedEnvVars secret_key("AWS_SECRET_ACCESS_KEY", std::nullopt);
+    const ScopedEnvVars session_token("AWS_SESSION_TOKEN", std::nullopt);
 
     DsqlAuthProvider provider(REGION, "dsql_static");
     EXPECT_TRUE(provider.HasResolvedCredentials());
     EXPECT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
+}
+
+// AuthProvider has subclasses (DsqlAuthProvider, the test mocks) and is held through base pointers. make_shared's
+// control block destroys the right type anyway; a unique_ptr<AuthProvider> or a delete through the base would not.
+TEST_F(DsqlAuthProviderTest, AuthProvider_HasVirtualDestructor) {
+    EXPECT_TRUE(std::has_virtual_destructor_v<AuthProvider>);
+}
+
+// The token is signed for the region GetToken is given. Off EC2, the client's own IMDS region lookup only waits for
+// its timeouts on every new provider.
+TEST_F(DsqlAuthProviderTest, ClientConfiguration_DisablesImds) {
+    const Aws::Client::GenericClientConfiguration config = DsqlAuthProvider::MakeClientConfiguration("eu-west-1");
+    EXPECT_TRUE(config.disableIMDS);
+    EXPECT_EQ("eu-west-1", config.region);
+}
+
+// TOKEN_EXPIRATION=0 means the default lifetime, as in the Go connector: X-Amz-Expires=0 would make a token that has
+// already expired. Negative values can only come from a direct caller; the connection string validator rejects them.
+TEST_F(DsqlAuthProviderTest, GetToken_NonPositiveExpiration_UsesDefault) {
+    DsqlAuthProvider provider(REGION, TestCredentials());
+    for (const std::chrono::milliseconds expiration : {std::chrono::milliseconds(0), std::chrono::milliseconds(-5000)}) {
+        const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, expiration).first;
+        EXPECT_NE(std::string::npos, token.find("X-Amz-Expires=900")) << expiration.count();
+    }
 }

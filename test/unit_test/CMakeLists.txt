@@ -27,6 +27,8 @@ set(TEST_UTILITIES
     ${CMAKE_CURRENT_SOURCE_DIR}/failover_mock_objects.h
     ${CMAKE_CURRENT_SOURCE_DIR}/limitless_mock_objects.h
     ${CMAKE_CURRENT_SOURCE_DIR}/rw_splitting_mock_objects.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_ctype_locale.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_env_vars.h
 )
 
 set(TEST_SUITE

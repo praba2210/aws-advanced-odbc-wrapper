@@ -17,6 +17,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "scoped_ctype_locale.h"
+
 #include "../../driver/util/rds_utils.h"
 
 namespace {
@@ -180,6 +182,16 @@ TEST_F(RdsUtilsTest, GetDsqlRegion) {
     EXPECT_EQ("", RdsUtils::GetDsqlRegion(US_EAST_REGION_CLUSTER));
     EXPECT_EQ("", RdsUtils::GetDsqlRegion("localhost"));
     EXPECT_EQ("", RdsUtils::GetDsqlRegion(""));
+}
+
+// Under tr_TR.UTF-8, glibc's std::tolower leaves I as I, so the region is folded in ASCII. Needs the tr_TR.UTF-8
+// locale.
+TEST_F(RdsUtilsTest, GetDsqlRegion_TurkishCtype_Lowercase) {
+    const ScopedCtypeLocale ctype("tr_TR.UTF-8");
+    if (!ctype.IsSet()) {
+        SKIP_OR_FAIL_WITHOUT_TURKISH_LOCALE();
+    }
+    EXPECT_EQ("il-central-1", RdsUtils::GetDsqlRegion("ABCDEFGHIJKLMNOPQRSTUVWXYZ.DSQL.IL-CENTRAL-1.ON.AWS"));
 }
 
 // The RDS parser must keep ignoring DSQL endpoints, so the IAM plugin doesn't sign for them by accident.

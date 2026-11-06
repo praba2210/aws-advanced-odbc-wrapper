@@ -114,11 +114,14 @@ std::string AuthProvider::GetRegionForProfile(const std::string &profile) {
     }
 
     const auto &profiles = loader.GetProfiles();
-    const auto it = profiles.find(profile);
+    // (data, size) copies here and for the token below: Aws::String is std::string only when the SDK is built without
+    // custom memory management.
+    const auto it = profiles.find(Aws::String(profile.data(), profile.size()));
     if (it == profiles.end()) {
         return "";
     }
-    return it->second.GetRegion();
+    const Aws::String &region = it->second.GetRegion();
+    return {region.data(), region.size()};
 }
 
 std::pair<std::string, bool> AuthProvider::GetToken(
@@ -158,8 +161,9 @@ std::pair<std::string, bool> AuthProvider::GetToken(
         const std::lock_guard<std::mutex> lock_guard(rds_client_mutex_);
         rds_client = rds_client_;
     }
-    const std::string aws_token =
+    const Aws::String generated_token =
         rds_client->GenerateConnectAuthToken(server.c_str(), region.c_str(), parsed_port.value(), username.c_str());
+    const std::string aws_token(generated_token.data(), generated_token.size());
     if (aws_token.empty()) {
         // Not cached: the next connect asks the SDK again.
         LOG(ERROR) << "The AWS SDK returned an empty token for " << server << ":" << port << " in region " << region;

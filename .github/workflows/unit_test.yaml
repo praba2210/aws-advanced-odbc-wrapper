@@ -117,6 +117,12 @@ jobs:
         run: |
           sudo apt update
           sudo apt-get install cmake libcurl4-openssl-dev libssl-dev odbcinst unixodbc-dev uuid-dev zlib1g-dev libicu-dev
+      - name: Generate the tr_TR.UTF-8 locale
+        # The unit tests that fold case under a Turkish locale need it. REQUIRE_TR_LOCALE=1 makes them fail, not skip,
+        # when it's missing.
+        run: |
+          sudo locale-gen tr_TR.UTF-8
+          echo "REQUIRE_TR_LOCALE=1" >> "$GITHUB_ENV"
       - name: Resolve AWS SDK version
         id: aws-sdk-version
         shell: bash

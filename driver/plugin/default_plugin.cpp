@@ -14,6 +14,10 @@
 
 #include "default_plugin.h"
 
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
 #include "../driver.h"
 #include "../odbcapi.h"
 #include "../util/connection_string_helper.h"
@@ -21,7 +25,15 @@
 #include "../util/odbc_helper.h"
 #include "../util/plugin_service.h"
 #include "../util/rds_lib_loader.h"
+#include "../util/secure_wipe.h"
 #include "../util/sql_query_analyzer.h"
+#include "dsql/dsql_compatibility.h"
+
+namespace {
+    // psqlODBC builds its output connection string in a MAX_CONNECT_STRING (4096) byte buffer, so a buffer of
+    // this many characters always holds what it writes, and psqlODBC never reports it truncated.
+    constexpr SQLSMALLINT BASE_DRIVER_OUT_CONN_STR_LEN = 4096;
+}  // namespace
 
 DefaultPlugin::DefaultPlugin(DBC *dbc) : DefaultPlugin(dbc, nullptr) {}
 
@@ -75,6 +87,9 @@ SQLRETURN DefaultPlugin::Connect(
         }
     }
 
+    // Keep psqlODBC from doing what Aurora DSQL can't handle. Does nothing on other connections.
+    DsqlCompatibility::PrepareConnect(dbc);
+
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
     const std::string conn_in = ConnectionStringHelper::BuildMinimumConnectionString(dbc->conn_attr);
@@ -88,8 +103,33 @@ SQLRETURN DefaultPlugin::Connect(
 #else
     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(conn_in.c_str()));
 #endif
+    // psqlODBC writes its own output connection string, PWD included, into the buffer it gets, and its length, and may
+    // warn that it doesn't fit. The application gets the wrapper's string and its length from RDS_SQLDriverConnect, so
+    // the base driver writes into a buffer and a length of the wrapper's (4 bytes a character, for a base driver with a
+    // 4-byte SQLWCHAR); the application's buffer starts as an empty string. Without an application buffer, the base
+    // driver gets none and no buffer length: psqlODBC's Unicode driver before 17.00.0005 would cut its string to that
+    // length in a buffer of its own and report 01004.
+    std::vector<uint32_t> base_out_conn_str;
+    // It gets PWD, the password or token: wiped on every return, before it is freed.
+    const ScopedWipe wipe_base_out_conn_str(base_out_conn_str);
+    SQLSMALLINT base_out_len = 0;
+    SQLTCHAR* out_conn_str = nullptr;
+    SQLSMALLINT out_buffer_len = 0;
+    if (OutConnectionString) {
+        if (BufferLength > 0) {
+#if UNICODE
+            const size_t char_size = env->use_4_bytes_user_app.load() ? sizeof(uint32_t) : sizeof(SQLTCHAR);
+#else
+            const size_t char_size = sizeof(SQLTCHAR);
+#endif
+            std::memset(OutConnectionString, 0, char_size);
+        }
+        base_out_conn_str.resize(static_cast<size_t>(BASE_DRIVER_OUT_CONN_STR_LEN), 0);
+        out_conn_str = reinterpret_cast<SQLTCHAR*>(base_out_conn_str.data());
+        out_buffer_len = BASE_DRIVER_OUT_CONN_STR_LEN;
+    }
     res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDriverConnect>(env->driver_lib_loader, RdsFuncNames::DriverConnect,
-        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion
+        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, out_conn_str, out_buffer_len, &base_out_len, DriverCompletion
     );
 
     if (res.fn_load_success) {
@@ -117,7 +157,7 @@ SQLRETURN DefaultPlugin::Connect(
                     const std::wstring wide_conn = ConvertUTF8ToWString(conn_in);
                     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(wide_conn.c_str()));
                     res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDriverConnect>(env->driver_lib_loader, RdsFuncNames::DriverConnect,
-                        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion
+                        dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, out_conn_str, out_buffer_len, &base_out_len, DriverCompletion
                     );
                     ret = res.fn_result;
                 }

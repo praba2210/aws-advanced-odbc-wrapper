@@ -42,8 +42,14 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/concurrent_stack_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/connection_string_helper_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/custom_endpoint_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/default_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/dsql_auth_provider_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_compatibility_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_connection_lifetime_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_connection_validator_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_error_hint_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dsql_occ_retry_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/failover_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/highest_weight_host_selector_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/iam_auth_plugin_test.cpp
@@ -60,6 +66,7 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/rds_strings_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/round_robin_host_selector_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/secrets_manager_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/secure_wipe_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/simple_read_write_splitting_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sliding_cache_map_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sql_query_analyzer_test.cpp

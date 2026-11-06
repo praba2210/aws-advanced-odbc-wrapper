@@ -13,9 +13,31 @@
 // limitations under the License.
 
 #include <gtest/gtest.h>
+
+#include <string>
+
+#include "scoped_ctype_locale.h"
+
 #include "../../driver/util/rds_strings.h"
 
 class RdsStringsTest : public testing::Test {};
+
+TEST_F(RdsStringsTest, AsciiLower_FoldsOnlyAsciiLetters) {
+    EXPECT_EQ("abc-xyz_019.on.aws", AsciiLower("AbC-XyZ_019.ON.AWS"));
+    EXPECT_EQ("", AsciiLower(""));
+    // UTF-8 bytes stay as they are: U+0130 (capital I with dot) and U+00DC (capital U with diaeresis).
+    EXPECT_EQ("\xC4\xB0\xC3\x9C", AsciiLower("\xC4\xB0\xC3\x9C"));
+}
+
+// Under tr_TR.UTF-8, glibc's std::tolower leaves I as I (under tr_TR.ISO-8859-9 it maps it to 0xFD). Needs the
+// tr_TR.UTF-8 locale.
+TEST_F(RdsStringsTest, AsciiLower_TurkishCtype_StillFoldsI) {
+    const ScopedCtypeLocale ctype("tr_TR.UTF-8");
+    if (!ctype.IsSet()) {
+        SKIP_OR_FAIL_WITHOUT_TURKISH_LOCALE();
+    }
+    EXPECT_EQ("il-central-1", AsciiLower("IL-CENTRAL-1"));
+}
 
 #ifdef UNICODE
 

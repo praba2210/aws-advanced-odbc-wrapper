@@ -349,6 +349,18 @@ inline std::string RDS_STR_UPPER(std::string str) {
     return str;
 }
 
+// Lowercases A-Z and nothing else, whatever the locale: for host names, AWS Region names and other ASCII protocol
+// text. std::tolower follows the C locale: under tr_TR.UTF-8 glibc leaves I as I, and under tr_TR.ISO-8859-9 it maps
+// I to 0xFD (dotless i). RDS_STR_UPPER follows ICU's default locale.
+inline std::string AsciiLower(std::string str) {
+    for (char& c : str) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return str;
+}
+
 #define EMPTY_RDS_STR ""
 
 inline std::string TrimStr(std::string &str) {

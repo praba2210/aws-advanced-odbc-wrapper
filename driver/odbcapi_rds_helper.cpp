@@ -28,6 +28,9 @@
 #include "plugin/custom_endpoint/custom_endpoint_plugin.h"
 #include "plugin/default_plugin.h"
 #include "plugin/dsql/dsql_auth_plugin.h"
+#include "plugin/dsql/dsql_compatibility.h"
+#include "plugin/dsql/dsql_error_hint_plugin.h"
+#include "plugin/dsql/dsql_occ_retry_plugin.h"
 #include "plugin/failover/failover_plugin.h"
 #include "plugin/federated/adfs_auth_plugin.h"
 #include "plugin/federated/aws_sso_auth_plugin.h"
@@ -41,6 +44,8 @@
 #include "util/connection_string_helper.h"
 #include "util/connection_string_keys.h"
 #include "util/core_service.h"
+#include "util/dsql_connection_lifetime.h"
+#include "util/dsql_connection_validator.h"
 #include "util/logger_wrapper.h"
 #include "util/map_utils.h"
 #include "util/odbc_dsn_helper.h"
@@ -600,6 +605,23 @@ SQLRETURN RDS_GetConnectAttr(
     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
     ClearError(dbc);
 
+    // Aurora DSQL has one isolation level, whatever psqlODBC would report.
+    if (DsqlCompatibility::TryGetConnectAttr(dbc, Attribute, ValuePtr)) {
+        return SQL_SUCCESS;
+    }
+
+    // An Aurora DSQL connection at its MAX_CONNECTION_LIFETIME reports itself dead, so a driver manager's pool
+    // replaces it. No round trip: the answer comes from the connection's age.
+    if (Attribute == SQL_ATTR_CONNECTION_DEAD && DsqlConnectionLifetime::IsRetired(dbc)) {
+        if (ValuePtr != nullptr) {
+            *static_cast<SQLUINTEGER*>(ValuePtr) = static_cast<SQLUINTEGER>(SQL_CD_TRUE);
+        }
+        if (StringLengthPtr != nullptr) {
+            *StringLengthPtr = static_cast<SQLINTEGER>(sizeof(SQLUINTEGER));
+        }
+        return SQL_SUCCESS;
+    }
+
     SQLRETURN ret = SQL_ERROR;
 
     // If already connected, query value from underlying DBC
@@ -659,6 +681,11 @@ SQLRETURN RDS_SQLSetConnectAttr(
     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
     ClearError(dbc);
 
+    // Attributes that would make psqlODBC undo a forced option or send a statement Aurora DSQL rejects are answered here.
+    if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetConnectAttr(dbc, Attribute, ValuePtr)) {
+        return *dsql_ret;
+    }
+
     // If already connected, apply value to underlying DBC, otherwise track and apply on connect
     if (dbc->wrapped_dbc) {
 #if UNICODE
@@ -683,8 +710,12 @@ SQLRETURN RDS_SQLSetConnectAttr(
     dbc->attr_map.insert_or_assign(Attribute, std::make_pair(ValuePtr, StringLength));
 
     if (SQL_ATTR_AUTOCOMMIT == Attribute) {
+        const bool was_auto_commit = dbc->auto_commit;
         dbc->auto_commit = reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON) == ValuePtr;
-        dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        // Autocommit set on while already on changes nothing in psqlODBC, so a transaction opened with BEGIN stays open.
+        if (!was_auto_commit || !dbc->auto_commit) {
+            dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        }
     }
 
     return ret;
@@ -918,6 +949,10 @@ SQLRETURN RDS_SQLConnect(
         return SQL_ERROR;
     }
 
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
+
 #ifdef UNICODE
     bool use_4_bytes_user_app = dbc->env->use_4_bytes_user_app.load();
 #endif
@@ -1124,6 +1159,10 @@ SQLRETURN RDS_SQLDriverConnect(
         return SQL_ERROR;
     }
 
+    // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
+    // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
+    dbc->conn_attr.clear();
+
     // Parse connection string, load input DSN followed by Base DSN
     ConnectionStringHelper::ParseConnectionString(conn_str_utf8, dbc->conn_attr);
 
@@ -1179,10 +1218,25 @@ SQLRETURN RDS_SQLDriverConnect(
 #else
         const SQLULEN written = snprintf(AS_CHAR(OutConnectionString), BufferLength, "%s", conn_out_str_utf8.c_str());
 #endif
-        if (len >= BufferLength && SQL_SUCCEEDED(ret)) {
+        // The wrapper cut its own string: say so with 01004 (psqlODBC, with a buffer of the wrapper's, has no record
+        // of it). A connect that returned a warning keeps its return code and its record: the wrapper keeps one record
+        // per handle.
+        if (len >= BufferLength && ret == SQL_SUCCESS) {
+            const std::string message = "SQLDriverConnect - The output connection string was truncated: the buffer "
+                "needs " + std::to_string(written + 1) + " characters";
+            ClearError(dbc);
+            dbc->err = std::make_unique<ErrInfo>(message.c_str(), WARN_STRING_DATA_RIGHT_TRUNCATED);
             ret = SQL_SUCCESS_WITH_INFO;
         }
         *StringLength2Ptr = static_cast<SQLSMALLINT>(written);
+    } else if (StringLength2Ptr) {
+        // No buffer: still the length of the wrapper's string, as with one (DefaultPlugin gives the base driver a
+        // length of its own).
+#ifdef UNICODE
+        *StringLength2Ptr = static_cast<SQLSMALLINT>(CopyUTF8ToUTF16Buffer(nullptr, 0, conn_out_str_utf8));
+#else
+        *StringLength2Ptr = static_cast<SQLSMALLINT>(conn_out_str_utf8.length());
+#endif
     }
 
     return ret;
@@ -1263,6 +1317,8 @@ SQLRETURN RDS_SQLExecDirect(
     const std::lock_guard<std::recursive_mutex> lock_guard_dbc(dbc->lock);
     const std::lock_guard<std::recursive_mutex> lock_guard(stmt->lock);
     ClearError(stmt);
+    // A direct execute replaces any prepared statement on the handle.
+    stmt->prepared_text.clear();
 
     SQLTCHAR* stmt_text = StatementText;
 #if UNICODE
@@ -2121,6 +2177,11 @@ SQLRETURN RDS_SQLGetInfo(
         return SQL_INVALID_HANDLE;
     }
 
+    // Aurora DSQL has one isolation level; psqlODBC reports PostgreSQL's four.
+    if (DsqlCompatibility::TryGetInfo(dbc, InfoType, InfoValuePtr, StringLengthPtr)) {
+        return SQL_SUCCESS;
+    }
+
     // Naming and version for Wrapper
     switch (InfoType) {
         case SQL_DRIVER_NAME:
@@ -2376,6 +2437,9 @@ SQLRETURN RDS_SQLPrepare(
 
     const std::lock_guard<std::recursive_mutex> lock_guard(stmt->lock);
     ClearError(stmt);
+    // Kept for SQLExecute, which passes no text down the plugin chain: what the base driver prepared, TextLength
+    // characters unless that is SQL_NTS, and never past a NUL.
+    stmt->prepared_text.clear();
     if (!HasWrappedHandle(stmt)) {
         return SQL_INVALID_HANDLE;
     }
@@ -2388,7 +2452,36 @@ SQLRETURN RDS_SQLPrepare(
             stmt_converted.tchar_ptr,
             TextLength
     );
-    return RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    if (SQL_SUCCEEDED(ret) && StatementText != nullptr) {
+#if UNICODE
+        if (odbc_helper->GetUse4BytesUserApp()) {
+            // Code points, two SQLTCHARs each. Convert4ByteSqlWChar takes a code point limit, and 0 reads to the end.
+            size_t count = 0;
+            while ((TextLength < 0 || count < static_cast<size_t>(TextLength))
+                   && (StatementText[count * 2] != 0 || StatementText[(count * 2) + 1] != 0)) {
+                ++count;
+            }
+            stmt->prepared_text = count == 0 ? "" : Convert4ByteSqlWChar(StatementText, static_cast<SQLINTEGER>(count));
+        } else {
+            const uint16_t* units = reinterpret_cast<const uint16_t*>(StatementText);
+            size_t count = 0;
+            while ((TextLength < 0 || count < static_cast<size_t>(TextLength)) && units[count] != 0) {
+                ++count;
+            }
+            std::vector<uint16_t> prepared(units, units + count);
+            prepared.push_back(0);
+            stmt->prepared_text = ConvertUTF16ToUTF8(prepared.data());
+        }
+#else
+        const char* chars = reinterpret_cast<const char*>(StatementText);
+        // psqlODBC stops at the first NUL too.
+        stmt->prepared_text = TextLength >= 0
+            ? std::string(chars, strnlen(chars, static_cast<size_t>(TextLength)))
+            : std::string(chars);
+#endif
+    }
+    return ret;
 }
 
 SQLRETURN RDS_SQLPrimaryKeys(
@@ -2635,6 +2728,12 @@ SQLRETURN RDS_SQLSetStmtAttr(
             break;
     }
 
+    // On Aurora DSQL a non-zero query timeout gets 01S02 and doesn't reach psqlODBC, which wouldn't apply it
+    // (IgnoreTimeout=1): Aurora DSQL rejects SET statement_timeout.
+    if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetStmtAttr(stmt, Attribute, ValuePtr)) {
+        return *dsql_ret;
+    }
+
     if (stmt->wrapped_stmt) {
         const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetStmtAttr>(env->driver_lib_loader, RdsFuncNames::SetStmtAttr,
             stmt->wrapped_stmt, Attribute, ValuePtr, StringLength
@@ -2855,6 +2954,12 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         return SQL_ERROR;
     }
 
+    // Settings that can't work with Aurora DSQL fail before the base driver is loaded or the plugin service exists,
+    // so a rejected handle keeps no state.
+    if (!DsqlConnectionValidator::CheckSettings(dbc)) {
+        return SQL_ERROR;
+    }
+
     RdsLibResult res;
     SQLRETURN ret = SQL_SUCCESS;
 
@@ -3026,6 +3131,16 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
             {
                 plugin_head = std::make_shared<BlueGreenPlugin>(dbc, plugin_head);
             }
+
+            // Aurora DSQL OCC retry. Inside the DSQL error hint plugin; a retry runs the chain below it again.
+            if (dbc->conn_attr.contains(KEY_ENABLE_OCC_RETRY)
+                && dbc->conn_attr.at(KEY_ENABLE_OCC_RETRY) == VALUE_BOOL_TRUE)
+            {
+                plugin_head = std::make_shared<DsqlOccRetryPlugin>(dbc, plugin_head);
+            }
+
+            // Aurora DSQL error hints. Outermost, after any OCC retry plugin, so they see only the result the app gets.
+            plugin_head = DsqlErrorHintPlugin::AddToChain(dbc, plugin_head);
 
             // Finalize and track in DBC
             if (!plugin_head) {

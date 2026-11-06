@@ -108,6 +108,12 @@ static std::unordered_set<std::string> const AWS_ODBC_KEY_SET = {
     KEY_SRW_CONN_INTERVAL_MS,
     KEY_SRW_VERIFY_INITIAL_CONN_TYPE,
     KEY_SRW_SKIP,
+    KEY_ENABLE_OCC_RETRY,
+    KEY_OCC_MAX_RETRIES,
+    KEY_OCC_BASE_DELAY_MS,
+    KEY_OCC_MAX_DELAY_MS,
+    KEY_OCC_JITTER_FACTOR,
+    KEY_MAX_CONNECTION_LIFETIME,
 };
 
 static std::unordered_map<std::string, std::string> const ALIAS_TO_REAL_MAP = {

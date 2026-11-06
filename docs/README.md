@@ -2,6 +2,7 @@
 
 - [Getting Started](./getting-started.md)
 - [Using the AWS Advanced ODBC Wrapper](./using-the-aws-odbc-wrapper/using-the-aws-odbc-wrapper.md)
+    - [Support for Amazon Aurora DSQL](./using-the-aws-odbc-wrapper/SupportForAuroraDSQL.md)
     - [Support for Amazon RDS Multi-AZ DB Cluster](./using-the-aws-odbc-wrapper/SupportForRDSMultiAzDBCluster.md)
     - [Plugins](./using-the-aws-odbc-wrapper/plugins/)
         - [ADFS Authentication Plugin](./using-the-aws-odbc-wrapper/plugins/adfs-authentication-plugin.md)
@@ -12,6 +13,7 @@
         - [Failover Plugin](./using-the-aws-odbc-wrapper/plugins/failover-plugin.md)
         - [IAM Authentication Plugin](./using-the-aws-odbc-wrapper/plugins/iam-authentication-plugin.md)
         - [Limitless Plugin](./using-the-aws-odbc-wrapper/plugins/limitless-plugin.md)
+        - [OCC Retry Plugin](./using-the-aws-odbc-wrapper/plugins/occ-retry-plugin.md)
         - [Okta Authentication Plugin](./using-the-aws-odbc-wrapper/plugins/okta-authentication-plugin.md)
         - [Read/Write Splitting Plugin](./using-the-aws-odbc-wrapper/plugins/read-write-splitting-plugin.md)
         - [Secrets Manager Plugin](./using-the-aws-odbc-wrapper/plugins/secrets-manager-plugin.md)

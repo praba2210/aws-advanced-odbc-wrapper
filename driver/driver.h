@@ -76,6 +76,7 @@ class BasePlugin;
 class RdsLibLoader;
 class LoggerWrapper;
 class PluginService;
+class DsqlConnectionLifetime;
 
 /* Const Lengths */
 #define NO_DATA_SQL_STATE "00000"
@@ -130,6 +131,9 @@ struct DBC {
     bool allow_interactive_auth = false;
     BasePlugin* plugin_head = nullptr;
     std::shared_ptr<PluginService> plugin_service;
+    // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD and the
+    // 60-minute hint read. The Aurora DSQL error hint plugin creates it; null on other connections.
+    std::shared_ptr<DsqlConnectionLifetime> dsql_lifetime;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
 
@@ -178,6 +182,8 @@ struct STMT {
     // TODO - May need to change SQLPOINTER to an actual object
     std::map<SQLINTEGER, std::pair<SQLPOINTER, SQLINTEGER>> attr_map;  // Key, <Value, Length>
     std::string cursor_name;
+    // UTF-8 text of the last successful SQLPrepare: SQLExecute passes no text down the plugin chain.
+    std::string prepared_text;
 
     // Buffers for UTF32 support
     std::vector<BoundColBuffer> bound_col_buffers;      // Intercepted WCHAR column bindings

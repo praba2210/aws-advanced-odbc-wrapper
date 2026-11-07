@@ -71,7 +71,7 @@ void OdbcDsnHelper::LoadAll(const std::string &dsn_key, std::map<std::string, st
 
     // Load entries into map
     for (const std::string& raw_key : entry_names) {
-        const std::string key = RDS_STR_UPPER(raw_key);
+        const std::string key = ToAsciiUpper(raw_key);
         const std::string val = Load(dsn_key, key);
 
         // Insert if value exists

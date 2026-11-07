@@ -273,7 +273,7 @@ std::string AuthProvider::GetPort(DBC* dbc) {
 }
 
 AuthType AuthProvider::AuthTypeFromString(const std::string &auth_type) {
-    const std::string local_str_upper = RDS_STR_UPPER(auth_type);
+    const std::string local_str_upper = ToAsciiUpper(auth_type);
     if (AUTH_TABLE.contains(local_str_upper)) {
         return AUTH_TABLE.at(local_str_upper);
     }

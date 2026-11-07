@@ -138,6 +138,10 @@ SQLRETURN SQL_API SQLConnectW(
     SQLSMALLINT    NameLength3)
 {
     LOG(INFO) << "Entering SQLConnectW";
+#if UNICODE && !defined(_WIN32)
+    // The driver manager calls this: its library tells unixODBC from iODBC or an app calling the driver itself.
+    RDS_NoteConnectCaller(ConnectionHandle, __builtin_return_address(0));
+#endif
     return RDS_SQLConnect(
         ConnectionHandle,
         ServerName,
@@ -208,6 +212,10 @@ SQLRETURN SQL_API SQLDriverConnectW(
     SQLUSMALLINT   DriverCompletion)
 {
     LOG(INFO) << "Entering SQLDriverConnectW";
+#if UNICODE && !defined(_WIN32)
+    // The driver manager calls this: its library tells unixODBC from iODBC or an app calling the driver itself.
+    RDS_NoteConnectCaller(ConnectionHandle, __builtin_return_address(0));
+#endif
     return RDS_SQLDriverConnect(
         ConnectionHandle,
         WindowHandle,

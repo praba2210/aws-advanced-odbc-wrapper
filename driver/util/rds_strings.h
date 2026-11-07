@@ -29,6 +29,7 @@
 #include <regex>
 #include <sstream>
 #include <string.h>
+#include <string_view>
 #include <vector>
 
 #include "unicode/ucasemap.h"
@@ -167,6 +168,38 @@ inline int CopyUTF8ToUTF16Buffer(uint16_t* buf, size_t buf_len, std::string str)
     return CopyUTF16StringToBuffer(buf, buf_len, ConvertUTF8ToUTF16(str));
 }
 
+// Writes UTF-8 text into an app's buffer of buffer_chars characters, in the app's characters: UTF-16 units, or code
+// points for an app with a 4-byte SQLWCHAR. Returns the text's full length in those characters, which is what a W
+// function reports. A text that doesn't fit is cut to the longest prefix that leaves room for the terminator and
+// doesn't end in the first half of a surrogate pair. Writes nothing when out is null or buffer_chars is 0.
+inline size_t CopyUTF8ToAppChars(std::string_view utf8, void* out, size_t buffer_chars, bool user_4_byte) {
+    const icu::UnicodeString text =
+        icu::UnicodeString::fromUTF8(icu::StringPiece(utf8.data(), static_cast<int32_t>(utf8.size())));
+    const auto full = static_cast<size_t>(user_4_byte ? text.countChar32() : text.length());
+    if (out == nullptr || buffer_chars == 0) {
+        return full;
+    }
+    const size_t room = std::min(full, buffer_chars - 1);
+    if (user_4_byte) {
+        auto* const dst = static_cast<UChar32*>(out);
+        int32_t index = 0;
+        for (size_t n = 0; n < room; ++n) {
+            dst[n] = text.char32At(index);
+            index = text.moveIndex32(index, 1);
+        }
+        dst[room] = 0;
+    } else {
+        size_t copied = room;
+        if (copied > 0 && copied < full && U16_IS_LEAD(text.charAt(static_cast<int32_t>(copied - 1)))) {
+            copied--;
+        }
+        auto* const dst = static_cast<char16_t*>(out);
+        text.extract(0, static_cast<int32_t>(copied), dst);
+        dst[copied] = 0;
+    }
+    return full;
+}
+
 // The input string buffer is assumed to be null terminated
 inline std::string ConvertUTF16ToUTF8(uint16_t *buffer_utf16) {
     const icu::UnicodeString unicode_str(reinterpret_cast<const char16_t*>(buffer_utf16));
@@ -205,6 +238,44 @@ inline void ExpandUTF16ToUTF32InPlace(SQLTCHAR* buf, size_t src_chars, size_t bu
     reinterpret_cast<UChar32*>(buf)[actual] = 0;
 }
 
+// A 4-byte base driver's UTF-32 text in buf to UTF-16, in place: at most max_chars code points, to the first NUL, and
+// as many of them whole as buf_slots SQLTCHARs hold with a NUL. A code point takes the two SQLTCHARs of its UTF-32 or
+// fewer, so all of them fit unless the text has no NUL in buf. An invalid code point becomes U+FFFD. Returns the
+// UTF-16 units written.
+inline size_t ConvertUTF32ToUTF16InPlace(SQLTCHAR* buf, size_t max_chars, size_t buf_slots) {
+    if (buf == nullptr || buf_slots == 0) {
+        return 0;
+    }
+    constexpr uint32_t MAX_CODE_POINT = 0x10FFFF;
+    constexpr uint32_t REPLACEMENT_CHARACTER = 0xFFFD;
+    const size_t chars = std::min(max_chars, buf_slots / 2);
+    std::vector<SQLTCHAR> utf16;
+    utf16.reserve(chars * 2);
+    for (size_t i = 0; i < chars; ++i) {
+        uint32_t code_point = 0;
+        std::memcpy(&code_point, buf + (i * 2), sizeof(code_point));
+        if (code_point == 0) {
+            break;
+        }
+        if (code_point > MAX_CODE_POINT || U_IS_SURROGATE(code_point)) {
+            code_point = REPLACEMENT_CHARACTER;
+        }
+        const size_t units = U16_LENGTH(code_point);
+        if (utf16.size() + units > buf_slots - 1) {
+            break;
+        }
+        if (units == 1) {
+            utf16.push_back(static_cast<SQLTCHAR>(code_point));
+        } else {
+            utf16.push_back(static_cast<SQLTCHAR>(U16_LEAD(code_point)));
+            utf16.push_back(static_cast<SQLTCHAR>(U16_TRAIL(code_point)));
+        }
+    }
+    std::copy(utf16.begin(), utf16.end(), buf);
+    buf[utf16.size()] = 0;
+    return utf16.size();
+}
+
 inline std::string Convert4ByteSqlWChar(
     const SQLTCHAR *   InputStr,
     SQLINTEGER         BufferLength
@@ -239,8 +310,21 @@ inline std::string ConvertUserAppToUTF8(bool user_4_byte, SQLTCHAR* in, SQLINTEG
     }
 
     if (user_4_byte) {
-        const size_t length = GetLenOfSqltcharArray(in, in_length, user_4_byte);
-        return Convert4ByteSqlWChar(in, static_cast<SQLINTEGER>(length));
+        // An explicit length (in code points) needn't be followed by a NUL, so never read past it. Convert4ByteSqlWChar
+        // stops at a NUL and reads to it for a length below 1, which serves SQL_NTS but not 0.
+        return in_length == 0 ? "" : Convert4ByteSqlWChar(in, in_length);
+    }
+    if (in_length >= 0) {
+        // An explicit length (in characters) needn't be followed by a NUL, so never read past it.
+        const uint16_t* in_utf16 = reinterpret_cast<const uint16_t*>(in);
+        int32_t length = 0;
+        while (length < in_length && in_utf16[length] != 0) {
+            length++;
+        }
+        const icu::UnicodeString unicode_str(reinterpret_cast<const char16_t*>(in_utf16), length);
+        std::string buffer_utf8;
+        unicode_str.toUTF8String(buffer_utf8);
+        return buffer_utf8;
     }
     return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(in));
 }
@@ -275,16 +359,9 @@ inline std::vector<SQLTCHAR> ConvertUserAppInputToBaseDriver(bool user_4_byte, b
     const std::string utf8 = ConvertUserAppToUTF8(user_4_byte, in, in_length);
     if (driver_4_byte) {
         const std::vector<uint16_t> utf16 = ConvertUTF8ToUTF16(utf8);
-        const size_t utf16_len = utf16.empty() ? 0 : utf16.size() - 1;
-
-        size_t size;
-        if (in_length == SQL_NTS || in_length < 0) {
-            size = utf16_len;
-        } else {
-            size = static_cast<size_t>(in_length) < utf16_len
-                ? static_cast<size_t>(in_length)
-                : utf16_len;
-        }
+        // utf8 holds in_length characters already. Cutting its UTF-16 to in_length units would cut a 4-byte app's
+        // text outside the BMP, as in_length counts its code points.
+        const size_t size = utf16.empty() ? 0 : utf16.size() - 1;
 
         const size_t size_converted = (size * 2) + 2; // Each char expands to 2 SQLTCHAR + null pair
         std::vector<SQLTCHAR> result(size_converted, 0);
@@ -321,6 +398,18 @@ inline std::vector<SQLTCHAR> ConvertUserAppInputToBaseDriver(bool user_4_byte, b
 #endif
 
 #include <cstring>
+
+// Uppercases a-z and nothing else, whatever the locale: for connection string and DSN keys, the option values
+// that name an enum, driver names and SQL keywords. RDS_STR_UPPER uses ICU's default locale, which under a
+// Turkish one uppercases i to a dotted capital I, so a key such as Region or a value such as iam wouldn't match.
+inline std::string ToAsciiUpper(std::string str) {
+    for (char& c : str) {
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - 'a' + 'A');
+        }
+    }
+    return str;
+}
 
 inline std::string RDS_STR_UPPER(std::string str) {
     if (!str.empty()) {

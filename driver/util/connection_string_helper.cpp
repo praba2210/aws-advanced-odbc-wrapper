@@ -31,7 +31,7 @@ void ConnectionStringHelper::ParseConnectionString(std::string conn_str, std::ma
         const std::string val = match[2].str();
 
         // Connection String takes precedence
-        conn_map.insert_or_assign(RDS_STR_UPPER(key), val);
+        conn_map.insert_or_assign(ToAsciiUpper(key), val);
         conn_str_itr = match.suffix().str();
     }
 }

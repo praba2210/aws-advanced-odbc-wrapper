@@ -42,7 +42,7 @@ public:
     virtual HostInfo GetHost(std::vector<HostInfo> hosts, bool is_writer,
         std::unordered_map<std::string, std::string> properties) = 0;
     static HostSelectorStrategies GetHostSelectorStrategy(const std::string &auth_type) {
-        const std::string local_str_upper = RDS_STR_UPPER(auth_type);
+        const std::string local_str_upper = ToAsciiUpper(auth_type);
         if (HOST_SELECTOR_TABLE.contains(local_str_upper)) {
             return HOST_SELECTOR_TABLE.at(local_str_upper);
         }

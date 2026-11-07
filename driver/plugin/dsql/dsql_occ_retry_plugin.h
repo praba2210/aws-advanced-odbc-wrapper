@@ -29,13 +29,15 @@
 // autocommit mode with no transaction open: waits with exponential backoff and jitter, clears the statement's
 // diagnostics and executes it again on the same handle. After the last retry, or when the next wait and an attempt as
 // long as the last one would take the call past OccRetryConfig::CALL_TIME_LIMIT_MS, it returns the last error with the
-// base driver's diagnostics as they were. It follows the transaction-control text it runs, so a transaction the
+// base driver's diagnostics as they were. An SQLCancel from another thread ends a wait at once, and the call returns
+// HY008 without another attempt. It follows the transaction-control text it runs, so a transaction the
 // application opened with BEGIN while autocommit is on is never retried into. On with ENABLE_OCC_RETRY=1, on Aurora
 // DSQL only.
 class DsqlOccRetryPlugin : public BasePlugin {
 public:
-    // Waits out a backoff delay. Tests pass one that records the delay.
-    using SleepFunction = std::function<void(std::chrono::milliseconds)>;
+    // Waits out a backoff delay on the statement's cancel state; returns true when an SQLCancel from another thread
+    // ended it. Tests pass one that records the delay.
+    using SleepFunction = std::function<bool(CancelState&, std::chrono::milliseconds)>;
     // Returns a number in [0, 1) that scales the jitter.
     using RandomFunction = std::function<double()>;
     // Returns the time now. Tests pass one that moves when the plugin sleeps.

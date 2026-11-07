@@ -391,7 +391,7 @@ protected:
         dbc_->transaction_status = TRANSACTION_CLOSED;
         stmt_ = new STMT();
         stmt_->dbc = dbc_;
-        stmt_->wrapped_stmt = static_cast<SQLHSTMT>(&base_stmt_stand_in_);
+        OdbcHelper::SetWrappedStmt(stmt_, static_cast<SQLHSTMT>(&base_stmt_stand_in_));
     }
 
     void TearDown() override {
@@ -644,6 +644,7 @@ TEST(DsqlOccRetryBackoffTest, ManyRetriesDoNotOverflow) {
 class DsqlOccRetryExecuteTest : public DsqlOccRetryPluginTest {
 protected:
     std::vector<int64_t> sleeps_ms_;
+    bool canceled_during_wait_ = false;  // the next wait ends as an SQLCancel ends it
     double random_unit_ = 0.0;
     std::chrono::steady_clock::time_point now_;
 
@@ -652,9 +653,10 @@ protected:
         dbc_->conn_attr = options;
         dbc_->conn_attr.insert_or_assign(KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE);
         return std::make_shared<DsqlOccRetryPlugin>(dbc_, next,
-            [this](std::chrono::milliseconds delay) {
+            [this](CancelState& /*cancel*/, std::chrono::milliseconds delay) {
                 sleeps_ms_.push_back(delay.count());
                 now_ += delay;
+                return std::exchange(canceled_during_wait_, false);
             },
             [this] { return random_unit_; },
             [this] { return now_; });
@@ -907,6 +909,36 @@ TEST_F(DsqlOccRetryExecuteTest, ZeroMaxRetries_RunsOnce) {
     EXPECT_EQ(0, g_get_stmt_attr_calls);
 }
 
+// An SQLCancel during a retry's wait ends the call: no other attempt, and HY008 ahead of the conflict's record.
+TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnotherAttempt) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    canceled_during_wait_ = true;
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(1U, chain->calls);
+    EXPECT_EQ((std::vector<int64_t>{100}), sleeps_ms_);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+}
+
+// The plugin's own wait is the statement's CancelState::WaitFor: a canceled call doesn't wait out the delay.
+TEST_F(DsqlOccRetryExecuteTest, DefaultWait_EndsAtOnceForACanceledCall) {
+    dbc_->conn_attr = {{KEY_ENABLE_OCC_RETRY, VALUE_BOOL_TRUE}, {KEY_OCC_BASE_DELAY_MS, "5000"},
+                       {KEY_OCC_MAX_DELAY_MS, "5000"}, {KEY_OCC_JITTER_FACTOR, "0"}};
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    const auto plugin = std::make_shared<DsqlOccRetryPlugin>(dbc_, chain, nullptr, nullptr, nullptr);
+    CancelState::Scope call(stmt_->cancel);
+    ASSERT_FALSE(call.Enter());
+    ASSERT_EQ(CancelState::Target::WRAPPER, stmt_->cancel.Request());
+    ClearError(stmt_);
+    TestText text(UPDATE_STATEMENT);
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, text.Get(), SQL_NTS));
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(2));
+    EXPECT_EQ(1U, chain->calls);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+}
+
 TEST_F(DsqlOccRetryExecuteTest, OtherError_IsNotRetried) {
     const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{
         Fail(ERR_INTEGRITY_CONSTRAINT_VIOLATION, "23505", "duplicate key value violates unique constraint"), Ok()});
@@ -995,7 +1027,7 @@ TEST_F(DsqlOccRetryExecuteTest, ParameterSetSize_IsAskedOnceBeforeTheFirstAttemp
 }
 
 TEST_F(DsqlOccRetryExecuteTest, NoBaseStatement_IsNotRetried) {
-    stmt_->wrapped_stmt = nullptr;
+    OdbcHelper::SetWrappedStmt(stmt_, SQL_NULL_HSTMT);
     EXPECT_EQ(1U, AttemptsForAConflict());
 }
 

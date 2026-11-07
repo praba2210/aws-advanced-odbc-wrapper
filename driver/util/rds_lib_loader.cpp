@@ -23,6 +23,15 @@ std::string GetLastModuleLoadError()
 {
 #ifdef _WIN32
     const DWORD err_code = GetLastError();
+#ifdef UNICODE
+    // The Unicode driver's messages are UTF-8; FormatMessageA would give the ANSI code page.
+    wchar_t err_buffer[512] = {0};
+    const DWORD err_len = FormatMessageW(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr, err_code, 0,
+        err_buffer, sizeof(err_buffer) / sizeof(err_buffer[0]), nullptr);
+    return RdsPlatform::LoadErrorMessage(err_code, err_len > 0 ? err_buffer : nullptr);
+#else
     char err_buffer[512] = {0};
     const DWORD err_len = FormatMessageA(
         FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -33,6 +42,7 @@ std::string GetLastModuleLoadError()
         err_msg.pop_back();
     }
     return "error " + std::to_string(err_code) + (err_msg.empty() ? "" : ": " + err_msg);
+#endif
 #else
     const char* err_msg = dlerror();
     return err_msg ? std::string(err_msg) : "unknown dlopen error";

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SQLGetInfo(SQL_DRIVER_VER)` now reports the real wrapper version instead of a hardcoded `1.0.0`
 - Discovery of the `odbcinst`/`iodbcinst` library on macOS and Linux, which ignored the configured `ODBC_ROOT`
 - The ANSI static library is now compiled with `SQL_NOUNICODEMAP`, matching the ANSI shared library
+- `SQLCancel` and `SQLCancelHandle` called from another thread no longer wait for the statement's running `SQLExecDirect` or `SQLExecute` to finish. A call canceled before its statement reaches the underlying driver returns `HY008` without running it, and during the underlying driver's execute the cancel goes to the underlying driver at once. Waits inside failover's reconnect and a Blue/Green switchover aren't interrupted: the call returns its own result
 
 ## [1.3.1] - 2026-09-08
 

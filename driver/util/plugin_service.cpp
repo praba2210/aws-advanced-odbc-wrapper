@@ -311,7 +311,7 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
         // TODO - Dialect from host
         // For release, we are only supporting Aurora PostgreSQL and Aurora PostgreSQL Limitless
         const std::string host = MapUtils::GetStringValue(conn_info, KEY_SERVER, "");
-        const std::string driver_upper = RDS_STR_UPPER(MapUtils::GetStringValue(conn_info, KEY_DRIVER, ""));
+        const std::string driver_upper = ToAsciiUpper(MapUtils::GetStringValue(conn_info, KEY_DRIVER, ""));
 
         static const std::vector<std::string> PG_IDENTIFIERS = {"POSTGRES", "PODBC", "PSQL"};
         static const std::vector<std::string> MYSQL_IDENTIFIERS = {"MYSQL","MYODBC"};
@@ -339,7 +339,7 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
         // Aurora DSQL has no topology. Detect it, from the endpoint or the auth type, before the psqlODBC
         // driver-name default (Aurora PostgreSQL) starts a topology monitor.
         if (RdsUtils::IsDsqlDns(host)
-            || RDS_STR_UPPER(MapUtils::GetStringValue(conn_info, KEY_AUTH_TYPE, "")) == VALUE_AUTH_DSQL)
+            || ToAsciiUpper(MapUtils::GetStringValue(conn_info, KEY_AUTH_TYPE, "")) == VALUE_AUTH_DSQL)
         {
             dialect = DatabaseDialectType::AURORA_DSQL;
         }

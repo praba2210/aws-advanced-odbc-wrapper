@@ -23,7 +23,7 @@ std::string SqlQueryAnalyzer::GetFirstSqlStatement(const std::string &statement)
         return statement;
     }
     const std::string& first_statement = query_list.front();
-    std::string first_statement_upper = RDS_STR_UPPER(first_statement);
+    std::string first_statement_upper = ToAsciiUpper(first_statement);
     // Remove spaces and comments (/* */)
     const std::regex space_comment_pattern(R"(\s*/\*(.*?)\*/\s*)");
     first_statement_upper = std::regex_replace(first_statement_upper, space_comment_pattern, " ");
@@ -139,7 +139,7 @@ std::optional<bool> SqlQueryAnalyzer::DoesSetReadOnly(const std::string &stateme
     const std::vector<std::string> statements = ParseMultiStatement(statement);
     std::optional<bool> does_set_read_only = {};
     for (const std::string &stmt : statements) {
-        if (const std::optional<bool> ret = dialect->DoesStatementSetReadOnly(RDS_STR_UPPER(stmt)); ret.has_value()) {
+        if (const std::optional<bool> ret = dialect->DoesStatementSetReadOnly(ToAsciiUpper(stmt)); ret.has_value()) {
             does_set_read_only = ret;
         }
     }

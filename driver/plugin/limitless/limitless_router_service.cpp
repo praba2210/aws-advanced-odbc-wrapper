@@ -88,7 +88,7 @@ std::shared_ptr<LimitlessRouterMonitor> LimitlessRouterService::CreateMonitor(
 
     bool block_and_query_immediately = true;
     const std::string limitless_mode = MapUtils::GetStringValue(conn_attr, KEY_LIMITLESS_MODE, VALUE_LIMITLESS_MODE_IMMEDIATE);
-    const std::string upper_local_str = RDS_STR_UPPER(limitless_mode);
+    const std::string upper_local_str = ToAsciiUpper(limitless_mode);
     if (upper_local_str == VALUE_LIMITLESS_MODE_LAZY) {
         block_and_query_immediately = false;
     }

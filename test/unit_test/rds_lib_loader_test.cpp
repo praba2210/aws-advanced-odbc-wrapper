@@ -54,6 +54,42 @@ TEST(RdsLibLoaderTest, CallFunctionOnUnloadedModuleFailsWithoutInvoking) {
     EXPECT_EQ(nullptr, env_handle);
 }
 
+#ifdef _WIN32
+// The load error is "error <code>: <the system's text>". A smoke test: the shape is the same whichever FormatMessage
+// gives the text, and an English system's text is ASCII.
+TEST(RdsLibLoaderTest, LoadErrorHasTheSystemMessage) {
+    RdsLibLoader loader(nonexistent_module);
+    const std::string error = loader.GetLoadError();
+    EXPECT_EQ(0U, error.find("error "));
+    const size_t text = error.find(": ");
+    ASSERT_NE(std::string::npos, text);
+    EXPECT_LT(text + 2, error.size());
+}
+#endif
+
+#if defined(_WIN32) && defined(UNICODE)
+// The Unicode driver's load error carries the system's text in UTF-8: in a French system's text each U+00E9 is C3 A9.
+// The text came from FormatMessageA in the ANSI code page, where it is the byte E9, which a W caller got as U+FFFD.
+TEST(RdsLibLoaderTest, LoadErrorTextIsUtf8) {
+    EXPECT_EQ("error 126: Le module sp\xC3\xA9" "cifi\xC3\xA9 est introuvable.",
+        RdsPlatform::LoadErrorMessage(126, L"Le module sp\u00e9cifi\u00e9 est introuvable.\r\n"));
+    EXPECT_EQ("error 5", RdsPlatform::LoadErrorMessage(5, nullptr));
+}
+
+// The loader's error is this system's own UTF-16 text for the code, converted: the same as converting FormatMessageW's
+// text here. On a system whose text isn't ASCII this also tells it from FormatMessageA's.
+TEST(RdsLibLoaderTest, LoadErrorIsTheSystemUtf16TextConverted) {
+    RdsLibLoader loader(nonexistent_module);
+    const std::string error = loader.GetLoadError();
+    ASSERT_EQ(0U, error.find("error "));
+    const DWORD code = std::stoul(error.substr(6));
+    wchar_t text[512] = {0};
+    const DWORD length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, code, 0,
+        text, sizeof(text) / sizeof(text[0]), nullptr);
+    EXPECT_EQ(RdsPlatform::LoadErrorMessage(code, length > 0 ? text : nullptr), error);
+}
+#endif
+
 TEST(RdsLibLoaderTest, DefaultConstructedLoaderIsNotLoaded) {
     RdsLibLoader loader;
     EXPECT_FALSE(loader.IsLoaded());

@@ -105,7 +105,7 @@ SQLRETURN AbstractReadWriteSplittingPlugin::Execute(SQLHSTMT StatementHandle, SQ
         curr_host = service->GetCurrentHostInfo();
     }
 
-    const STMT* stmt = static_cast<STMT*>(StatementHandle);
+    STMT* stmt = static_cast<STMT*>(StatementHandle);
     const DBC* dbc = stmt->dbc;
 
     if (!this->plugin_head_) {
@@ -115,9 +115,19 @@ SQLRETURN AbstractReadWriteSplittingPlugin::Execute(SQLHSTMT StatementHandle, SQ
 
     SQLRETURN ret = SQL_SUCCESS;
     if (read_only.has_value()) {
+        // A cancel that came before the switch stops the call with the connection as it was
+        if (stmt->cancel.IsCanceled()) {
+            return RDS_StatementCanceled(stmt);
+        }
+        const SQLHDBC connection_before = dbc->wrapped_dbc;
         {
             const std::lock_guard<std::recursive_mutex> lock_guard(lock_);
             ret = SwitchConnectionIfRequired(read_only.value(), curr_host);
+        }
+        // Once the connection changed, the statement runs: stopping it now would leave the connection switched
+        // while the app is told the statement didn't run
+        if (dbc->wrapped_dbc != connection_before) {
+            stmt->cancel.MarkUncancelable();
         }
     }
 
@@ -294,43 +304,15 @@ void AbstractReadWriteSplittingPlugin::SwitchCurrentConnectionTo(DBC* new_conn, 
     const std::lock_guard<std::recursive_mutex> lock_guard_dbc(dbc_->lock);
 
     if (current_connection_ != nullptr) {
-        // Null out underlying statements, they can be reallocated in the default plugin using the new connection.
-        for (STMT* stmt : dbc_->stmt_list) {
-            {
-                const std::lock_guard<std::recursive_mutex> lock_guard_stmt(stmt->lock);
-                if (stmt->wrapped_stmt) {
-                    RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(dbc_->env->driver_lib_loader, RdsFuncNames::FreeHandle,
-                        SQL_HANDLE_STMT, stmt->wrapped_stmt);
-                    stmt->wrapped_stmt = nullptr;
-                }
-                OdbcHelper::InvalidateImplicitDescriptors(stmt);
-            }
-        }
-        // And explicit descriptors, which would dangle after the old connection
-        // is freed (mirrors FailoverPlugin).
-        for (DESC* desc : dbc_->desc_list) {
-            const std::lock_guard<std::recursive_mutex> lock_guard_desc(desc->lock);
-            if (desc->wrapped_desc) {
-                RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(dbc_->env->driver_lib_loader, RdsFuncNames::FreeHandle,
-                    SQL_HANDLE_DESC, desc->wrapped_desc);
-                desc->wrapped_desc = nullptr;
-            }
-        }
+        // Null out underlying statements, they can be reallocated in the default plugin using the new connection, and
+        // explicit descriptors, which would dangle after the old connection is freed (mirrors FailoverPlugin). Free
+        // them and the current underlying connection, now or once an SQLCancel using them returns.
+        const SQLHDBC old_wrapped = OdbcHelper::ReleaseBaseHandles(dbc_->env->driver_lib_loader, dbc_, true);
 
-        // Free the current underlying connection. If reader_cache_item_ or writer_connection_ had the same underlying
-        // connection, delete them.
+        // If reader_cache_item_ or writer_connection_ had the same underlying connection, delete them.
         DBC* reader_conn = GetCurrentReaderConn();
         DBC* writer_conn = writer_connection_;
-        const ENV* env = dbc_->env;
-        if (const SQLHDBC old_wrapped = dbc_->wrapped_dbc) {
-            const RdsLibResult disconnect_res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDisconnect>(
-                env->driver_lib_loader, RdsFuncNames::Disconnect, old_wrapped);
-            if (SQL_SUCCEEDED(disconnect_res.fn_result)) {
-                RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(
-                    env->driver_lib_loader, RdsFuncNames::FreeHandle, SQL_HANDLE_DBC, old_wrapped);
-            }
-            dbc_->wrapped_dbc = nullptr;
-
+        if (old_wrapped) {
             if (writer_conn && writer_conn->wrapped_dbc == old_wrapped) {
                 writer_conn->wrapped_dbc = nullptr;
                 {
@@ -457,11 +439,7 @@ void AbstractReadWriteSplittingPlugin::SetStmtError(const std::string &msg, SQL_
     const std::lock_guard<std::recursive_mutex> lock_guard_dbc(dbc_->lock);
     for (STMT* stmt : dbc_->stmt_list) {
         const std::lock_guard<std::recursive_mutex> lock_guard_stmt(stmt->lock);
-        if (stmt->wrapped_stmt) {
-            RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(dbc_->env->driver_lib_loader, RdsFuncNames::FreeHandle,
-                SQL_HANDLE_STMT, stmt->wrapped_stmt);
-        }
-        stmt->wrapped_stmt = nullptr;
+        OdbcHelper::FreeWrappedStmt(dbc_->env->driver_lib_loader, stmt);
         ClearError(stmt);
         stmt->err = std::make_unique<ErrInfo>(msg, state);
     }

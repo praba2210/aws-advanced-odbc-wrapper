@@ -70,7 +70,7 @@ public:
     virtual std::optional<bool> DoesStatementSetReadOnly(std::string statement) { return {}; };
 
     static DatabaseDialectType DatabaseDialectFromString(const std::string &database_dialect) {
-        const std::string upper_local_str = RDS_STR_UPPER(database_dialect);
+        const std::string upper_local_str = ToAsciiUpper(database_dialect);
         if (DATABASE_DIALECT_TABLE.contains(upper_local_str)) {
             return DATABASE_DIALECT_TABLE.at(upper_local_str);
         }

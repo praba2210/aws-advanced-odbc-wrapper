@@ -74,6 +74,22 @@ inline FuncHandle FindSymbol(ModuleHandle handle, const char* symbol_name)
     return dlsym(handle, symbol_name);
 #endif
 }
+
+#if defined(_WIN32) && defined(UNICODE)
+// The Unicode driver's load error for a Windows error code and the system's text for it, as FormatMessageW gives it
+// (UTF-16, or null when there is none): "error <code>", then ": " and the text in UTF-8, the encoding of the driver's
+// messages, without its line break.
+inline std::string LoadErrorMessage(DWORD code, const wchar_t* system_text)
+{
+    std::string text = system_text != nullptr
+        ? ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(const_cast<wchar_t*>(system_text)))
+        : "";
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+        text.pop_back();
+    }
+    return "error " + std::to_string(code) + (text.empty() ? "" : ": " + text);
+}
+#endif
 } // namespace RdsPlatform
 
 struct RdsLibResult {

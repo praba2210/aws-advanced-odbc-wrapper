@@ -94,7 +94,7 @@ SQLRETURN FailoverPlugin::Execute(
         // Invalidate statements, but don't fully clean up
         for (STMT* stmt : dbc->stmt_list) {
             const std::lock_guard<std::recursive_mutex> lock_guard_stmt(stmt->lock);
-            stmt->wrapped_stmt = nullptr;
+            OdbcHelper::SetWrappedStmt(stmt, SQL_NULL_HSTMT);
             OdbcHelper::InvalidateImplicitDescriptors(stmt);
             ClearError(stmt);
             stmt->err = std::make_unique<ErrInfo>("Failed to switch to a new connection.", ERR_FAILOVER_FAILED);
@@ -350,7 +350,7 @@ FailoverMode FailoverPlugin::InitFailoverMode(std::map<std::string, std::string>
     FailoverMode mode = UNKNOWN_FAILOVER_MODE;
     if (conn_info.contains(KEY_FAILOVER_MODE)) {
         const std::string local_str = conn_info.at(KEY_FAILOVER_MODE);
-        const std::string local_str_upper = RDS_STR_UPPER(local_str);
+        const std::string local_str_upper = ToAsciiUpper(local_str);
         if (FAILOVER_MODE_TABLE.contains(local_str_upper)) {
             mode = FAILOVER_MODE_TABLE.at(local_str_upper);
         }

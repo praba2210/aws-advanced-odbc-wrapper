@@ -36,7 +36,7 @@ protected:
         // Simulate a statement invalidated by a failed failover.
         stmt_ = new STMT();
         stmt_->dbc = dbc_;
-        stmt_->wrapped_stmt = SQL_NULL_HSTMT;
+        OdbcHelper::SetWrappedStmt(stmt_, SQL_NULL_HSTMT);
         stmt_->app_row_desc = new DESC();
         stmt_->app_row_desc->dbc = dbc_;
         stmt_->app_param_desc = new DESC();
@@ -83,7 +83,7 @@ TEST_F(NullWrappedHandleTest, DisconnectWithNulledWrappedHandlesDoesNotCrash) {
     OdbcHelper helper(nullptr, &env_);
     helper.Disconnect(dbc_);
 
-    EXPECT_EQ(SQL_NULL_HSTMT, stmt_->wrapped_stmt);
+    EXPECT_EQ(SQL_NULL_HSTMT, stmt_->wrapped_stmt.Get());
     EXPECT_EQ(SQL_NULL_HDESC, desc->wrapped_desc);
 
     dbc_->desc_list.clear();

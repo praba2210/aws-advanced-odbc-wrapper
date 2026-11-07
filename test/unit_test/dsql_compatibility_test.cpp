@@ -34,6 +34,7 @@
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_connection_lifetime.h"
+#include "../../driver/util/odbc_helper.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
 
@@ -131,7 +132,7 @@ protected:
 
     void TearDown() override {
         // The fake handles point at test objects; never let them outlive the test.
-        stmt_.wrapped_stmt = SQL_NULL_HSTMT;
+        OdbcHelper::SetWrappedStmt(&stmt_, SQL_NULL_HSTMT);
         dbc_.wrapped_dbc = SQL_NULL_HDBC;
         env_.wrapped_env = SQL_NULL_HENV;
         dbc_.plugin_service = nullptr;
@@ -147,7 +148,7 @@ protected:
     // connection's lifetime too, which the first connect's chain build creates.
     void Connect() {
         dbc_.wrapped_dbc = static_cast<SQLHDBC>(&dbc_);
-        stmt_.wrapped_stmt = static_cast<SQLHSTMT>(&stmt_);
+        OdbcHelper::SetWrappedStmt(&stmt_, static_cast<SQLHSTMT>(&stmt_));
         if (DsqlCompatibility::IsDsql(&dbc_)) {
             dbc_.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
         }

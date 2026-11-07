@@ -22,12 +22,12 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -221,9 +221,10 @@ namespace {
         return std::to_string(retries) + (retries == 1 ? " retry" : " retries");
     }
 
-    void SleepFor(std::chrono::milliseconds delay)
+    // SQLCancel from another thread ends the wait at once.
+    bool SleepFor(CancelState& cancel, std::chrono::milliseconds delay)
     {
-        std::this_thread::sleep_for(delay);
+        return cancel.WaitFor(delay);
     }
 
     double UniformRandom()
@@ -329,7 +330,14 @@ SQLRETURN DsqlOccRetryPlugin::RetryOccConflicts(STMT* stmt, SQLTCHAR* statement_
         }
         LOG(INFO) << "[DSQL] OCC conflict (" << DescribeConflict(sql_state, message) << "): retry " << retry << "/"
                   << config_.max_retries << " in " << delay.count() << " ms";
-        sleep_(delay);
+        if (sleep_(stmt->cancel, delay)) {
+            // No attempt after it: HY008, ahead of the conflict's record.
+            LOG(INFO) << "[DSQL] OCC retry " << retry << " canceled during its wait";
+            ClearError(stmt);
+            stmt->err = std::make_unique<ErrInfo>("Operation canceled: SQLCancel was called while an OCC retry waited",
+                ERR_OPERATION_CANCELED);
+            return SQL_ERROR;
+        }
         ClearError(stmt);
         const std::chrono::steady_clock::time_point attempt_started_at = clock_();
         ret = ExecuteNext(stmt, statement_text, text_length);

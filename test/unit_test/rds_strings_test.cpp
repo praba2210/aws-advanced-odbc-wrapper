@@ -206,4 +206,149 @@ TEST_F(RdsStringsTest, GetLenOfSqltcharArray_4Byte_NTS_MultipleHighByteZero) {
     EXPECT_EQ(len, 4u);
 }
 
+// The length is in the app's characters: "café" is 5 UTF-8 bytes, 4 UTF-16 units and 4 code points; "a😀" is 5 bytes,
+// 3 units and 2 code points.
+TEST_F(RdsStringsTest, CopyUTF8ToAppChars_CountsAppCharacters) {
+    EXPECT_EQ(4u, CopyUTF8ToAppChars("caf\xC3\xA9", nullptr, 0, false));
+    EXPECT_EQ(4u, CopyUTF8ToAppChars("caf\xC3\xA9", nullptr, 0, true));
+    EXPECT_EQ(3u, CopyUTF8ToAppChars("a\xF0\x9F\x98\x80", nullptr, 0, false));
+    EXPECT_EQ(2u, CopyUTF8ToAppChars("a\xF0\x9F\x98\x80", nullptr, 0, true));
+    EXPECT_EQ(0u, CopyUTF8ToAppChars("", nullptr, 0, false));
+
+    uint16_t utf16[5] = {0x5A5A, 0x5A5A, 0x5A5A, 0x5A5A, 0x5A5A};
+    EXPECT_EQ(4u, CopyUTF8ToAppChars("caf\xC3\xA9", utf16, 5, false));
+    EXPECT_EQ(0x00E9, utf16[3]);
+    EXPECT_EQ(0, utf16[4]);
+}
+
+// A text that doesn't fit, or fits only without its terminator, is cut to a terminated prefix; the full length is
+// returned either way.
+TEST_F(RdsStringsTest, CopyUTF8ToAppChars_CutsToATerminatedPrefix) {
+    const std::vector<uint32_t> abc = {'a', 'b', 'c', 0};
+    for (const bool user_4_byte : {false, true}) {
+        // The buffer's 4 characters, read in the app's width.
+        uint32_t buf[4];
+        const auto chars = [&buf, user_4_byte]() {
+            std::vector<uint32_t> out;
+            for (size_t i = 0; i < 4; ++i) {
+                out.push_back(user_4_byte ? buf[i] : reinterpret_cast<const uint16_t*>(buf)[i]);
+            }
+            return out;
+        };
+
+        std::fill(buf, buf + 4, 0x5A5A5A5Au);
+        EXPECT_EQ(5u, CopyUTF8ToAppChars("abcde", buf, 4, user_4_byte));
+        EXPECT_EQ(abc, chars());
+
+        // Room for every character but the terminator.
+        std::fill(buf, buf + 4, 0x5A5A5A5Au);
+        EXPECT_EQ(4u, CopyUTF8ToAppChars("abcd", buf, 4, user_4_byte));
+        EXPECT_EQ(abc, chars());
+
+        std::fill(buf, buf + 4, 0x5A5A5A5Au);
+        EXPECT_EQ(3u, CopyUTF8ToAppChars("abc", buf, 4, user_4_byte));
+        EXPECT_EQ(abc, chars());
+    }
+}
+
+// A cut doesn't end in the first half of a surrogate pair: "ab😀" in 4 UTF-16 units leaves "ab".
+TEST_F(RdsStringsTest, CopyUTF8ToAppChars_KeepsSurrogatePairsWhole) {
+    uint16_t buf[4] = {0x5A5A, 0x5A5A, 0x5A5A, 0x5A5A};
+    EXPECT_EQ(4u, CopyUTF8ToAppChars("ab\xF0\x9F\x98\x80", buf, 4, false));
+    EXPECT_EQ('a', buf[0]);
+    EXPECT_EQ('b', buf[1]);
+    EXPECT_EQ(0, buf[2]);
+
+    uint16_t roomy[5] = {0x5A5A, 0x5A5A, 0x5A5A, 0x5A5A, 0x5A5A};
+    EXPECT_EQ(4u, CopyUTF8ToAppChars("ab\xF0\x9F\x98\x80", roomy, 5, false));
+    EXPECT_EQ(0xD83D, roomy[2]);
+    EXPECT_EQ(0xDE00, roomy[3]);
+    EXPECT_EQ(0, roomy[4]);
+}
+
+// An app with a 4-byte SQLWCHAR gets one code point per character, a supplementary one too.
+TEST_F(RdsStringsTest, CopyUTF8ToAppChars_FourByteWritesCodePoints) {
+    uint32_t buf[3] = {0x5A5A5A5A, 0x5A5A5A5A, 0x5A5A5A5A};
+    EXPECT_EQ(2u, CopyUTF8ToAppChars("a\xF0\x9F\x98\x80", buf, 3, true));
+    EXPECT_EQ(0x61u, buf[0]);
+    EXPECT_EQ(0x1F600u, buf[1]);
+    EXPECT_EQ(0u, buf[2]);
+
+    uint32_t tight[2] = {0x5A5A5A5A, 0x5A5A5A5A};
+    EXPECT_EQ(2u, CopyUTF8ToAppChars("a\xF0\x9F\x98\x80", tight, 2, true));
+    EXPECT_EQ(0x61u, tight[0]);
+    EXPECT_EQ(0u, tight[1]);
+}
+
+TEST_F(RdsStringsTest, CopyUTF8ToAppChars_ZeroCapacityWritesNothing) {
+    uint32_t buf[2] = {0x5A5A5A5A, 0x5A5A5A5A};
+    EXPECT_EQ(3u, CopyUTF8ToAppChars("abc", buf, 0, false));
+    EXPECT_EQ(3u, CopyUTF8ToAppChars("abc", buf, 0, true));
+    EXPECT_EQ(0x5A5A5A5Au, buf[0]);
+    EXPECT_EQ(0x5A5A5A5Au, buf[1]);
+}
+
+// ODBC W functions take a length in characters, and the text needn't be NUL-terminated. pyodbc, for example, passes
+// a UTF-16 buffer that ends in a single NUL byte, so reading to a 16-bit NUL picks up whatever follows.
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_2Byte_ExplicitLength_StopsAtLength) {
+    SQLTCHAR in[] = {'S', 'E', 'L', 'E', 'C', 'T', ' ', '1', 0x0400, 0};
+    EXPECT_EQ("SELECT 1", ConvertUserAppToUTF8(false, in, 8));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_2Byte_ExplicitLength_StopsAtEmbeddedNul) {
+    SQLTCHAR in[] = {'a', 'b', 0, 'x', 'y', 0};
+    EXPECT_EQ("ab", ConvertUserAppToUTF8(false, in, 5));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_2Byte_ZeroLength_Empty) {
+    SQLTCHAR in[] = {'a', 'b', 0};
+    EXPECT_EQ("", ConvertUserAppToUTF8(false, in, 0));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_2Byte_Nts_ReadsToNul) {
+    SQLTCHAR in[] = {'a', 'b', 0, 'x', 0};
+    EXPECT_EQ("ab", ConvertUserAppToUTF8(false, in, SQL_NTS));
+}
+
+// An app with a 4-byte SQLWCHAR (iODBC) gives the length in code points, and the text needn't end in a NUL. Each
+// buffer below holds the text, then a sentinel right after TextLength characters that the conversion mustn't reach.
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_4Byte_ExplicitLength_StopsAtLength) {
+    char32_t in[] = {U'C', U'O', U'M', U'M', U'I', U'T', U'X'};
+    EXPECT_EQ("COMMIT", ConvertUserAppToUTF8(true, reinterpret_cast<SQLTCHAR*>(in), 6));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_4Byte_ExplicitLength_CountsCodePointsOutsideTheBmp) {
+    char32_t in[] = {U'\U0001F600', U'\U0001F600', U'a', U'b', U'c'};
+    EXPECT_EQ("\xF0\x9F\x98\x80\xF0\x9F\x98\x80", ConvertUserAppToUTF8(true, reinterpret_cast<SQLTCHAR*>(in), 2));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_4Byte_ZeroLength_Empty) {
+    char32_t in[] = {U'a', U'b', 0};
+    EXPECT_EQ("", ConvertUserAppToUTF8(true, reinterpret_cast<SQLTCHAR*>(in), 0));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_4Byte_ExplicitLength_StopsAtEmbeddedNul) {
+    char32_t in[] = {U'a', U'b', 0, U'x', U'y'};
+    EXPECT_EQ("ab", ConvertUserAppToUTF8(true, reinterpret_cast<SQLTCHAR*>(in), 5));
+}
+
+TEST_F(RdsStringsTest, ConvertUserAppToUTF8_4Byte_Nts_ReadsToNul) {
+    char32_t in[] = {U'a', U'b', 0, U'x', 0};
+    EXPECT_EQ("ab", ConvertUserAppToUTF8(true, reinterpret_cast<SQLTCHAR*>(in), SQL_NTS));
+}
+
+// What a 2-byte base driver gets for SQLPrepareW and the catalog functions.
+TEST_F(RdsStringsTest, ConvertUserAppInputToBaseDriver_4ByteApp_ExplicitLength_StopsAtLength) {
+    char32_t in[] = {U'C', U'O', U'M', U'M', U'I', U'T', U'X'};
+    const std::vector<SQLTCHAR> out = ConvertUserAppInputToBaseDriver(true, false, reinterpret_cast<SQLTCHAR*>(in), 6);
+    EXPECT_EQ((std::vector<SQLTCHAR>{'C', 'O', 'M', 'M', 'I', 'T', 0}), out);
+}
+
+// A 4-byte base driver gets all TextLength code points of a 4-byte app's text, also outside the BMP.
+TEST_F(RdsStringsTest, ConvertUserAppInputToBaseDriver_4ByteAppAndDriver_KeepsTextOutsideTheBmp) {
+    char32_t in[] = {U'\U0001F600', U'\U0001F600', U'a', U'b', U'c'};
+    std::vector<SQLTCHAR> out = ConvertUserAppInputToBaseDriver(true, true, reinterpret_cast<SQLTCHAR*>(in), 2);
+    EXPECT_EQ("\xF0\x9F\x98\x80\xF0\x9F\x98\x80", Convert4ByteSqlWChar(out.data(), SQL_NTS));
+}
+
 #endif // UNICODE

@@ -42,6 +42,13 @@ SQLRETURN RDS_AllocDesc(
     SQLHDBC        ConnectionHandle,
     SQLHANDLE *    DescriptorHandlePointer);
 
+SQLRETURN RDS_SQLGetEnvAttr(
+    SQLHENV        EnvironmentHandle,
+    SQLINTEGER     Attribute,
+    SQLPOINTER     ValuePtr,
+    SQLINTEGER     BufferLength,
+    SQLINTEGER *   StringLengthPtr);
+
 SQLRETURN RDS_SQLSetEnvAttr(
     SQLHENV        EnvironmentHandle,
     SQLINTEGER     Attribute,
@@ -66,6 +73,14 @@ SQLRETURN RDS_FreeStmt(
     SQLHSTMT       StatementHandle,
     SQLUSMALLINT   Option);
 
+// SQLCancel and SQLCancelHandle on a statement, also from another thread while a call runs on it.
+SQLRETURN RDS_SQLCancel(
+    SQLHSTMT       StatementHandle);
+
+// The answer of a call that SQLCancel stopped before its statement ran: SQL_ERROR with HY008.
+SQLRETURN RDS_StatementCanceled(
+    SQLHSTMT       StatementHandle);
+
 SQLRETURN RDS_GetConnectAttr(
     SQLHDBC        ConnectionHandle,
     SQLINTEGER     Attribute,
@@ -89,15 +104,6 @@ SQLRETURN RDS_SQLBrowseConnect(
     SQLSMALLINT *  StringLength2Ptr);
 
 SQLRETURN RDS_SQLColAttribute(
-    SQLHSTMT       StatementHandle,
-    SQLUSMALLINT   ColumnNumber,
-    SQLUSMALLINT   FieldIdentifier,
-    SQLPOINTER     CharacterAttributePtr,
-    SQLSMALLINT    BufferLength,
-    SQLSMALLINT *  StringLengthPtr,
-    SQLLEN *       NumericAttributePtr);
-
-SQLRETURN RDS_SQLColAttributes(
     SQLHSTMT       StatementHandle,
     SQLUSMALLINT   ColumnNumber,
     SQLUSMALLINT   FieldIdentifier,
@@ -340,6 +346,22 @@ SQLRETURN RDS_SQLSetCursorName(
     SQLTCHAR *     CursorName,
     SQLSMALLINT    NameLength);
 
+SQLRETURN RDS_SQLCopyDesc(
+    SQLHDESC       SourceDescHandle,
+    SQLHDESC       TargetDescHandle);
+
+SQLRETURN RDS_SQLSetDescRec(
+    SQLHDESC      DescriptorHandle,
+    SQLSMALLINT   RecNumber,
+    SQLSMALLINT   Type,
+    SQLSMALLINT   SubType,
+    SQLLEN        Length,
+    SQLSMALLINT   Precision,
+    SQLSMALLINT   Scale,
+    SQLPOINTER    DataPtr,
+    SQLLEN *      StringLengthPtr,
+    SQLLEN *      IndicatorPtr);
+
 SQLRETURN RDS_SQLSetDescField(
     SQLHDESC       DescriptorHandle,
     SQLSMALLINT    RecNumber,
@@ -397,6 +419,28 @@ SQLRETURN RDS_SQLTables(
     SQLSMALLINT    NameLength4);
 
 SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str);
+
+#if UNICODE && !defined(_WIN32)
+// The bound SQL_C_WCHAR parameters when the app's or the base driver's SQLWCHAR is 4 bytes: copied into the base
+// driver's width before a statement runs (SQLExecute, SQLExecDirect), and the output ones back after it ran.
+void RDS_ConvertBoundParamBuffersBeforeExecute(STMT* stmt);
+SQLRETURN RDS_ConvertBoundParamBuffersAfterExecute(STMT* stmt, SQLRETURN ret, const char* function);
+
+// Those copies, and the bound columns' (DESC::bound_col_buffers, bound_param_buffers), hold one row or parameter set at
+// the binding's own address. So SQL_ERROR with HYC00 for what would have the base driver use them for more rows or
+// parameter sets, row-wise or at a bind offset:
+// - a statement attribute, or ODBC 2 option, with this value while the ARD's (for a row one) or the APD's copies exist;
+//   SQL_SUCCESS for any other.
+SQLRETURN RDS_RefuseMultiRowWithCopies(STMT* stmt, SQLINTEGER attribute, SQLULEN value, const char* function);
+// - a binding that would get a copy while one of those is set.
+SQLRETURN RDS_OneRowCopiesError(STMT* stmt, const char* function);
+
+// Whether code at this address is in unixODBC's driver manager, by the library it's in. Public for tests.
+bool RDS_IsInUnixOdbc(const void* address);
+// SQLConnectW and SQLDriverConnectW, with their return address: whether the connect came through unixODBC
+// (DBC::connect_through_unix_odbc).
+void RDS_NoteConnectCaller(SQLHDBC ConnectionHandle, const void* caller);
+#endif
 
 ENV* RDS_GetEnvFromHandle(SQLSMALLINT handle_type, SQLHANDLE handle);
 

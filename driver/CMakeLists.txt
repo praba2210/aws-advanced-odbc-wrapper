@@ -104,6 +104,8 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/attribute_validator.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/auth_provider.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/aws_sdk_helper.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/base_handle_guard.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/cancel_state.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cluster_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/concurrent_map.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/concurrent_stack.h

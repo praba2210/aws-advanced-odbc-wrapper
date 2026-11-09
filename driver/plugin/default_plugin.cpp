@@ -20,6 +20,7 @@
 
 #include "../driver.h"
 #include "../odbcapi.h"
+#include "../odbcapi_rds_helper.h"
 #include "../util/connection_string_helper.h"
 #include "../util/logger_wrapper.h"
 #include "../util/odbc_helper.h"
@@ -92,11 +93,16 @@ SQLRETURN DefaultPlugin::Connect(
 
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
-    const std::string conn_in = ConnectionStringHelper::BuildMinimumConnectionString(dbc->conn_attr);
+    // It holds the password or token in PWD, as do the converted copies below. This string, its UTF-16 copy and the
+    // wide copy of the 4-byte retry are wiped when they go; the converters' own temporary copies (the by-value
+    // argument, ICU's buffer, a vector they grow) are not.
+    std::string conn_in = ConnectionStringHelper::BuildMinimumConnectionString(dbc->conn_attr);
+    const ScopedWipe wipe_conn_in(conn_in);
     DLOG(INFO) << "Built minimum connection string for underlying driver: " << ConnectionStringHelper::MaskSensitiveInformation(conn_in);
     SQLTCHAR *conn_in_sqltchar;
 #if UNICODE
-    const std::vector<uint16_t> conn_in_vec = ConvertUTF8ToUTF16(conn_in);
+    std::vector<uint16_t> conn_in_vec = ConvertUTF8ToUTF16(conn_in);
+    const ScopedWipe wipe_conn_in_vec(conn_in_vec);
     const uint16_t* conn_in_ushort = conn_in_vec.data();
 
     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(conn_in_ushort));
@@ -154,7 +160,8 @@ SQLRETURN DefaultPlugin::Connect(
 
                 if (this->odbc_helper_->GetUse4BytesBaseDriver()) {
                     // Try connecting again with 4-byte characters
-                    const std::wstring wide_conn = ConvertUTF8ToWString(conn_in);
+                    std::wstring wide_conn = ConvertUTF8ToWString(conn_in);
+                    const ScopedWipe wipe_wide_conn(wide_conn);
                     conn_in_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(wide_conn.c_str()));
                     res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDriverConnect>(env->driver_lib_loader, RdsFuncNames::DriverConnect,
                         dbc->wrapped_dbc, WindowHandle, conn_in_sqltchar, SQL_NTS, out_conn_str, out_buffer_len, &base_out_len, DriverCompletion
@@ -176,9 +183,20 @@ SQLRETURN DefaultPlugin::Connect(
         if (key == SQL_ATTR_LOGIN_TIMEOUT || key == SQL_ATTR_CONNECTION_TIMEOUT) {
             continue;
         }
-        res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetConnectAttr>(env->driver_lib_loader, RdsFuncNames::SetConnectAttr,
-            dbc->wrapped_dbc, key, val.first, val.second
-        );
+#if UNICODE
+        // A string value is kept in the app's characters (RDS_SQLSetConnectAttr); the base driver gets its own.
+        if (val.first && OdbcHelper::IsStringConnectAttr(key) && this->odbc_helper_->NeedsConversion()) {
+            const auto converted = this->odbc_helper_->ConvertInput(static_cast<SQLTCHAR*>(val.first), SQL_NTS);
+            res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetConnectAttr>(env->driver_lib_loader, RdsFuncNames::SetConnectAttr,
+                dbc->wrapped_dbc, key, converted.tchar_ptr, SQL_NTS
+            );
+        } else
+#endif
+        {
+            res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetConnectAttr>(env->driver_lib_loader, RdsFuncNames::SetConnectAttr,
+                dbc->wrapped_dbc, key, val.first, val.second
+            );
+        }
         if (!SQL_SUCCEEDED(res.fn_result)) {
             LOG(WARNING) << "Error setting connection attribute: " << key;
             has_conn_attr_errors  = true;
@@ -216,9 +234,12 @@ SQLRETURN DefaultPlugin::Execute(
     // Allocate wrapped handle if NULL
     if (!stmt->wrapped_stmt) {
         if (dbc->wrapped_dbc) {
+            // Stored through dbc->base_handles, as SQLCancel reads it without the statement's lock
+            SQLHSTMT wrapped_stmt = SQL_NULL_HSTMT;
             res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLAllocHandle>(env->driver_lib_loader, RdsFuncNames::AllocHandle,
-                SQL_HANDLE_STMT, dbc->wrapped_dbc, &stmt->wrapped_stmt
+                SQL_HANDLE_STMT, dbc->wrapped_dbc, &wrapped_stmt
             );
+            OdbcHelper::SetWrappedStmt(stmt, wrapped_stmt);
             if (!SQL_SUCCEEDED(res.fn_result) || !stmt->wrapped_stmt) {
                 LOG(ERROR) << "Unable to allocate underlying STMT";
                 ClearError(stmt);
@@ -236,13 +257,28 @@ SQLRETURN DefaultPlugin::Execute(
                 stmt->wrapped_stmt, key, val.first, val.second
             );
         }
+        // and the explicit ARD and APD the app set, through base descriptors on this base connection: releasing the
+        // connection's base handles dropped theirs.
+        for (const auto& [attribute, desc] : {
+                 std::pair{SQL_ATTR_APP_ROW_DESC, stmt->explicit_row_desc},
+                 std::pair{SQL_ATTR_APP_PARAM_DESC, stmt->explicit_param_desc},
+             }) {
+            if (desc) {
+                res = OdbcHelper::SetWrappedAppDesc(env->driver_lib_loader, stmt, attribute, desc);
+                if (!SQL_SUCCEEDED(res.fn_result)) {
+                    LOG(WARNING) << "Unable to set the statement's explicit descriptor " << attribute;
+                }
+            }
+        }
         // Cursor Name
         const std::string cursor_name = stmt->cursor_name;
 #if UNICODE
         const std::vector<uint16_t> cursor_name_vector = ConvertUTF8ToUTF16(cursor_name);
         SQLTCHAR* cursor_name_sqltchar = const_cast<SQLTCHAR *>(reinterpret_cast<const SQLTCHAR *>(cursor_name_vector.data()));
+        // Its length in UTF-16 units: the UTF-8 one counts bytes.
+        const auto cursor_name_length = static_cast<SQLSMALLINT>(cursor_name_vector.size() - 1);
         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetCursorName>(env->driver_lib_loader, RdsFuncNames::SetCursorName,
-            stmt->wrapped_stmt, cursor_name_sqltchar, cursor_name.length()
+            stmt->wrapped_stmt, cursor_name_sqltchar, cursor_name_length
         );
 #else
         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLSetCursorName>(env->driver_lib_loader, RdsFuncNames::SetCursorName,
@@ -251,13 +287,21 @@ SQLRETURN DefaultPlugin::Execute(
 #endif
     }
 
+    // SQLCancel came from another thread before the statement reached the base driver (while the call waited for
+    // the connection, or in a plugin): don't run it. From here a cancel goes to the base driver.
+    if (!stmt->cancel.EnterBaseDriver()) {
+        return RDS_StatementCanceled(stmt);
+    }
+
     if (query.empty()) {
         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLExecute>(env->driver_lib_loader, RdsFuncNames::Execute,
             stmt->wrapped_stmt
         );
     } else {
-        res = this->odbc_helper_->ExecDirect(&stmt->wrapped_stmt, query);
+        const SQLHSTMT wrapped_stmt = stmt->wrapped_stmt;
+        res = this->odbc_helper_->ExecDirect(&wrapped_stmt, query);
     }
+    stmt->cancel.LeaveBaseDriver();
 
     // Supports checking for transaction changes only if it was a direct execute
     if (SQL_SUCCEEDED(res.fn_result) && !query.empty()) {

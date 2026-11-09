@@ -52,6 +52,7 @@
 
 #include <sql.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <list>
@@ -63,6 +64,8 @@
 #include <vector>
 
 #include "error.h"
+#include "util/base_handle_guard.h"
+#include "util/cancel_state.h"
 
 /* Forward Declarations */
 struct ENV;
@@ -107,6 +110,9 @@ struct ENV {
     bool counted_by_core_service = false;
 
     SQLHENV wrapped_env = SQL_NULL_HENV;
+    // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can
+    // be cleared without the handle's lock (a statement's or descriptor's SQLAllocHandle clears the connection's).
+    std::atomic<bool> base_diag_stale = false;
 
     std::shared_ptr<RdsLibLoader> driver_lib_loader;
     std::atomic<bool> use_4_bytes_user_app = false;
@@ -121,16 +127,27 @@ struct DBC {
     uint16_t unnamed_cursor_count;
     std::list<DESC*> desc_list;
     SQLHDBC wrapped_dbc = SQL_NULL_HDBC;
+    // The base handles of the connection's statements against an SQLCancel from another thread (see STMT::wrapped_stmt)
+    BaseHandleGuard base_handles;
     CONN_STATUS conn_status;
     TRANSACTION_STATUS transaction_status;
     bool auto_commit = true;  // By default, drivers will be in auto commit mode
 
     // TODO - May need to change SQLPOINTER to an actual object
     std::map<SQLINTEGER, std::pair<SQLPOINTER, SQLINTEGER>> attr_map;  // Key, <Value, Length>
+    // The values of the string attributes in attr_map, copied as the app passed them and terminated: attr_map's
+    // pointers for them point here, so they stay valid after the app's buffer is gone.
+    std::map<SQLINTEGER, std::vector<SQLTCHAR>> attr_strings;
 
     // Connection Information, i.e. Server, Port, UID, Pass, Plugin Info, etc
     std::map<std::string, std::string> conn_attr;  // Key, Value
     bool allow_interactive_auth = false;
+    // The driver manager said how wide the app's SQLWCHAR is (iODBC's SQL_ATTR_APP_WCHAR_TYPE), so the connect
+    // functions don't tell it from the app's text.
+    bool app_wchar_type_known = false;
+    // The app's SQLConnectW or SQLDriverConnectW came through unixODBC's driver manager, whose SQLWCHAR is 2 bytes
+    // (RDS_NoteConnectCaller).
+    bool connect_through_unix_odbc = false;
     BasePlugin* plugin_head = nullptr;
     std::shared_ptr<PluginService> plugin_service;
     // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD and the
@@ -138,6 +155,9 @@ struct DBC {
     std::shared_ptr<DsqlConnectionLifetime> dsql_lifetime;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
+    // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can
+    // be cleared without the handle's lock (a statement's or descriptor's SQLAllocHandle clears the connection's).
+    std::atomic<bool> base_diag_stale = false;
 
     ~DBC();
 };  // DBC
@@ -174,12 +194,23 @@ struct STMT {
     // TODO - Do we need lock?
     std::recursive_mutex lock;
     DBC* dbc;
-    SQLHSTMT wrapped_stmt = SQL_NULL_HSTMT;
+    // The running SQLExecDirect or SQLExecute, for an SQLCancel from another thread
+    CancelState cancel;
+    // SQLCancel uses it from another thread without `lock`, so that it reaches a running statement. Every store,
+    // null-out and base free of it goes through dbc->base_handles (OdbcHelper::SetWrappedStmt, FreeWrappedStmt,
+    // ReleaseBaseHandles); its type has no plain assignment. So does every base disconnect and free of the connection
+    // (SQLDisconnect, RDS_FreeConnect, ReleaseBaseHandles). Readers
+    // that hold `lock` need nothing more.
+    WrappedStmt wrapped_stmt;
 
     DESC* app_row_desc = SQL_NULL_HANDLE;
     DESC* app_param_desc = SQL_NULL_HANDLE;
     DESC* imp_row_desc = SQL_NULL_HANDLE;
     DESC* imp_param_desc = SQL_NULL_HANDLE;
+    // The explicit descriptors the app made the statement's ARD and APD (SQLSetStmtAttr), or nullptr while it uses
+    // app_row_desc and app_param_desc.
+    DESC* explicit_row_desc = nullptr;
+    DESC* explicit_param_desc = nullptr;
 
     // TODO - May need to change SQLPOINTER to an actual object
     std::map<SQLINTEGER, std::pair<SQLPOINTER, SQLINTEGER>> attr_map;  // Key, <Value, Length>
@@ -187,10 +218,12 @@ struct STMT {
     // UTF-8 text of the last successful SQLPrepare: SQLExecute passes no text down the plugin chain.
     std::string prepared_text;
 
-    // Buffers for UTF32 support
-    std::vector<BoundColBuffer> bound_col_buffers;      // Intercepted WCHAR column bindings
-    std::vector<BoundParamBuffer> bound_param_buffers;  // Intercepted WCHAR param bindings
+    // For UTF32 support; the copies of the intercepted WCHAR bindings are on the ARD and APD that hold them
+    // (CurrentRowDesc, CurrentParamDesc).
     bool put_data_char_conversion = false;
+    // An SQLExecute or SQLExecDirect returned SQL_NEED_DATA: the SQLParamData that ends its data-at-execution
+    // parameters runs the statement, and its output parameters come back then.
+    bool execute_needs_data = false;
 
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
@@ -203,12 +236,51 @@ struct DESC {
     std::recursive_mutex lock;
     // TODO - What to put here
     DBC* dbc;
+    // The statement whose implicit descriptor this is, which frees it; nullptr for one SQLAllocHandle allocated.
+    STMT* stmt = nullptr;
     SQLHDESC wrapped_desc = SQL_NULL_HDESC;
+    // The wrapper's copies of the SQL_C_WCHAR bindings in this descriptor's records while the app's and the base
+    // driver's SQLWCHAR differ: SQLBindCol's in an ARD, SQLBindParameter's in an APD. The base driver's record points
+    // at the copy, so the copy lives as long as the record, whichever statements use the descriptor. Under `lock`.
+    std::vector<BoundColBuffer> bound_col_buffers;
+    std::vector<BoundParamBuffer> bound_param_buffers;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
 
     ~DESC();
 };  // DESC
+
+// The descriptor that holds a statement's column bindings: the explicit ARD the app set, or its implicit one.
+inline DESC* CurrentRowDesc(const STMT* stmt) {
+    return stmt->explicit_row_desc != nullptr ? stmt->explicit_row_desc : stmt->app_row_desc;
+}
+
+// The one that holds its parameter bindings: the explicit APD the app set, or its implicit one.
+inline DESC* CurrentParamDesc(const STMT* stmt) {
+    return stmt->explicit_param_desc != nullptr ? stmt->explicit_param_desc : stmt->app_param_desc;
+}
+
+// Drops a descriptor's copies for the records above count: a lower SQL_DESC_COUNT unbinds them in the base driver.
+// A column's and a parameter's, as for one record (DropRecordCopies).
+inline void DropRecordCopiesAbove(DESC* desc, SQLSMALLINT count) {
+    const std::lock_guard<std::recursive_mutex> lock_guard(desc->lock);
+    std::erase_if(desc->bound_col_buffers,
+                  [count](const BoundColBuffer& b) { return static_cast<int>(b.column_number) > count; });
+    std::erase_if(desc->bound_param_buffers,
+                  [count](const BoundParamBuffer& b) { return static_cast<int>(b.param_number) > count; });
+}
+
+// Whether a descriptor has copies of SQL_C_WCHAR bindings, which hold one row or parameter set at the binding's own
+// address (a data-at-execution parameter has none: the base driver gets the app's buffer as its token).
+inline bool HasOneRowCopies(DESC* desc) {
+    if (desc == nullptr) {
+        return false;
+    }
+    const std::lock_guard<std::recursive_mutex> lock_guard(desc->lock);
+    return !desc->bound_col_buffers.empty()
+        || std::any_of(desc->bound_param_buffers.begin(), desc->bound_param_buffers.end(),
+                       [](const BoundParamBuffer& param) { return !param.local_buf.empty(); });
+}
 
 /* Simple Macros */
 #define RDS_NOT_IMPLEMENTED return SQL_ERROR
@@ -242,6 +314,9 @@ void ClearError(HandleT* handle) {
     if (handle != nullptr) {
         handle->sql_error_called = 0;
         handle->err.reset();
+        if constexpr (requires { handle->base_diag_stale; }) {
+            handle->base_diag_stale = false;
+        }
     }
 }
 

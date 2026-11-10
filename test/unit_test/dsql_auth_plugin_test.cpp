@@ -43,8 +43,10 @@
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
+#include "../../driver/plugin/dsql/dsql_compatibility.h"
 #include "../../driver/plugin/dsql/dsql_plugin_helper.h"
 #include "../../driver/util/aws_sdk_helper.h"
+#include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_auth_provider.h"
 #include "../../driver/util/logger_wrapper.h"
@@ -1650,4 +1652,65 @@ TEST_F(DsqlAuthPluginTest, RootCertHint_BundleRootCert) {
     const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, "SSL error: certificate verify failed");
     EXPECT_NE(std::string::npos, hint.find("system CA bundle"));
     EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert="));
+}
+
+namespace {
+    // psqlODBC's connection string for these attributes, through the connect's steps: the DSQL plugin's defaults
+    // (DsqlAuthPlugin::Connect), the forced psqlODBC options and the builder (DefaultPlugin::Connect).
+    std::string BaseDriverString(std::map<std::string, std::string> conn_attr) {
+        DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+        DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+        return ConnectionStringHelper::BuildMinimumConnectionString(conn_attr);
+    }
+
+    std::map<std::string, std::string> Parsed(const std::string& conn_str) {
+        std::map<std::string, std::string> conn_attr;
+        ConnectionStringHelper::ParseConnectionString(conn_str, conn_attr);  // bool after #177: ignored
+        return conn_attr;
+    }
+
+    // The value of key in a string the builder wrote (these tests' values hold no ';'), or "<missing>".
+    std::string ValueOf(const std::string& conn_str, const std::string& key) {
+        const std::string padded = ";" + conn_str + ";";
+        const size_t start = padded.find(";" + key + "=");
+        if (start == std::string::npos) {
+            return "<missing>";
+        }
+        const size_t value_start = start + key.size() + 2;
+        return padded.substr(value_start, padded.find(';', value_start) - value_start);
+    }
+}  // namespace
+
+// psqlODBC reads SSLmode's first letter, so a braced mode would be disable: libpq would connect without TLS, and could
+// hand the token to whoever answers as the server. psqlODBC always gets a bare mode that encrypts.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_BracedSslModeArrivesBare) {
+    for (const std::string mode : {"verify-full", "verify-ca", "require", "disable"}) {
+        const std::string sent = ValueOf(BaseDriverString(Parsed("SSLmode={" + mode + "}")), "SSLMODE");
+        EXPECT_TRUE(sent == "verify-full" || sent == "verify-ca" || sent == "require") << mode << " -> " << sent;
+    }
+}
+
+// psqlODBC reads these values as written: braced, IgnoreTimeout={1} would read as 0.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_BracedForcedOptionsArriveBare) {
+    for (const char* conn_str : {"IgnoreTimeout={0};UseServerSidePrepare={1};UseDeclareFetch={1};Protocol={7.4-2}",
+                                 "IgnoreTimeout={1};UseServerSidePrepare={0};UseDeclareFetch={0};Protocol={7.4-0}",}) {
+        const std::string out = BaseDriverString(Parsed(conn_str));
+        EXPECT_EQ("1", ValueOf(out, "IGNORETIMEOUT")) << conn_str;
+        EXPECT_EQ("0", ValueOf(out, "USESERVERSIDEPREPARE")) << conn_str;
+        EXPECT_EQ("0", ValueOf(out, "USEDECLAREFETCH")) << conn_str;
+        EXPECT_EQ("7.4-0", ValueOf(out, "PROTOCOL")) << conn_str;
+    }
+}
+
+// psqlODBC removes one pair of braces from pqopt, and URL-decodes it otherwise ('+' would become a space). Typed in
+// braces, from a DSN (stored as it is, with or without braces) or not set, it arrives in exactly one pair.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_PqoptArrivesInOnePairOfBraces) {
+    const std::string expected = "{sslrootcert=/tmp/a+b.pem application_name=" + EXPECTED_APP_NAME + "}";
+    for (const auto& conn_attr : {Parsed("pqopt={sslrootcert=/tmp/a+b.pem}"),
+                                  std::map<std::string, std::string>{{"PQOPT", "sslrootcert=/tmp/a+b.pem"}},
+                                  std::map<std::string, std::string>{{"PQOPT", "{sslrootcert=/tmp/a+b.pem}"}},}) {
+        EXPECT_EQ(expected, ValueOf(BaseDriverString(conn_attr), "PQOPT"));
+    }
+    EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}",
+              ValueOf(BaseDriverString({}), "PQOPT"));
 }

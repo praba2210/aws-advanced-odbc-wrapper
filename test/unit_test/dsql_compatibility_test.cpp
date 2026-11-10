@@ -562,6 +562,18 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetUnsetSslMode_NoWarn
     EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
 }
 
+// The text psqlODBC gets is exact: SSLMODE bare (psqlODBC reads its first letter, so a braced mode would run as
+// disable) and PQOPT in one pair of braces (psqlODBC removes one pair, and URL-decodes the value otherwise).
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDatabaseAuthUnsetSslMode_BaseDriverGetsExactTlsText) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}});
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    DefaultPlugin plugin(&dbc_);
+    plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+    const std::string padded = ";" + captured_conn_str + ";";
+    EXPECT_NE(std::string::npos, padded.find(";SSLMODE=verify-full;")) << captured_conn_str;
+    EXPECT_NE(std::string::npos, padded.find(";PQOPT=" + VERIFY_FULL_PQOPT + ";")) << captured_conn_str;
+}
+
 // The wrapper keeps one record per handle, and its record hides the base driver's: a connect that fails, or that the
 // base driver warns about, keeps the base driver's result and records.
 TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDisable_KeepsTheBaseDriversResult) {

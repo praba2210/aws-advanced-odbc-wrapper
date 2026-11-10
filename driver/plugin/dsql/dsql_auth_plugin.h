@@ -54,8 +54,9 @@ public:
 
     // Sets SSLMODE by the policy, dropping its short form CA, and merges pqopt: root_cert as sslrootcert for
     // verify-full (none when it is ""), and the application name, each only when the user's pqopt doesn't set it.
-    // Returns the 01S02 text for a mode it replaced with verify-full, or "". DsqlCompatibility::PrepareConnect calls it
-    // for the other auth types. Public for tests.
+    // With OTHER_AUTH a mode psqlODBC runs is left as set, pqopt included. Returns the 01S02 text for a mode it
+    // replaced with verify-full, or "". DsqlCompatibility::PrepareConnect calls it for the other auth types. Public
+    // for tests.
     static std::string ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, TlsPolicy policy,
                                         std::string_view root_cert);
 
@@ -88,6 +89,10 @@ public:
     // The same for a connection handle; on false it has logged the error and set dbc->err (08001).
     // RDS_InitializeConnection calls it before anything reads the host.
     static bool ExpandClusterId(DBC* dbc);
+
+    // True when psqlODBC would run the SSLmode set in conn_attr (SSLMODE, else CA) as disable: none, or a value whose
+    // first byte isn't a, p, r or v (psqlODBC reads it case-sensitively). Aurora DSQL refuses that connection.
+    static bool SslModeRunsAsDisable(const std::map<std::string, std::string>& conn_attr);
 
     // The 01S02 message for an SSLmode that ApplyConnectionDefaults replaces with verify-full, or "" when the mode is
     // kept or not set. It reads the mode as the user set it, so call it before ApplyConnectionDefaults. Public for tests.

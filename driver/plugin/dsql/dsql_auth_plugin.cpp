@@ -182,10 +182,9 @@ namespace {
         return mode.empty() || (mode[0] != 'a' && mode[0] != 'p' && mode[0] != 'r' && mode[0] != 'v');
     }
 
-    // Another auth type on Aurora DSQL keeps a mode that connects: a full mode name in any case, lowercased (psqlODBC
-    // would run Require as disable), or another value psqlODBC can run (r, vc), as written. What psqlODBC would run as
-    // disable, which Aurora DSQL always refuses, becomes verify-full.
-    std::string ResolveSslModeForOtherAuth(const std::string& requested_mode)
+    // The mode another auth type gets in place of one psqlODBC would run as disable, which Aurora DSQL always refuses:
+    // a full mode name in another case, lowercased (psqlODBC reads Require as disable), else verify-full.
+    std::string RaiseSslModeForOtherAuth(const std::string& requested_mode)
     {
         const std::string requested_lower = AsciiLower(requested_mode);
         for (const std::string& mode :
@@ -193,9 +192,6 @@ namespace {
             if (requested_lower == mode) {
                 return mode;
             }
-        }
-        if (!RunsAsDisable(requested_mode)) {
-            return requested_mode;
         }
         if (!requested_mode.empty()) {
             LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL
@@ -607,8 +603,14 @@ std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>&
                                              const std::string_view root_cert)
 {
     const std::string requested = RequestedSslMode(conn_attr);
+    // Another auth type keeps a mode psqlODBC runs exactly as set, pqopt included: the connection works today, maybe
+    // with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT) or PGAPPNAME, which a default here
+    // would override.
+    if (policy == TlsPolicy::OTHER_AUTH && !RunsAsDisable(requested)) {
+        return "";
+    }
     const std::string ssl_mode =
-        policy == TlsPolicy::DSQL_AUTH ? ResolveSslMode(requested) : ResolveSslModeForOtherAuth(requested);
+        policy == TlsPolicy::DSQL_AUTH ? ResolveSslMode(requested) : RaiseSslModeForOtherAuth(requested);
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
     conn_attr.insert_or_assign(PG_KEY_SSLMODE, ssl_mode);
 
@@ -728,6 +730,11 @@ bool DsqlAuthPlugin::ExpandClusterId(DBC* dbc)
     ClearError(dbc);
     dbc->err = std::make_unique<ErrInfo>(error.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
     return false;
+}
+
+bool DsqlAuthPlugin::SslModeRunsAsDisable(const std::map<std::string, std::string>& conn_attr)
+{
+    return RunsAsDisable(RequestedSslMode(conn_attr));
 }
 
 std::string DsqlAuthPlugin::GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr)

@@ -282,10 +282,12 @@ DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
     ApplyBaseDriverOptions(dbc->conn_attr);
     PreparedConnect prepared;
 
-    // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. Another auth type (a token in PWD, a
-    // secret) gets TLS where psqlODBC would connect without it, which Aurora DSQL refuses, and keeps any other mode.
-    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, ""))
-        != AuthType::DSQL) {
+    // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. With another auth type (a token in PWD,
+    // a secret) a mode psqlODBC runs works today and is left as set. One it would run as disable, which Aurora DSQL
+    // refuses, gets TLS and the database default.
+    const bool other_auth =
+        AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL;
+    if (other_auth && DsqlAuthPlugin::SslModeRunsAsDisable(dbc->conn_attr)) {
         prepared.tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH,
             DsqlAuthPlugin::DefaultRootCert(
                 DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));

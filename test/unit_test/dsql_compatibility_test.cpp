@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -421,34 +422,50 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_Disable_BecomesVerifyFull
     EXPECT_EQ(5, log.Count("[DSQL] Overriding SSLmode="));
 }
 
-// allow, prefer, require and verify-ca connect today, so they stay, psqlODBC's short forms (r, vc) as written. A full
-// name in another case would be disable to psqlODBC, so it is lowercased. libpq rejects sslrootcert=system below
-// verify-full, so only verify-full gets the root certificate. None of them is reported.
+// A mode psqlODBC runs (allow, prefer, require, verify-ca, verify-full, or its short forms r, vc and vf, under either
+// keyword) connects today, maybe with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT),
+// PGAPPNAME or PGDATABASE, which a pqopt or database default would override. It is left exactly as set, pqopt
+// included, and nothing is reported.
 TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
     CapturingLogSink log;
-    for (const auto& [requested, expected] : std::vector<std::pair<std::string, std::string>>{
-             {"allow", "allow"}, {"prefer", "prefer"}, {"require", "require"}, {"verify-ca", "verify-ca"},
-             {"r", "r"}, {"vc", "vc"}, {"Require", "require"}, {"VERIFY-CA", "verify-ca"},}) {
+    for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+             {"SSLMODE", "allow"}, {"SSLMODE", "prefer"}, {"SSLMODE", "require"}, {"SSLMODE", "verify-ca"},
+             {"SSLMODE", "verify-full"}, {"SSLMODE", "r"}, {"SSLMODE", "vc"}, {"SSLMODE", "vf"}, {"CA", "require"},}) {
+        SCOPED_TRACE(testing::Message() << key << "=" << mode);
+        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {key, mode}});
+        std::map<std::string, std::string> expected = dbc_.conn_attr;
+        DsqlCompatibility::ApplyBaseDriverOptions(expected);
+        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ(expected, dbc_.conn_attr);
+        EXPECT_EQ("", prepared.tls_warning);
+    }
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {"SSLMODE", "verify-full"}, {"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}});
+    std::map<std::string, std::string> expected = dbc_.conn_attr;
+    DsqlCompatibility::ApplyBaseDriverOptions(expected);
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ(expected, dbc_.conn_attr);
+    EXPECT_EQ(0, log.Count("Overriding SSLmode"));
+}
+
+// A full mode name in another case is disable to psqlODBC, which reads the first byte case-sensitively. It is
+// lowercased rather than replaced, so nothing is reported, and it gets the defaults of a raised mode. libpq rejects
+// sslrootcert=system below verify-full, so only VERIFY-FULL gets the root certificate.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_ModeNameInAnotherCase_IsLowercased) {
+    const std::string application_name_only = "{application_name=" + APPLICATION_NAME + "}";
+    for (const auto& [requested, expected, pqopt] : std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"Allow", "allow", application_name_only},
+             {"PREFER", "prefer", application_name_only},
+             {"Require", "require", application_name_only},
+             {"VERIFY-CA", "verify-ca", application_name_only},
+             {"VERIFY-FULL", "verify-full", VERIFY_FULL_PQOPT},}) {
         SCOPED_TRACE(requested);
         UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", requested}});
         const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
         EXPECT_EQ(expected, dbc_.conn_attr.at("SSLMODE"));
-        EXPECT_EQ("{application_name=" + APPLICATION_NAME + "}", dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ(pqopt, dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ("postgres", dbc_.conn_attr.at(KEY_DATABASE));
         EXPECT_EQ("", prepared.tls_warning);
     }
-    for (const std::string requested : {"verify-full", "VERIFY-FULL"}) {
-        SCOPED_TRACE(requested);
-        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", requested}});
-        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
-        EXPECT_EQ("verify-full", dbc_.conn_attr.at("SSLMODE"));
-        EXPECT_EQ(VERIFY_FULL_PQOPT, dbc_.conn_attr.at("PQOPT"));
-        EXPECT_EQ("", prepared.tls_warning);
-    }
-    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"CA", "require"}});
-    DsqlCompatibility::PrepareConnect(&dbc_);
-    EXPECT_FALSE(dbc_.conn_attr.contains("CA"));
-    EXPECT_EQ("require", dbc_.conn_attr.at("SSLMODE"));
-    EXPECT_EQ(0, log.Count("Overriding SSLmode"));
 }
 
 // RDS_AUTH_TYPE=DSQL (any case) applied its own, stricter defaults in DsqlAuthPlugin before the chain reached
@@ -481,6 +498,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_DialectWithIp_GetsVerifyFull) {
         {{KEY_SERVER, "10.0.0.1"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {"SSLMODE", "verify-ca"}});
     DsqlCompatibility::PrepareConnect(&dbc_);
     EXPECT_EQ("verify-ca", dbc_.conn_attr.at("SSLMODE"));
+    EXPECT_FALSE(dbc_.conn_attr.contains("PQOPT"));
 }
 
 // Off Aurora DSQL nothing changes: psqlODBC's own TLS default and libpq's database default stay.

@@ -238,6 +238,7 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_Dsql_BaseDriverGetsServerSide
     EXPECT_EQ(SQL_ERROR, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_NE(std::string::npos, captured_conn_str.find("SERVER=" + DSQL_HOST));
     EXPECT_NE(std::string::npos, captured_conn_str.find("USESERVERSIDEPREPARE=0"));
+    EXPECT_NE(std::string::npos, captured_conn_str.find("UPDATABLECURSORS=0"));
 }
 
 TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_OtherDatabase_BaseDriverGetsNoDsqlOptions) {
@@ -246,7 +247,8 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_OtherDatabase_BaseDriverGetsN
     DefaultPlugin plugin(&dbc_);
     EXPECT_EQ(SQL_ERROR, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_NE(std::string::npos, captured_conn_str.find("SERVER=" + AURORA_HOST));
-    for (const char* key : {"PROTOCOL=", "IGNORETIMEOUT=", "USEDECLAREFETCH=", "USESERVERSIDEPREPARE="}) {
+    for (const char* key : {"PROTOCOL=", "IGNORETIMEOUT=", "USEDECLAREFETCH=", "USESERVERSIDEPREPARE=",
+                            "UPDATABLECURSORS="}) {
         EXPECT_EQ(std::string::npos, captured_conn_str.find(key)) << key;
     }
 }
@@ -351,7 +353,8 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_SetEveryOption) {
     std::map<std::string, std::string> conn_attr;
     DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
     const std::map<std::string, std::string> expected = {
-        {"IGNORETIMEOUT", "1"}, {"PROTOCOL", "7.4-0"}, {"USEDECLAREFETCH", "0"}, {"USESERVERSIDEPREPARE", "0"}};
+        {"IGNORETIMEOUT", "1"},   {"PROTOCOL", "7.4-0"},        {"UPDATABLECURSORS", "0"},
+        {"USEDECLAREFETCH", "0"}, {"USESERVERSIDEPREPARE", "0"}};
     EXPECT_EQ(expected, conn_attr);
 }
 
@@ -393,10 +396,29 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_OverrideUserDeclareFetch) {
 // What psqlODBC gets: each option once, under its long keyword, after the CX flags.
 TEST_F(DsqlCompatibilityTest, BaseDriverOptions_BaseDriverStringHasOnlyLongKeysAfterCx) {
     std::map<std::string, std::string> conn_attr = {
-        {"A1", "7.4-2"}, {"D9", "0"}, {"B6", "1"}, {"C8", "1"}, {"CX", "1c2305bab"}};
+        {"A1", "7.4-2"}, {"D9", "0"}, {"B6", "1"}, {"C8", "1"}, {"C4", "1"}, {"CX", "1c2305bab"}};
     DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
-    EXPECT_EQ("CX=1c2305bab;IGNORETIMEOUT=1;PROTOCOL=7.4-0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
+    EXPECT_EQ("CX=1c2305bab;IGNORETIMEOUT=1;PROTOCOL=7.4-0;UPDATABLECURSORS=0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
               ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
+}
+
+// UpdatableCursors=1 is psqlODBC's default; it makes keyset-driven and updatable cursors select ctid.
+TEST_F(DsqlCompatibilityTest, BaseDriverOptions_TurnUpdatableCursorsOff) {
+    CapturingLogSink log;
+    std::map<std::string, std::string> long_form = {{"UPDATABLECURSORS", "1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(long_form);
+    EXPECT_EQ("0", long_form.at("UPDATABLECURSORS"));
+
+    std::map<std::string, std::string> short_form = {{"C4", "1"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(short_form);
+    EXPECT_FALSE(short_form.contains("C4"));
+    EXPECT_EQ("0", short_form.at("UPDATABLECURSORS"));
+    EXPECT_EQ(2, log.Count("[DSQL] Overriding UpdatableCursors=1 with 0: Aurora DSQL doesn't return system columns "
+                           "such as ctid, which psqlODBC's keyset-driven and updatable cursors use"));
+
+    std::map<std::string, std::string> already_off = {{"UPDATABLECURSORS", "0"}};
+    DsqlCompatibility::ApplyBaseDriverOptions(already_off);
+    EXPECT_EQ(0, log.Count("[DSQL] Overriding UpdatableCursors=0"));
 }
 
 TEST_F(DsqlCompatibilityTest, BaseDriverOptions_LogEachOverride) {
@@ -419,6 +441,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_SetsEveryOption) {
     EXPECT_EQ("1", dbc_.conn_attr.at("IGNORETIMEOUT"));
     EXPECT_EQ("0", dbc_.conn_attr.at("USEDECLAREFETCH"));
     EXPECT_EQ("0", dbc_.conn_attr.at("USESERVERSIDEPREPARE"));
+    EXPECT_EQ("0", dbc_.conn_attr.at("UPDATABLECURSORS"));
 }
 
 // A connection string as users write it: psqlODBC's mixed-case keywords and its short forms. The wrapper's parser
@@ -427,7 +450,7 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_ReplaceOptionsAsUsersWriteThem) 
     std::map<std::string, std::string> conn_attr;
     ConnectionStringHelper::ParseConnectionString("UseServerSidePrepare=1;Protocol=7.4;usedeclarefetch=1;D9=0;", conn_attr);
     DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
-    EXPECT_EQ("IGNORETIMEOUT=1;PROTOCOL=7.4-0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
+    EXPECT_EQ("IGNORETIMEOUT=1;PROTOCOL=7.4-0;UPDATABLECURSORS=0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
               ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
 }
 

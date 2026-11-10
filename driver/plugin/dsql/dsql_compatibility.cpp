@@ -81,6 +81,17 @@ namespace {
             .reason = "freeing a prepared statement inside a transaction can silently roll the transaction back on "
                       "Aurora DSQL",
         },
+        // psqlODBC's keyset-driven and updatable cursors add ctid to the select list (and keyset-driven ones refetch
+        // by ctid). Aurora DSQL returns no system columns, so each such SELECT fails, and in a transaction that aborts
+        // it. Off, psqlODBC makes them static and read-only (01S02) and refuses positioned updates.
+        ForcedOption{
+            .name = "UpdatableCursors",
+            .key = "UPDATABLECURSORS",
+            .short_key = "C4",
+            .value = "0",
+            .reason = "Aurora DSQL doesn't return system columns such as ctid, which psqlODBC's keyset-driven and "
+                      "updatable cursors use",
+        },
     };
 
     // Writes the option under its long keyword and removes the short one. The base driver's connection string is

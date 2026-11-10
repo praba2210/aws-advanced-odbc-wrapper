@@ -43,6 +43,8 @@ It is possible to use the AWS Advanced ODBC Wrapper with plain RDS databases, bu
 
 The AWS Advanced ODBC Wrapper is compliant with the Microsoft ODBC 3.8 specification, ensuring compatibility with existing applications. Internally, the ODBC Wrapper will compute any plugin functionality before loading and passing the actual calls to an underlying driver.
 
+**Canceling from another thread.** `SQLCancel` and `SQLCancelHandle` reach a statement that runs on another thread. A free of that statement, a disconnect, or a free of its connection or environment that comes while the underlying driver's cancel is still running doesn't wait for it: the wrapper frees the underlying driver's handles when the cancel returns. Still, wait for `SQLCancel` to return before you free that statement, or disconnect or free its connection or environment: the driver manager reads its own statement after the driver's `SQLCancel` returns.
+
 ## Logging
 
 Logs are generated for the AWS Advanced ODBC Wrapper as well as the underlying driver. Logs for the AWS Advanced ODBC Wrapper are saved in the user's `temp` directory under the folder `aws-odbc-wrapper`. For configuring the underlying ODBC driver, please refer to the individual driver's documentation.

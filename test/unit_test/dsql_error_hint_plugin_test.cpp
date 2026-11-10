@@ -551,3 +551,26 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterASuspend_LogsTheHint)
 
     EXPECT_EQ(1, sink.Count("[DSQL] The connection failed after 61 minutes. " + AGE_HINT));
 }
+
+// A handle whose first connect was Aurora DSQL keeps the hint plugin in its chain. Reconnected to another engine, the
+// age the earlier connect left isn't this connection's, and the 60-minute limit isn't its engine's.
+TEST_F(DsqlErrorHintPluginTest, Execute_ReconnectedToAnotherEngine_LogsNoAgeHint) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
+
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
+    now_ += std::chrono::minutes(61);
+    // The reconnect: RDS_InitializeConnection decides it isn't Aurora DSQL, and DefaultPlugin leaves the age alone.
+    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
+    dbc_->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_->conn_attr);
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const std::optional<std::chrono::steady_clock::duration> age = dbc_->dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value() && age.value() >= DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+
+    EXPECT_EQ(0, sink.Count(AGE_HINT));
+    // No dead check either, so psqlODBC's connection-level record stays.
+    EXPECT_EQ((std::vector<std::string>{"read"}), plugin->calls);
+}

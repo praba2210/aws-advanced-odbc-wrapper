@@ -132,7 +132,12 @@ std::string_view DsqlErrorHintPlugin::GetAdvisoryLockHint(const std::string& sql
 
 void DsqlErrorHintPlugin::LogConnectionAgeHint(DBC* dbc, const std::string& sql_state)
 {
-    const DsqlConnectionLifetime* lifetime = dbc != nullptr ? dbc->dsql_lifetime.get() : nullptr;
+    // Only while the handle is on Aurora DSQL: a reconnect to another engine keeps this plugin, and the age, from the
+    // handle's Aurora DSQL connect.
+    if (dbc == nullptr || !dbc->is_dsql) {
+        return;
+    }
+    const DsqlConnectionLifetime* lifetime = dbc->dsql_lifetime.get();
     const std::optional<std::chrono::steady_clock::duration> age =
         lifetime != nullptr ? lifetime->Age() : std::nullopt;
     if (!age.has_value() || age_hint_logged_) {

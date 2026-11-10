@@ -622,6 +622,8 @@ TEST(DsqlOccRetryStatementTest, TransactionChange_None) {
 // the text. The scan has a budget and gives up with OPENS, the direction that doesn't retry.
 TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_ManySemicolonsWithUnclosedComments_IsLinear) {
     constexpr int REPETITIONS = 20000;
+    // The quadratic version took about 7.8 s in Release and sanitizer builds are much slower, so 1 s still catches it.
+    constexpr auto TIME_LIMIT = std::chrono::seconds(1);
     std::string statement = "x";
     for (int i = 0; i < REPETITIONS; ++i) {
         statement += "; ls /*";
@@ -630,7 +632,7 @@ TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_ManySemicolonsWithU
     const auto change = DsqlOccRetryPlugin::GetTransactionChange(statement);
     const auto elapsed = std::chrono::steady_clock::now() - begin;
     EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::OPENS, change);
-    EXPECT_LT(elapsed, std::chrono::milliseconds(50));
+    EXPECT_LT(elapsed, TIME_LIMIT);
 }
 
 TEST(DsqlOccRetryBackoffTest, DoublesFromTheBaseUpToTheCap) {

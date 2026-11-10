@@ -129,7 +129,8 @@ private:
     // handle, and a connect holds its dbc->lock (RDS_SQLConnect, RDS_SQLDriverConnect), so one thread at a time.
     bool owns_provider_;                       // false: the provider was given to the constructor (tests), and stays
     std::optional<ProviderInputs> built_for_;  // what the provider was built from; nullopt before the first build
-    bool rebuild_provider_ = false;            // set when the last connect found no usable credentials
+    bool rebuild_provider_ = false;            // set when the last connect found no usable credentials, or the
+                                               // server rejected its token
     std::string connect_region_;               // this connect's region, resolved once by Connect
 };
 

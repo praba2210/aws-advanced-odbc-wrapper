@@ -583,6 +583,12 @@ SQLRETURN DsqlAuthPlugin::Connect(
 
 void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message)
 {
+    // The server rejected the token (28000, 28P01, or Aurora DSQL's "access denied", which psqlODBC reports as 08001):
+    // the keys may have been rotated or revoked since the chain read them, and a chain that caches them would keep
+    // failing, so the next connect builds a new one.
+    if (sql_state == "28000" || sql_state == "28P01" || error_message.find("access denied") != std::string::npos) {
+        rebuild_provider_ = true;
+    }
     if (const std::string_view hint = GetRootCertHint(dbc->conn_attr, error_message); !hint.empty()) {
         LOG(WARNING) << hint;
     }

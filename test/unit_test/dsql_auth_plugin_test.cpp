@@ -40,6 +40,7 @@
 #include "scoped_ctype_locale.h"
 #include "scoped_env_vars.h"
 
+#include "../../driver/dialect/dialect_aurora_dsql.h"
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
@@ -1623,6 +1624,37 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionChange_RebuildsTheProvider
     ResetAttributes(dbc_, "p");
     dbc_->conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
     EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
+}
+
+// When the server rejects the token (keys rotated or revoked since the chain read them), the next connect builds the
+// provider again, so one that holds the old keys doesn't keep failing. psqlODBC reports Aurora DSQL's "access denied"
+// as 08001, so that message counts as well as 28000 and 28P01; another error keeps the provider.
+TEST_F(DsqlAuthPluginTest, Connect_AfterTheServerRejectsTheToken_RebuildsTheProvider) {
+    struct BaseError {
+        std::string sql_state;
+        std::string message;
+        bool rebuilt;
+    };
+    for (const BaseError& error : std::vector<BaseError>{
+             {.sql_state = "28P01", .message = "FATAL:  password authentication failed", .rebuilt = true},
+             {.sql_state = "28000", .message = "", .rebuilt = true},
+             {.sql_state = "08001", .message = "FATAL:  unable to accept connection, access denied", .rebuilt = true},
+             {.sql_state = "08001", .message = "could not connect to server: Connection refused", .rebuilt = false},}) {
+        SCOPED_TRACE(error.sql_state + " " + error.message);
+        const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+        const ScopedEnvVars env = OnlyProfileCredentials();
+        SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+        ResetAttributes(dbc_, "p");
+        EXPECT_CALL(*mock_odbc_helper_, GetSqlStateAndLogMessage(testing::An<DBC*>(), testing::_))
+            .WillOnce(testing::DoAll(testing::SetArgReferee<1>(error.message), testing::Return(error.sql_state)));
+        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, nullptr, std::make_shared<DialectAuroraDsql>(), mock_odbc_helper_);
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin, SQL_ERROR), "AKIDPROCESS"));
+
+        credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+        ResetAttributes(dbc_, "p");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), error.rebuilt ? "AKIDSTATIC" : "AKIDPROCESS"));
+        testing::Mock::VerifyAndClearExpectations(mock_odbc_helper_.get());
+    }
 }
 #endif
 

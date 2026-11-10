@@ -822,14 +822,20 @@ TEST_F(DsqlCompatibilityTest, SetAutocommit_Unchanged_DoesNotCommit) {
     EXPECT_EQ(expected, base_calls);
 }
 
-// psqlODBC rejects the value and leaves the mode, so nothing is committed.
+// psqlODBC rejects the value and leaves the mode, so nothing is committed, a transaction opened with BEGIN as SQL text
+// in autocommit mode included. Not a mode, the value is no change from either.
 TEST_F(DsqlCompatibilityTest, SetAutocommit_InvalidValue_DoesNotCommit) {
     UseServer(DSQL_HOST);
     Connect();
-    dbc_.auto_commit = false;
     const SQLULEN not_a_mode = 2;
-    RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(not_a_mode), 0);
-    EXPECT_EQ(std::vector<std::string>{SetConnectAttrCall(SQL_ATTR_AUTOCOMMIT, not_a_mode)}, base_calls);
+    for (const bool auto_commit : {true, false}) {
+        SCOPED_TRACE(auto_commit ? "autocommit on" : "autocommit off");
+        dbc_.auto_commit = auto_commit;
+        dbc_.transaction_status = TRANSACTION_OPEN;
+        base_calls.clear();
+        RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(not_a_mode), 0);
+        EXPECT_EQ(std::vector<std::string>{SetConnectAttrCall(SQL_ATTR_AUTOCOMMIT, not_a_mode)}, base_calls);
+    }
 }
 
 TEST_F(DsqlCompatibilityTest, SetAutocommitOn_OtherDatabase_DoesNotCommit) {

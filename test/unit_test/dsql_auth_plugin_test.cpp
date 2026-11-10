@@ -1795,28 +1795,41 @@ TEST_F(DsqlAuthPluginTest, Connect_RootCertFollowsTheBaseLibpqVersion) {
     }
 }
 
-// Only a regular file that only root can change, found through symbolic links: /etc/passwd and a link to it, not the
-// /etc directory, a file the test made, a link to that one, or a path that doesn't exist.
-TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RootOwnedRegularFilesOnly) {
-    // A link in the temp directory, removed at the end of the scope.
-    struct TempLink {
-        std::filesystem::path path;
-        TempLink(const std::string& target, const std::string& name)
-            : path(std::filesystem::path(::testing::TempDir()) / name) {
+namespace {
+    // A symbolic link to target in the temp directory, under a name no other one has (the process ID and a counter),
+    // removed at the end of the scope.
+    class TempLink {
+    public:
+        explicit TempLink(const std::string& target)
+            : path_(std::filesystem::path(::testing::TempDir())
+                    / ("dsql_test_link_" + std::to_string(getpid()) + "_" + std::to_string(next_id_++))) {
             std::error_code ignored;
-            std::filesystem::remove(path, ignored);
-            std::filesystem::create_symlink(target, path);
+            std::filesystem::remove(path_, ignored);  // left by an earlier process with the same ID
+            std::filesystem::create_symlink(target, path_);
         }
         ~TempLink() {
             std::error_code ignored;
-            std::filesystem::remove(path, ignored);
+            std::filesystem::remove(path_, ignored);
         }
         TempLink(const TempLink&) = delete;
         TempLink& operator=(const TempLink&) = delete;
+
+        [[nodiscard]] const char* Path() const {
+            return path_.c_str();
+        }
+
+    private:
+        static inline unsigned next_id_ = 0;
+        std::filesystem::path path_;
     };
+}  // namespace
+
+// Only a regular file that only root can change, found through symbolic links: /etc/passwd and a link to it, not the
+// /etc directory, a file the test made, a link to that one, or a path that doesn't exist.
+TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RootOwnedRegularFilesOnly) {
     EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile("/etc/passwd"));
-    const TempLink link_to_root_file("/etc/passwd", "dsql_root_owned_file_test_link_passwd");
-    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile(link_to_root_file.path.c_str()));
+    const TempLink link_to_root_file("/etc/passwd");
+    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile(link_to_root_file.Path()));
     EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/etc"));
     EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/nonexistent/dsql-ca-bundle.crt"));
 
@@ -1824,9 +1837,9 @@ TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RootOwnedRegularFilesOnly) {
         GTEST_SKIP() << "files made by root are root-owned";
     }
     const TempConfigFile own_file("x");
-    const TempLink link_to_own_file(own_file.Path(), "dsql_root_owned_file_test_link_own");
+    const TempLink link_to_own_file(own_file.Path());
     EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(own_file.Path().c_str()));
-    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(link_to_own_file.path.c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(link_to_own_file.Path()));
     EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(::testing::TempDir().c_str()));
 }
 #endif

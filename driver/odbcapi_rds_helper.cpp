@@ -473,6 +473,14 @@ SQLRETURN RDS_SQLEndTran(
                 if (!HasWrappedHandle(dbc)) {
                     return SQL_INVALID_HANDLE;
                 }
+                // Aurora DSQL: a COMMIT of a transaction the server ended at a failed statement saves nothing, and
+                // psqlODBC reports it as a success.
+                if (CompletionType == SQL_COMMIT) {
+                    const std::optional<SQLRETURN> rolled_back = DsqlCompatibility::RollBackAbortedTransaction(dbc);
+                    if (rolled_back) {
+                        return *rolled_back;
+                    }
+                }
                 res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
                     HandleType, dbc->wrapped_dbc, CompletionType
                 );
@@ -480,6 +488,7 @@ SQLRETURN RDS_SQLEndTran(
                 if (SQL_SUCCEEDED(ret) && dbc) {
                     dbc->transaction_status = TRANSACTION_CLOSED;
                 }
+                dbc->dsql_statement_failed_in_transaction = false;  // either outcome ends the transaction
             }
             break;
         case SQL_HANDLE_ENV:
@@ -492,28 +501,41 @@ SQLRETURN RDS_SQLEndTran(
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
                 ClearError(env);
 
+                // Each connection's transaction ends, also after one fails; the first error is the result. Only
+                // without a driver manager: they call the connection form for each connection.
                 for (DBC* dbc : env->dbc_list) {
-                    // TODO - May need enhanced error handling due to multiple DBCs
-                    //   Should error out on the first?
                     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
                     ClearError(dbc);
 
                     if (!HasWrappedHandle(dbc)) {
                         return SQL_INVALID_HANDLE;
                     }
-                    res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
-                        SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
-                    );
-                    ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
-                    if (SQL_SUCCEEDED(ret) && dbc) {
-                        dbc->transaction_status = TRANSACTION_CLOSED;
+                    std::optional<SQLRETURN> dbc_ret;
+                    if (CompletionType == SQL_COMMIT) {
+                        dbc_ret = DsqlCompatibility::RollBackAbortedTransaction(dbc);
+                    }
+                    if (!dbc_ret) {
+                        res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader,
+                            RdsFuncNames::EndTran, SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
+                        );
+                        dbc_ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
+                        if (SQL_SUCCEEDED(*dbc_ret)) {
+                            dbc->transaction_status = TRANSACTION_CLOSED;
+                        }
+                    }
+                    dbc->dsql_statement_failed_in_transaction = false;
+                    if (!SQL_SUCCEEDED(*dbc_ret) && SQL_SUCCEEDED(ret)) {
+                        ret = *dbc_ret;
                     }
                 }
 
                 res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
                     HandleType, env->wrapped_env, CompletionType
                 );
-                ret = RDS_ProcessLibRes(HandleType, env, res);
+                const SQLRETURN env_ret = RDS_ProcessLibRes(HandleType, env, res);
+                if (SQL_SUCCEEDED(ret)) {
+                    ret = env_ret;
+                }
             }
             break;
         default:
@@ -1076,6 +1098,10 @@ SQLRETURN RDS_SQLSetConnectAttr(
         // Autocommit set on while already on changes nothing in psqlODBC, so a transaction opened with BEGIN stays open.
         if (!was_auto_commit || !dbc->auto_commit) {
             dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        }
+        // A switch ends the transaction. Only after the base call: a commit before it on Aurora DSQL reads the note.
+        if (SQL_SUCCEEDED(ret) && dbc->auto_commit != was_auto_commit) {
+            dbc->dsql_statement_failed_in_transaction = false;
         }
     }
 

@@ -64,6 +64,16 @@ namespace DsqlCompatibility {
     // SQLGetInfo(SQL_DEFAULT_TXN_ISOLATION or SQL_TXN_ISOLATION_OPTION) on an Aurora DSQL connection whose wrapped
     // handle is allocated: writes SQL_TXN_REPEATABLE_READ and returns true. False for anything else.
     bool TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER value, SQLSMALLINT* length);
+
+    // After SQLExecDirect, SQLExecute or SQLParamData: on an Aurora DSQL connection, notes a call that failed or warned
+    // inside a transaction (DBC::dsql_statement_failed_in_transaction), for RollBackAbortedTransaction.
+    void NoteStatementResult(DBC* dbc, SQLRETURN ret);
+
+    // Before SQLEndTran(SQL_COMMIT) on a connection: when a statement failed in the transaction, checks with SELECT 1
+    // whether Aurora DSQL ended it. 25P02 means it did: rolls it back and returns SQL_ERROR with 25S03 on the
+    // connection. Otherwise std::nullopt, for the commit to go ahead, with a warning when the check itself failed.
+    // Clears the note.
+    std::optional<SQLRETURN> RollBackAbortedTransaction(DBC* dbc);
 }  // namespace DsqlCompatibility
 
 #endif // DSQL_COMPATIBILITY_H_

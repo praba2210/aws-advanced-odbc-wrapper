@@ -205,6 +205,7 @@ SQLRETURN DefaultPlugin::Connect(
         }
     }
     dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+    dbc->dsql_statement_failed_in_transaction = false;  // a new connection has no transaction
 
     // TODO - Error Handling for ConnAttr, IsConnected
     // Successful Connection, but bad environment and/or connection attribute setting
@@ -305,6 +306,8 @@ SQLRETURN DefaultPlugin::Execute(
         res = this->odbc_helper_->ExecDirect(&wrapped_stmt, query);
     }
     stmt->cancel.LeaveBaseDriver();
+    // Aurora DSQL: a statement that failed in a transaction is checked for before the commit.
+    DsqlCompatibility::NoteStatementResult(dbc, res.fn_result);
 
     // Supports checking for transaction changes only if it was a direct execute
     if (SQL_SUCCEEDED(res.fn_result) && !query.empty()) {
@@ -314,6 +317,7 @@ SQLRETURN DefaultPlugin::Execute(
             || SqlQueryAnalyzer::DoesSwitchAutoCommitFalseTrue(dbc, query)
         ) {
             dbc->transaction_status = TRANSACTION_CLOSED;
+            dbc->dsql_statement_failed_in_transaction = false;
         }
 
         if (SqlQueryAnalyzer::IsStatementSettingAutoCommit(query)) {

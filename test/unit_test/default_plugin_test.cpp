@@ -82,6 +82,8 @@ namespace {
     bool unicode_base_driver = false;
     // The base driver is psqlODBC 17.00.0005 or later, which builds only what fits the buffer length (790a1f0).
     bool cuts_to_buffer_length = false;
+    // What each SQLExecDirect returns.
+    SQLRETURN exec_direct_result = SQL_SUCCESS;
     int fake_wrapped_dbc = 0;
 
     SQLRETURN FakeAllocHandle(SQLSMALLINT /*handle_type*/, SQLHANDLE /*input_handle*/, SQLHANDLE* output_handle) {
@@ -138,6 +140,10 @@ namespace {
         return base_call.truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
     }
 
+    SQLRETURN FakeExecDirect(SQLHSTMT /*statement_handle*/, SQLTCHAR* /*statement_text*/, SQLINTEGER /*text_length*/) {
+        return exec_direct_result;
+    }
+
 #ifdef UNICODE
     // A base driver built with a 4-byte SQLWCHAR: its SQLSTATE runs past the first MAX_SQL_STATE_LEN 2-byte
     // characters, which is how DefaultPlugin tells it to connect again with 4-byte text.
@@ -149,8 +155,8 @@ namespace {
     }
 #endif
 
-    // The base driver: answers SQLAllocHandle and SQLDriverConnect (and SQLGetDiagRecW). Nothing is at the path;
-    // RDS_InitializeConnection only compares it with BASE_DRIVER.
+    // The base driver: answers SQLAllocHandle, SQLDriverConnect and SQLExecDirect (and SQLGetDiagRecW). Nothing is at
+    // the path; RDS_InitializeConnection only compares it with BASE_DRIVER.
     class FakeBaseDriver : public RdsLibLoader {
     public:
         FakeBaseDriver() : RdsLibLoader(BASE_DRIVER_PATH) {}
@@ -161,6 +167,9 @@ namespace {
             }
             if (function_name == RdsFuncNames::DriverConnect) {
                 return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeDriverConnect);
+            }
+            if (function_name == RdsFuncNames::ExecDirect) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeExecDirect);
             }
 #ifdef UNICODE
             if (function_name == RdsFuncNames::GetDiagRec) {
@@ -290,6 +299,7 @@ protected:
         during_connect = nullptr;
         unicode_base_driver = false;
         cuts_to_buffer_length = false;
+        exec_direct_result = SQL_SUCCESS;
     }
 
     void TearDown() override {
@@ -710,4 +720,87 @@ TEST_F(DefaultPluginDsqlLifetimeTest, Connect_FailingBeforeTheDecision_IsNotDsql
     EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(&dbc, nullptr, 0, nullptr, 0, nullptr, 0));
     EXPECT_FALSE(dbc.is_dsql);
     EXPECT_EQ(0, connect_calls);
+}
+
+// DefaultPlugin notes an Aurora DSQL statement that failed (or warned) in a transaction, which SQLEndTran(SQL_COMMIT)
+// checks for (DsqlCompatibility::RollBackAbortedTransaction).
+class DefaultPluginDsqlTransactionTest : public DefaultPluginOutputTest {
+protected:
+    std::vector<std::unique_ptr<STMT>> stmts_;
+
+    // A handle connected to the server as RDS_InitializeConnection and a connect leave it, with this autocommit mode.
+    DBC& Connected(const std::string& server, bool auto_commit) {
+        DBC& dbc = NewHandle(server);
+        dbc.is_dsql = DsqlConnectionValidator::IsDsqlTarget({{KEY_SERVER, server}});
+        dbc.wrapped_dbc = static_cast<SQLHDBC>(&fake_wrapped_dbc);
+        dbc.conn_status = CONN_CONNECTED;
+        dbc.auto_commit = auto_commit;
+        dbc.transaction_status = auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        return dbc;
+    }
+
+    // The chain's Execute for a new statement, as RDS_SQLExecDirect calls it.
+    SQLRETURN ExecDirect(DBC& dbc, const std::string& text) {
+        stmts_.push_back(std::make_unique<STMT>());
+        STMT* stmt = stmts_.back().get();
+        stmt->dbc = &dbc;
+        std::vector<SQLTCHAR> statement = AppString(text);
+        return dbc.plugin_head->Execute(stmt, statement.data(), SQL_NTS);
+    }
+};
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorWithAutocommitOff_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// psqlODBC can report the failed rows of a parameter array with SQL_SUCCESS_WITH_INFO.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_WarningWithAutocommitOff_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    exec_direct_result = SQL_SUCCESS_WITH_INFO;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A transaction opened with BEGIN in autocommit mode.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorAfterTextBegin_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, true);
+    dbc.transaction_status = TRANSACTION_OPEN;
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorInAutocommit_LeavesItClear) {
+    DBC& dbc = Connected(DSQL_HOST, true);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_OtherDatabase_LeavesItClear) {
+    DBC& dbc = Connected(OTHER_HOST, false);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A ROLLBACK or COMMIT sent as SQL text ended the transaction.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_TextRollback_ClearsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    dbc.dsql_statement_failed_in_transaction = true;
+    EXPECT_EQ(SQL_SUCCESS, ExecDirect(dbc, "ROLLBACK"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A new connection has no transaction.
+TEST_F(DefaultPluginDsqlTransactionTest, Connect_ClearsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    dbc.dsql_statement_failed_in_transaction = true;
+    dbc.conn_status = CONN_NOT_CONNECTED;
+    dbc.conn_attr = {{KEY_SERVER, DSQL_HOST}};
+    ASSERT_EQ(SQL_SUCCESS, dbc.plugin_head->Connect(&dbc, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
 }

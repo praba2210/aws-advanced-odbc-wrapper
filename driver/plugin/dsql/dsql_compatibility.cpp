@@ -24,11 +24,16 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "../../driver.h"
 #include "../../error.h"
+#include "../../odbcapi.h"
 #include "../../util/dsql_connection_lifetime.h"
 #include "../../util/logger_wrapper.h"
+#include "../../util/odbc_helper.h"
+#include "../../util/plugin_service.h"
+#include "../../util/rds_lib_loader.h"
 
 namespace {
     // A psqlODBC option the wrapper sets on every Aurora DSQL connection. key and short_key are psqlODBC's keywords,
@@ -229,6 +234,22 @@ namespace {
             }
         }
     }
+
+    const std::string TRANSACTION_ROLLED_BACK =
+        "The transaction was rolled back, not committed: a statement in it failed, and Aurora DSQL ends a transaction "
+        "at its first error (it has no savepoints). Roll back after an error, and run the whole transaction again.";
+
+    // What every statement fails with in a transaction the server has ended.
+    constexpr std::string_view IN_FAILED_TRANSACTION = "25P02";
+
+    // The end of the warning when the check can't tell: the commit goes ahead, as psqlODBC would make it.
+    constexpr std::string_view COMMITTING_UNCHECKED =
+        ": committing. If Aurora DSQL ended the transaction, the commit saves nothing.";
+
+    std::string StateForLog(const std::string& state)
+    {
+        return state.empty() ? "no SQLSTATE" : state;
+    }
 }  // namespace
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
@@ -362,4 +383,50 @@ bool DsqlCompatibility::TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER 
         *length = static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER));
     }
     return true;
+}
+
+// SQL_SUCCESS_WITH_INFO too: psqlODBC can report failed rows of a parameter array that way.
+void DsqlCompatibility::NoteStatementResult(DBC* dbc, SQLRETURN ret)
+{
+    if ((ret == SQL_ERROR || ret == SQL_SUCCESS_WITH_INFO) && IsDsql(dbc)
+        && (!dbc->auto_commit || dbc->transaction_status == TRANSACTION_OPEN)) {
+        dbc->dsql_statement_failed_in_transaction = true;
+    }
+}
+
+std::optional<SQLRETURN> DsqlCompatibility::RollBackAbortedTransaction(DBC* dbc)
+{
+    if (!IsDsql(dbc) || !HasWrappedHandle(dbc) || !dbc->dsql_statement_failed_in_transaction.exchange(false)) {
+        return std::nullopt;
+    }
+    const std::shared_ptr<OdbcHelper> helper = dbc->plugin_service->GetOdbcHelper();
+    SQLHSTMT probe = SQL_NULL_HSTMT;
+    if (!SQL_SUCCEEDED(helper->BaseAllocStmt(&dbc->wrapped_dbc, &probe).fn_result) || probe == SQL_NULL_HSTMT) {
+        // psqlODBC reports a failed allocation on the connection.
+        LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit couldn't "
+                     << "allocate a statement (" << StateForLog(helper->GetDbcSqlState(dbc->wrapped_dbc)) << ")"
+                     << COMMITTING_UNCHECKED;
+        return std::nullopt;
+    }
+    // In a transaction Aurora DSQL has ended, every statement fails with 25P02.
+    const bool alive = SQL_SUCCEEDED(helper->ExecDirect(&probe, "SELECT 1").fn_result);
+    const std::string state = alive ? "" : helper->GetStmtSqlState(probe);
+    helper->BaseFreeStmt(&probe);
+    if (alive) {
+        return std::nullopt;
+    }
+    if (state != IN_FAILED_TRANSACTION) {
+        // Any other failure doesn't show that the transaction ended.
+        LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit got "
+                     << StateForLog(state) << ", not " << IN_FAILED_TRANSACTION << COMMITTING_UNCHECKED;
+        return std::nullopt;
+    }
+    // psqlODBC's SQLEndTran rolls back in manual-commit mode and after a BEGIN sent as SQL text, which it marks as a
+    // manual transaction.
+    RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(dbc->env->driver_lib_loader, RdsFuncNames::EndTran,
+        SQL_HANDLE_DBC, dbc->wrapped_dbc, SQL_ROLLBACK);
+    dbc->transaction_status = TRANSACTION_CLOSED;
+    LOG(WARNING) << "[DSQL] " << TRANSACTION_ROLLED_BACK << " (the check before the commit got " << state << ")";
+    dbc->err = std::make_unique<ErrInfo>(TRANSACTION_ROLLED_BACK.c_str(), ERR_TRANSACTION_IS_ROLLED_BACK);  // 25S03
+    return SQL_ERROR;
 }

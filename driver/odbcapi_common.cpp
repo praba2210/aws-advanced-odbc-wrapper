@@ -18,6 +18,7 @@
 #include "error.h"
 #include "odbcapi_rds_helper.h"
 #include "plugin/base_plugin.h"
+#include "plugin/dsql/dsql_compatibility.h"
 #include "util/plugin_service.h"
 #include "util/rds_lib_loader.h"
 
@@ -1295,6 +1296,8 @@ SQLRETURN SQL_API SQLParamData(
 #endif
 
     const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    // Aurora DSQL: as after SQLExecute, a statement that failed in a transaction is checked for before the commit.
+    DsqlCompatibility::NoteStatementResult(stmt->dbc, ret);
     // The last SQLParamData of an SQLExecute or SQLExecDirect ran its statement (or failed to).
     if (stmt->execute_needs_data && ret != SQL_NEED_DATA && ret != SQL_STILL_EXECUTING) {
         stmt->execute_needs_data = false;

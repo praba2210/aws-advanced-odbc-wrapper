@@ -355,6 +355,36 @@ std::string OdbcHelper::GetStmtErrorMessage(SQLHSTMT stmt) {
     return "";
 }
 
+std::string OdbcHelper::GetStmtSqlState(SQLHSTMT stmt) {
+    return GetSqlState(SQL_HANDLE_STMT, stmt);
+}
+
+std::string OdbcHelper::GetDbcSqlState(SQLHDBC dbc) {
+    return GetSqlState(SQL_HANDLE_DBC, dbc);
+}
+
+// Read in the base driver's characters, as DefaultPlugin::Connect reads its state: bytes in the ANSI build; 2 bytes, or
+// 4 for a base driver built with a 4-byte SQLWCHAR, in the Unicode build.
+std::string OdbcHelper::GetSqlState(SQLSMALLINT handle_type, SQLHANDLE handle) const {
+    SQLTCHAR sql_state[MAX_SQL_STATE_LEN * 2] = { 0 };
+    SQLTCHAR message[MAX_MSG_LEN * 2] = { 0 };
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT text_length = 0;
+    const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLGetDiagRec>(lib_loader_,
+        RdsFuncNames::GetDiagRec, handle_type, handle, 1, sql_state, &native_error, message, MAX_MSG_LEN, &text_length);
+    if (!SQL_SUCCEEDED(res.fn_result)) {
+        return "";
+    }
+#if UNICODE
+    if (use_4_bytes_base_driver_) {
+        return Convert4ByteSqlWChar(sql_state, MAX_SQL_STATE_LEN);
+    }
+    return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(sql_state));
+#else
+    return {reinterpret_cast<const char*>(sql_state)};
+#endif
+}
+
 // Convert base driver output to either 2-byte or 4-byte output for the client application
 void OdbcHelper::ConvertDriverOutputToTarget(
     const SQLTCHAR* src,

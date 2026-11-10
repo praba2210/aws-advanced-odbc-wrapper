@@ -103,6 +103,10 @@ public:
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc);
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc, std::string& out_message);
     virtual std::string GetStmtErrorMessage(SQLHSTMT stmt);
+    // The SQLSTATE of the base driver's first diagnostic record on a statement, or on a connection; "" when there is
+    // none.
+    virtual std::string GetStmtSqlState(SQLHSTMT stmt);
+    virtual std::string GetDbcSqlState(SQLHDBC dbc);
 
     void ConvertDriverOutputToTarget(const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;
     void ConvertDriverOutputToTarget(bool wrapper_call, const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;
@@ -139,6 +143,8 @@ public:
     static bool IsStringColAttribute(SQLUSMALLINT field_identifier);
 
 private:
+    [[nodiscard]] std::string GetSqlState(SQLSMALLINT handle_type, SQLHANDLE handle) const;
+
     std::shared_ptr<RdsLibLoader> lib_loader_;
     const ENV *env_ = nullptr;
     bool use_4_bytes_base_driver_ = false;

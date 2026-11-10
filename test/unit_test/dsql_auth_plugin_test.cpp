@@ -1533,12 +1533,18 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvide
 }
 
 // libpq before 16 reads sslrootcert=system as a file named "system" in the working directory, so the plugin adds a
-// system CA bundle there instead (SEC-2).
+// system CA bundle there instead (SEC-2). An unknown version keeps system, and the log says that is only the default:
+// the user's own sslrootcert, or a mode below verify-full, gets none.
 TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq16OrUnknown_IsSystem) {
+    CapturingLogSink sink;
+    nglog::AddLogSink(&sink);
     const auto never_trusted = [](const char*) { return false; };
     EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(160000, never_trusted));
     EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(180001, never_trusted));
     EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(std::nullopt, never_trusted));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(1, sink.Count("[DSQL] The base driver's libpq version is unknown; the sslrootcert default is system."));
+    EXPECT_EQ(1, sink.Count("libpq version"));
 }
 
 TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq15_UsesTheFirstTrustedBundle) {

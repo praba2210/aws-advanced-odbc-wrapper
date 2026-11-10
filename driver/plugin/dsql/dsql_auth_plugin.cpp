@@ -309,9 +309,9 @@ namespace {
         return "{" + merged + "}";
     }
 
-    // What pqopt gives for sslrootcert: the default the plugin adds ("system" or a system CA bundle), a value of the
-    // user's, or none.
-    enum class RootCertSource : std::uint8_t { NONE, DEFAULT, BUNDLE, USER };
+    // What pqopt gives for sslrootcert: system or a system CA bundle (the defaults the plugin adds, though a user can set
+    // them too), another value of the user's, or none.
+    enum class RootCertSource : std::uint8_t { NONE, SYSTEM, BUNDLE, USER };
 
     RootCertSource ClassifyRootCert(const std::string& pqopt)
     {
@@ -321,7 +321,7 @@ namespace {
             return RootCertSource::NONE;
         }
         if (it->second == SYSTEM_ROOT_CERT) {
-            return RootCertSource::DEFAULT;
+            return RootCertSource::SYSTEM;
         }
         const bool is_bundle = std::ranges::any_of(SYSTEM_CA_BUNDLES,
             [&it](const char* bundle) { return it->second == bundle; });
@@ -573,7 +573,7 @@ std::string DsqlAuthPlugin::DefaultRootCert(const std::optional<int> libpq_versi
                                             const std::function<bool(const char*)>& is_trusted_file)
 {
     if (!libpq_version) {
-        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; sslrootcert=system is used.";
+        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; the sslrootcert default is system.";
         return SYSTEM_ROOT_CERT;
     }
     if (*libpq_version >= LIBPQ_16) {
@@ -666,7 +666,7 @@ std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std
         return "";
     }
     switch (ClassifyRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
-    case RootCertSource::DEFAULT:
+    case RootCertSource::SYSTEM:
         return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
                "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
                "AmazonRootCA1.pem>} instead.";

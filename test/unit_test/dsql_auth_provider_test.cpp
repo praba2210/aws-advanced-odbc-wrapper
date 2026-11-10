@@ -28,14 +28,16 @@
 #include <aws/core/utils/DateTime.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <typeinfo>
+#include <vector>
 
 #include "auth_mock_objects.h"
 #include "scoped_ctype_locale.h"
@@ -441,8 +443,9 @@ TEST_F(DsqlAuthProviderTest, CheckedCredentials_AreUsedByOneToken) {
     EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDKEYB"));
 }
 
-// The client signs only while a token is being made: an expired source after a signed token yields no token.
-TEST_F(DsqlAuthProviderTest, Snapshot_IsClearedAfterSigning) {
+// Each token reads its own credentials: once the source's have expired, the next token isn't signed, though the one
+// before it was, with credentials that were valid then.
+TEST_F(DsqlAuthProviderTest, GetToken_SourceExpiredAfterAToken_ReturnsEmpty) {
     const Aws::Auth::AWSCredentials expired("AKIDGONE", SECRET_KEY, "", Aws::Utils::DateTime::Now() - std::chrono::hours(1));
     const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
         Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), expired,});
@@ -450,3 +453,30 @@ TEST_F(DsqlAuthProviderTest, Snapshot_IsClearedAfterSigning) {
     ASSERT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
     EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);
 }
+
+#ifndef _WIN32
+// A credential_process without Expiration runs on every read of its provider (the CRT's "never expires" reads as
+// already expired), so each extra read is an extra run. Building the provider runs it no times, and a connect, the
+// check and then the token, runs it once.
+TEST_F(DsqlAuthProviderTest, CredentialProcess_RunsOncePerConnect) {
+    const TempConfigFile runs("");
+    const TempConfigFile credentials("[cp]\ncredential_process = echo run >> " + runs.Path()
+        + " && echo '{\"Version\": 1, \"AccessKeyId\": \"AKIDPROCESS\", \"SecretAccessKey\": \"" + SECRET_KEY
+        + "\"}'\n");
+    const ScopedEnvVars env = ProfileFilesAndEnvironmentKeys();
+    const ScopedEnvVars credentials_file("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+    const auto run_count = [&runs] {
+        std::ifstream log(runs.Path());
+        return std::count(std::istreambuf_iterator<char>(log), std::istreambuf_iterator<char>(), '\n');
+    };
+
+    DsqlAuthProvider provider(REGION, "cp", DsqlAuthProvider::ProfileSource::KEY);
+    EXPECT_EQ(0, run_count());
+    for (const int connect : {1, 2}) {
+        ASSERT_TRUE(provider.HasResolvedCredentials()) << connect;
+        EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first,
+                              "AKIDPROCESS")) << connect;
+        EXPECT_EQ(connect, run_count());
+    }
+}
+#endif

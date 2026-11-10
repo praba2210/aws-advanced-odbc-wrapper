@@ -169,14 +169,20 @@ public:
     MOCK_METHOD(Aws::Auth::AWSCredentials, GetAwsCredentials, (bool allow_interactive, std::string& out_error), (override));
 };
 
-// A credentials source that answers from a fixed list (the last one repeats) and counts the reads.
+// A credentials source that answers from a fixed list (the last one repeats) and counts the reads. The list can't be
+// empty.
 class CountingCredentialsProvider : public Aws::Auth::AWSCredentialsProvider {
 public:
     explicit CountingCredentialsProvider(std::vector<Aws::Auth::AWSCredentials> answers)
-        : answers_(std::move(answers)) {}
+        : answers_(std::move(answers)) {
+        EXPECT_FALSE(answers_.empty()) << "CountingCredentialsProvider needs at least one answer";
+    }
 
     Aws::Auth::AWSCredentials GetAWSCredentials() override {
         const int index = reads_++;
+        if (answers_.empty()) {
+            return {};
+        }
         return answers_[std::min<std::size_t>(static_cast<std::size_t>(index), answers_.size() - 1)];
     }
     [[nodiscard]] int Reads() const { return reads_; }

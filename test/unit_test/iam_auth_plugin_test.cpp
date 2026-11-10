@@ -314,4 +314,6 @@ TEST_F(IamAuthPluginTest, Connect_CacheHit_AccessError_EmptyFreshToken_Fails) {
     EXPECT_EQ(dbc_->err->native_err, ERR_INVALID_AUTHORIZATION_SPECIFICATION);
     EXPECT_EQ("Failed to generate IAM authentication token. See the driver log for the cause.",
         dbc_->err->error_msg);
+    // The rejected cached token stays in conn_attr when no fresh one replaces it.
+    EXPECT_EQ("cached_token", dbc_->conn_attr.at(KEY_DB_PASSWORD));
 }

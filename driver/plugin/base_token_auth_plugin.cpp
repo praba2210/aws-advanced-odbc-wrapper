@@ -178,15 +178,16 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
         return ret;
     }
 
-    // The first token and its copy in conn_attr are wiped before the new one replaces them.
+    // The first token is wiped before the new one replaces it.
     SecureWipeString(token.first);
-    if (const auto password = dbc->conn_attr.find(KEY_DB_PASSWORD); password != dbc->conn_attr.end()) {
-        SecureWipeString(password->second);
-    }
     token = auth_provider_->GetToken(
         iam_host, region, port, username, false, extra_url_encode, token_expiration);
     if (token.first.empty()) {
         return FailTokenGeneration(dbc, plugin_name_);
+    }
+    // The conn_attr copy is wiped just before the new token replaces it.
+    if (const auto password = dbc->conn_attr.find(KEY_DB_PASSWORD); password != dbc->conn_attr.end()) {
+        SecureWipeString(password->second);
     }
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
     ret = ConnectNext(

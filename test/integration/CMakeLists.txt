@@ -22,6 +22,7 @@ set(BUILD_UNICODE OFF CACHE BOOL "Toggle to build with Unicode tests, else Ansi"
 set(BUILD_FAILOVER OFF CACHE BOOL "Toggle to build Failover Tests")
 set(BUILD_LIMITLESS OFF CACHE BOOL "Toggle to build Limitless Tests")
 set(BUILD_BLUE_GREEN OFF CACHE BOOL "Toggle to build Blue Green Tests")
+set(BUILD_DSQL OFF CACHE BOOL "Toggle to build Aurora DSQL Tests")
 set(USE_ASAN OFF CACHE BOOL "Toggle to use Address Sanitizer")
 
 # Sources ----------------------------------------------------------------------------------------------------
@@ -62,6 +63,13 @@ elseif(BUILD_BLUE_GREEN)
     set(TEST_SUITE
         ${CMAKE_CURRENT_SOURCE_DIR}/base_failover_integration_test.h
         ${CMAKE_CURRENT_SOURCE_DIR}/blue_green_integration_test.cpp
+    )
+elseif(BUILD_DSQL)
+    # No AWS SDK: the wrapper signs the token. The cases skip unless TEST_DSQL_ENDPOINT is set at run time.
+    set(TEST_SUITE
+        ${CMAKE_CURRENT_SOURCE_DIR}/aurora_dsql_test_helper.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/aurora_dsql_integration_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/aurora_dsql_pool_integration_test.cpp
     )
 endif()
 
@@ -180,6 +188,7 @@ set(THREADING "0")
 # -D MYSQL_DRIVER_PATH
 # -D MYSQL_SERVER
 # -D MYSQL_DATABASE
+# -D TEST_DSQL_ENDPOINT (BUILD_DSQL: the endpoint of the two inte-dsql DSNs)
 
 # SSLCA (RDS CA bundle) gives verified TLS so RDS IAM tokens are sent encrypted. Only added when provided.
 # -D BASE_DRIVER_SSL_CA=/path/to/rds-global-bundle.pem
@@ -196,5 +205,11 @@ configure_file(
 configure_file(
     ${ODBC_PATH}/odbc.ini.in
     ${ODBC_PATH}/odbc.ini
+    @ONLY
+)
+# A driver-manager-pooled driver for the Aurora DSQL pool cases: run them with ODBCSYSINI=<build>/dsql-pool.
+configure_file(
+    ${ODBC_PATH}/odbcinst-dsql-pool.ini.in
+    ${CMAKE_CURRENT_BINARY_DIR}/dsql-pool/odbcinst.ini
     @ONLY
 )

@@ -1,0 +1,9 @@
+[ODBC]
+Pooling = Yes
+
+[ODBC Drivers]
+AWS DSQL Pooled = Installed
+
+[AWS DSQL Pooled]
+Driver = @TEST_DRIVER_PATH@
+CPTimeout = 600

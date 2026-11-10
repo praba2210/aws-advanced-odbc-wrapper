@@ -618,6 +618,21 @@ TEST(DsqlOccRetryStatementTest, TransactionChange_None) {
     }
 }
 
+// Each ';' is followed by "/*" within five words and the comment never closes, so every start would scan to the end of
+// the text. The scan has a budget and gives up with OPENS, the direction that doesn't retry.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_ManySemicolonsWithUnclosedComments_IsLinear) {
+    constexpr int REPETITIONS = 20000;
+    std::string statement = "x";
+    for (int i = 0; i < REPETITIONS; ++i) {
+        statement += "; ls /*";
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const auto change = DsqlOccRetryPlugin::GetTransactionChange(statement);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::OPENS, change);
+    EXPECT_LT(elapsed, std::chrono::milliseconds(50));
+}
+
 TEST(DsqlOccRetryBackoffTest, DoublesFromTheBaseUpToTheCap) {
     const OccRetryConfig config;
     const std::vector<int64_t> expected = {100, 200, 400, 800, 1600, 3200, 5000, 5000};

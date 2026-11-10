@@ -43,6 +43,8 @@ namespace {
 
     // The most words a transaction-control statement has: COMMIT TRANSACTION AND NO CHAIN.
     constexpr size_t MAX_CONTROL_WORDS = 5;
+    // How many times the text size GetTransactionChange may read across all of its starts.
+    constexpr size_t SCAN_BUDGET_FACTOR = 4;
 
     // What may follow the last statement of a text.
     constexpr std::string_view TRAILING_CHARACTERS = " \t\n\v\f\r;";
@@ -380,10 +382,17 @@ DsqlOccRetryPlugin::TransactionChange DsqlOccRetryPlugin::GetTransactionChange(c
 {
     // Every statement of a batch starts at the beginning of the text or right after a ';'. Looking after every ';',
     // even one inside a literal or a comment, sees every real statement; the extra places can only find a transaction
-    // that isn't there.
+    // that isn't there. A comment that never closes makes each read run to the end of the text, so the characters
+    // read across all starts are budgeted; past it the answer is OPENS, the direction that doesn't retry.
+    const size_t budget = SCAN_BUDGET_FACTOR * statement.size();
+    size_t scanned = 0;
     for (size_t start = 0; start != std::string::npos;) {
         size_t end = 0;
         if (OpensTransaction(ReadWords(statement, start, end))) {
+            return TransactionChange::OPENS;
+        }
+        scanned += end - start;
+        if (scanned > budget) {
             return TransactionChange::OPENS;
         }
         const size_t semicolon = statement.find(';', start);

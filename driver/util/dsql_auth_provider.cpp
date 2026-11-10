@@ -178,12 +178,14 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     const Aws::String aws_host(host.data(), host.size());
     const Aws::String aws_region(region.data(), region.size());
     // The presigner reads its provider, so give it the credentials checked above and take them back after.
-    const std::lock_guard sign_lock(sign_mutex_);
+    std::unique_lock sign_lock(sign_mutex_);
     signing_->Set(credentials);
     auto outcome = is_admin
         ? dsql_client_->GenerateDBConnectAdminAuthToken(aws_host, aws_region, lifetime.count())
         : dsql_client_->GenerateDBConnectAuthToken(aws_host, aws_region, lifetime.count());
     signing_->Set(Aws::Auth::AWSCredentials{});
+    // Nothing is logged under the lock: ng-log takes its own mutex, and a log sink may take another under that one.
+    sign_lock.unlock();
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};

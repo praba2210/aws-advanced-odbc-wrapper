@@ -18,6 +18,7 @@
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/auth/CrtCredentialsProvider.h>
 #include <aws/core/auth/GeneralHTTPCredentialsProvider.h>
 #include <aws/core/auth/LoginCredentialsProvider.h>
 #include <aws/core/auth/ProfileCredentialsProvider.h>
@@ -35,6 +36,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <typeinfo>
 
 #include "scoped_ctype_locale.h"
 #include "scoped_env_vars.h"
@@ -58,18 +60,20 @@ namespace {
     // Profiles come only from the fixture files (or the config file a test writes), the environment has keys, which
     // the default chain answers with first, and no container, EKS web identity or IMDS source.
     ScopedEnvVars ProfileFilesAndEnvironmentKeys(const std::string& config_file = RESOURCES_DIR + "/aws_config") {
-        return ScopedEnvVars({{"AWS_CONFIG_FILE", config_file},
-                              {"AWS_SHARED_CREDENTIALS_FILE", RESOURCES_DIR + "/aws_credentials"},
-                              {"AWS_PROFILE", std::nullopt},
-                              {"AWS_DEFAULT_PROFILE", std::nullopt},
-                              {"AWS_ACCESS_KEY_ID", ENV_ACCESS_KEY},
-                              {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
-                              {"AWS_SESSION_TOKEN", std::nullopt},
-                              {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", std::nullopt},
-                              {"AWS_CONTAINER_CREDENTIALS_FULL_URI", std::nullopt},
-                              {"AWS_ROLE_ARN", std::nullopt},
-                              {"AWS_WEB_IDENTITY_TOKEN_FILE", std::nullopt},
-                              {"AWS_EC2_METADATA_DISABLED", "true"}});
+        return ScopedEnvVars({
+            {"AWS_CONFIG_FILE", config_file},
+            {"AWS_SHARED_CREDENTIALS_FILE", RESOURCES_DIR + "/aws_credentials"},
+            {"AWS_PROFILE", std::nullopt},
+            {"AWS_DEFAULT_PROFILE", std::nullopt},
+            {"AWS_ACCESS_KEY_ID", ENV_ACCESS_KEY},
+            {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
+            {"AWS_SESSION_TOKEN", std::nullopt},
+            {"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", std::nullopt},
+            {"AWS_CONTAINER_CREDENTIALS_FULL_URI", std::nullopt},
+            {"AWS_ROLE_ARN", std::nullopt},
+            {"AWS_WEB_IDENTITY_TOKEN_FILE", std::nullopt},
+            {"AWS_EC2_METADATA_DISABLED", "true"},
+        });
     }
 
     // An AWS config file with the given text in the temp directory, removed at the end of the scope.
@@ -101,6 +105,15 @@ namespace {
     bool HasProvider(const Aws::Auth::AWSCredentialsProviderChain& chain) {
         return std::ranges::any_of(chain.GetProviders(), [](const auto& provider) {
             return dynamic_cast<const T*>(provider.get()) != nullptr;
+        });
+    }
+
+    // Whether the chain has a provider of exactly type T, not of a subclass.
+    template <typename T>
+    bool HasExactProvider(const Aws::Auth::AWSCredentialsProviderChain& chain) {
+        return std::ranges::any_of(chain.GetProviders(), [](const auto& provider) {
+            const Aws::Auth::AWSCredentialsProvider& object = *provider;
+            return typeid(object) == typeid(T);
         });
     }
 
@@ -268,8 +281,7 @@ TEST_F(DsqlAuthProviderTest, ProfileKey_MissingProfile_ResolvesNothing) {
 
 // The key's chain has only the profile's own sources: no environment keys, no EKS (IRSA) web identity from the
 // environment, no container endpoint and no instance role, though the environment names them. sso_p has no
-// login_session, so there is no login provider either: the SDK's would read the session of [default] (or of the
-// profile the AWS_PROFILE variable names).
+// login_session, so there is no login provider either, though [default] has one.
 TEST_F(DsqlAuthProviderTest, ProfileKey_ChainHasOnlyProfileProviders) {
     const TempConfigFile config(
         "[profile sso_p]\nsso_session = s\nsso_account_id = 111122223333\nsso_role_name = ReadOnly\n\n"
@@ -279,7 +291,8 @@ TEST_F(DsqlAuthProviderTest, ProfileKey_ChainHasOnlyProfileProviders) {
     const ScopedEnvVars irsa_and_container({
         {"AWS_ROLE_ARN", "arn:aws:iam::111122223333:role/pod-role"},
         {"AWS_WEB_IDENTITY_TOKEN_FILE", "no_such_web_identity_token"},
-        {"AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://127.0.0.1:1/credentials"}});
+        {"AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://127.0.0.1:1/credentials"},
+    });
 
     const std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> chain =
         DsqlAuthProvider::MakeProfileOnlyChain("sso_p", REGION);
@@ -291,6 +304,7 @@ TEST_F(DsqlAuthProviderTest, ProfileKey_ChainHasOnlyProfileProviders) {
     EXPECT_FALSE(HasProvider<Aws::Auth::InstanceProfileCredentialsProvider>(*chain));
     EXPECT_FALSE(HasProvider<Aws::Auth::GeneralHTTPCredentialsProvider>(*chain));
     EXPECT_FALSE(HasProvider<Aws::Auth::LoginCredentialsProvider>(*chain));
+    EXPECT_EQ(2U, chain->GetProviders().size());  // profile and SSO
 }
 
 // role_arn with web_identity_token_file and no source_profile or credential_source: the CRT profile provider can't
@@ -307,7 +321,9 @@ TEST_F(DsqlAuthProviderTest, ProfileKey_WebIdentityProfile_GetsItsOwnProvider) {
     EXPECT_FALSE(HasProvider<Aws::Auth::EnvironmentAWSCredentialsProvider>(*chain));
 }
 
-// An `aws login` profile (login_session) gets the login provider.
+// An `aws login` profile (login_session) gets a login provider, built from the CRT's for that profile, though there is
+// no [default]. Not the SDK's LoginCredentialsProvider: it lets the CRT read the AWS_PROFILE variable's profile or
+// [default] instead.
 TEST_F(DsqlAuthProviderTest, ProfileKey_LoginProfile_GetsTheLoginProvider) {
     const TempConfigFile config("[profile login_p]\nlogin_session = arn:aws:iam::111122223333:user/dev\n"
                                 "region = us-west-2\n");
@@ -316,8 +332,35 @@ TEST_F(DsqlAuthProviderTest, ProfileKey_LoginProfile_GetsTheLoginProvider) {
     const std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> chain =
         DsqlAuthProvider::MakeProfileOnlyChain("login_p", REGION);
     ASSERT_NE(nullptr, chain);
-    EXPECT_TRUE(HasProvider<Aws::Auth::LoginCredentialsProvider>(*chain));
+    EXPECT_TRUE(HasExactProvider<Aws::Auth::CrtCredentialsProvider>(*chain));
+    EXPECT_FALSE(HasProvider<Aws::Auth::LoginCredentialsProvider>(*chain));
     EXPECT_FALSE(HasProvider<Aws::Auth::EnvironmentAWSCredentialsProvider>(*chain));
+}
+
+// The CRT login provider reads the key's profile (the one it also takes endpoint settings from): that profile's
+// session counts though [default] is missing, and a profile without one gets nothing, though [default] or the
+// AWS_PROFILE variable's profile has one. The CRT rejects a profile without a session when it builds the provider, so
+// a null provider shows which profile it read. Nothing is signed in: building the provider doesn't connect.
+TEST_F(DsqlAuthProviderTest, LoginCrtProvider_ReadsOnlyTheKeyProfile) {
+    {
+        const TempConfigFile config("[profile login_p]\nlogin_session = arn:aws:iam::111122223333:user/login_p\n"
+                                    "region = us-west-2\n");
+        const ScopedEnvVars env = ProfileFilesAndEnvironmentKeys(config.Path());
+        EXPECT_NE(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("login_p", REGION));
+    }
+    const TempConfigFile config("[default]\nlogin_session = arn:aws:iam::111122223333:user/default\n"
+                                "region = us-east-1\n\n"
+                                "[profile env_p]\nlogin_session = arn:aws:iam::111122223333:user/env_p\n"
+                                "region = us-east-1\n\n"
+                                "[profile plain]\nregion = us-east-1\n");
+    const ScopedEnvVars env = ProfileFilesAndEnvironmentKeys(config.Path());
+    EXPECT_NE(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("default", REGION));
+    EXPECT_EQ(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("plain", REGION));
+    const ScopedEnvVars env_profile("AWS_PROFILE", "env_p");
+    EXPECT_NE(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("env_p", REGION));
+    EXPECT_EQ(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("plain", REGION));
+    EXPECT_EQ(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("no_such_profile", REGION));
+    EXPECT_EQ(nullptr, DsqlAuthProvider::MakeLoginCrtProvider("", REGION));
 }
 
 // With only the AWS_PROFILE variable (the plugin passes "" or the trimmed name) the SDK's default chain runs, as

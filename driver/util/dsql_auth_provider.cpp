@@ -16,18 +16,27 @@
 
 #include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
+#include <aws/auth/credentials.h>
+#include <aws/common/byte_buf.h>
+#include <aws/core/Globals.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
-#include <aws/core/auth/LoginCredentialsProvider.h>
+#include <aws/core/auth/CrtCredentialsProvider.h>
 #include <aws/core/auth/ProfileCredentialsProvider.h>
 #include <aws/core/auth/SSOCredentialsProvider.h>
 #include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/client/GenericClientConfiguration.h>
+#include <aws/core/client/UserAgent.h>
 #include <aws/core/config/AWSConfigFileProfileConfigLoader.h>
+#include <aws/crt/Allocator.h>
+#include <aws/crt/auth/Credentials.h>
+#include <aws/crt/io/Bootstrap.h>
+#include <aws/crt/io/TlsOptions.h>
 #include <aws/dsql/DSQLClient.h>
 
 #include "aws_sdk_helper.h"
@@ -203,19 +212,16 @@ std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakePr
             break;
         }
     }
-    // The SDK's login provider doesn't pass the profile on: the CRT reads login_session from the profile the
-    // AWS_PROFILE variable names, or [default]. So it gets this profile's session, from the config file where
-    // `aws login` writes it, and is left out when the profile has none. Its region, which also names the sign-in
-    // endpoint, is the profile's (the CRT's own choice when none is passed), else the DSQL region.
+    // `aws login`. The SDK's LoginCredentialsProvider doesn't pass the profile on, so the CRT would read the session
+    // and endpoint settings of the profile the AWS_PROFILE variable names, or of [default]. The CRT provider is built
+    // here for this profile instead, and wrapped as the SDK wraps its own.
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> login;
-    if (const std::optional<Aws::Config::Profile> p = FindProfile(profile, true);
-        p && !p->GetValue("login_session").empty()) {
-        Aws::Client::ClientConfiguration::CredentialProviderConfiguration login_config = config;
-        login_config.loginCredentialProviderConfig.loginSession = p->GetValue("login_session");
-        if (!p->GetRegion().empty()) {
-            login_config.region = p->GetRegion();
-        }
-        login = std::make_shared<Aws::Auth::LoginCredentialsProvider>(login_config);
+    if (std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> login_crt = MakeLoginCrtProvider(profile, region)) {
+        // The SDK calls the factory once, in the constructor.
+        login = std::make_shared<Aws::Auth::CrtCredentialsProvider>(
+            [crt = std::move(login_crt)]() mutable { return std::move(crt); },
+            config.loginCredentialProviderConfig.retrieveCredentialsFutureTimeout,
+            Aws::Client::UserAgentFeature::CREDENTIALS_LOGIN, "LoginCredentialsProvider");
     }
     return std::make_shared<ProfileOnlyChain>(std::vector<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>>{
         // Access keys, role_arn with source_profile or credential_source (Ec2InstanceMetadata, EcsContainer,
@@ -225,6 +231,35 @@ std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakePr
         std::make_shared<Aws::Auth::SSOCredentialsProvider>(config.profile),
         login,
     });
+}
+
+std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLoginCrtProvider(
+    const std::string& profile, const std::string& region)
+{
+    const Aws::Crt::Io::ClientBootstrap* bootstrap = Aws::GetDefaultClientBootstrap();
+    const Aws::Crt::Io::TlsConnectionOptions* tls = Aws::GetDefaultTlsConnectionOptions();
+    // With no profile name the CRT would pick one itself.
+    if (profile.empty() || bootstrap == nullptr || tls == nullptr || tls->GetUnderlyingHandle() == nullptr) {
+        return nullptr;
+    }
+    // The CRT builds the sign-in endpoint from the region it is given, so one is always given: the profile's, which
+    // the CRT would pick, else the DSQL region.
+    const std::optional<Aws::Config::Profile> config_profile = FindProfile(profile, true);
+    const std::string login_region = config_profile && !config_profile->GetRegion().empty()
+        ? std::string(config_profile->GetRegion().data(), config_profile->GetRegion().size())
+        : region;
+    // The CRT copies these strings while it builds the provider. The login session comes from the profile.
+    aws_credentials_provider_login_options options{};
+    options.profile_name_override = aws_byte_cursor_from_array(profile.data(), profile.size());
+    options.login_region = aws_byte_cursor_from_array(login_region.data(), login_region.size());
+    options.bootstrap = bootstrap->GetUnderlyingHandle();
+    options.tls_ctx = tls->GetUnderlyingHandle()->ctx;
+    aws_credentials_provider* const provider = aws_credentials_provider_new_login(Aws::Crt::ApiAllocator(), &options);
+    if (provider == nullptr) {
+        return nullptr;
+    }
+    // Takes the reference and releases it when destroyed.
+    return std::make_shared<Aws::Crt::Auth::CredentialsProvider>(provider, Aws::Crt::ApiAllocator());
 }
 
 bool DsqlAuthProvider::HasResolvedCredentials() const

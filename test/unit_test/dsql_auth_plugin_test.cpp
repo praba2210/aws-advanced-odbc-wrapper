@@ -1157,14 +1157,16 @@ TEST_F(DsqlAuthPluginTest, Connect_PaddedProfile_SignsWithThatProfile) {
 // though the environment has keys.
 TEST_F(DsqlAuthPluginTest, Connect_MissingProfileKey_FailsWithItsName) {
     const ScopedEnvVars env = OnlyProfileCredentials();
-    const ScopedEnvVars env_keys({{"AWS_ACCESS_KEY_ID", "AKIDENVEXAMPLE"},
-                                  {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"}});
+    const ScopedEnvVars env_keys({
+        {"AWS_ACCESS_KEY_ID", "AKIDENVEXAMPLE"},
+        {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
+    });
     dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "no_such_profile");
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .Times(testing::Exactly(0));
 
     DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
-    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ("28000", dbc_->err->sqlstate);
     EXPECT_EQ("Unable to resolve AWS credentials for DSQL authentication: the 'AWS_PROFILE' profile 'no_such_profile' "

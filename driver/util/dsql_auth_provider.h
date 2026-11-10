@@ -32,6 +32,9 @@ namespace Aws {
     namespace Client {
         struct GenericClientConfiguration;
     }
+    namespace Crt::Auth {
+        class ICredentialsProvider;
+    }
     namespace DSQL {
         class DSQLClient;
     }
@@ -68,6 +71,10 @@ public:
     // The credentials source for the AWS_PROFILE key. Public for tests.
     static std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> MakeProfileOnlyChain(const std::string& profile,
                                                                                       const std::string& region);
+    // The CRT's `aws login` provider for the profile, which reads that profile's login_session and endpoint settings.
+    // Null when the config file has no such profile or it has no login_session. Public for tests.
+    static std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> MakeLoginCrtProvider(const std::string& profile,
+                                                                                    const std::string& region);
 
 private:
     void SetUpDsqlClient(const std::string &region);

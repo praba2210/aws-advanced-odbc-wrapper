@@ -881,18 +881,22 @@ TEST_F(DescriptorTest, Disconnect_ADescriptorNeverAttachedIsFreedFirstToo) {
 // No driver manager frees the descriptor after the disconnect: the DESC is still the app's, and its free makes no
 // base call.
 TEST_F(DescriptorTest, Disconnect_ThenTheAppFreesTheDescriptor_NoBaseCall) {
-    desc_base_driver->free_descs_on_disconnect = true;
-    DBC* dbc = Connect(&base_dbc_);
-    SQLHDESC desc = AllocDesc(dbc);
-    dbc->plugin_head = nullptr;
-    EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
-    const int frees = desc_base_driver->desc_frees;
+    for (const bool free_descs_on_disconnect : {true, false}) {
+        SCOPED_TRACE(free_descs_on_disconnect ? "psqlODBC 16" : "psqlODBC 18");
+        desc_base_driver = std::make_unique<FakeDescBaseDriver>();
+        desc_base_driver->free_descs_on_disconnect = free_descs_on_disconnect;
+        DBC* dbc = Connect(&base_dbc_);
+        SQLHDESC desc = AllocDesc(dbc);
+        dbc->plugin_head = nullptr;
+        EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
+        const int frees = desc_base_driver->desc_frees;
 
-    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, desc));
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, desc));
 
-    EXPECT_EQ(frees, desc_base_driver->desc_frees);
-    EXPECT_EQ(0, desc_base_driver->dead_desc_frees);
-    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc));
+        EXPECT_EQ(frees, desc_base_driver->desc_frees);
+        EXPECT_EQ(0, desc_base_driver->dead_desc_frees);
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc));
+    }
 }
 
 // After a reconnect on the same handle the descriptor gets a base descriptor again when a statement uses it.

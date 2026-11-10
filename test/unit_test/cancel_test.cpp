@@ -1378,15 +1378,16 @@ TEST_F(CancelTest, Cancel_BlockedInTheBaseDriverOutlivesTheFreedEnvironment) {
         std::future<SQLRETURN> cancel = BlockedCancel(stmt);
         const bool inside = WaitUntilTheCancelIsInside();
 
+        // SCOPED_TRACE doesn't reach another thread: these checks name the sequence themselves.
         std::future<void> freeing = std::async(std::launch::async, [env, dbc, stmt, sequence] {
             if (sequence.free_the_statement) {
-                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt));
+                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt)) << sequence.name;
             }
             if (sequence.disconnect_and_free_the_connection) {
-                EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
-                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc));
+                EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc)) << sequence.name;
+                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc)) << sequence.name;
             }
-            EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_ENV, env));
+            EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_ENV, env)) << sequence.name;
         });
         const bool prompt = freeing.wait_for(PROMPT) == std::future_status::ready;
         const std::vector<std::string> calls_during_the_cancel = Calls();

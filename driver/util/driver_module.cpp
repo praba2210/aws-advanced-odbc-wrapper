@@ -18,6 +18,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <string>
 
 #ifndef _WIN32
     #include <dlfcn.h>
@@ -42,9 +43,16 @@ void DriverModule::Pin() {
 #else
         // The loaded copy (RTLD_NOLOAD), made undeletable (RTLD_NODELETE: glibc and macOS dyld). The handle is kept.
         Dl_info info{};
-        if (dladdr(&g_pinned, &info) == 0 || info.dli_fname == nullptr
-            || dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE) == nullptr) {
-            LOG(WARNING) << "Could not pin the driver library";
+        if (dladdr(&g_pinned, &info) == 0 || info.dli_fname == nullptr) {
+            LOG(WARNING) << "Could not pin the driver library: dladdr found no library for its address";
+            return;
+        }
+        if (dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE) == nullptr) {
+            // glibc sets no dlerror() text when RTLD_NOLOAD finds nothing loaded under the name.
+            const char* error = dlerror();
+            LOG(WARNING) << "Could not pin the driver library: "
+                         << (error != nullptr ? std::string(error)
+                                              : std::string(info.dli_fname) + " isn't loaded under that name");
             return;
         }
 #endif

@@ -56,7 +56,8 @@ namespace DsqlCompatibility {
     PreparedConnect PrepareConnect(DBC* dbc);
 
     // Called by DefaultPlugin::Connect once the base driver has connected: starts the connection's age from the
-    // moment PrepareConnect returned, with its MAX_CONNECTION_LIFETIME. Does nothing without that moment.
+    // moment PrepareConnect returned, with its MAX_CONNECTION_LIFETIME, and drops the connect's SSLmode change
+    // (DBC::dsql_tls_warning), so the app gets one 01S02 for its connect. No age without that moment.
     void ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at);
 
     // SQLSetConnectAttr on an Aurora DSQL connection, for the attributes that would undo a forced psqlODBC option or

@@ -625,6 +625,23 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_RetryInTheSameConnect_KeepsTh
     EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=require")) << captured_conn_str;
 }
 
+// The connect that succeeded reported the change. A later base connect on the connection, such as a failover
+// reconnect, doesn't start in RDS_InitializeConnection and reports none: the app gets one 01S02 for its connect.
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_ReconnectAfterTheConnect_NoSecond01S02) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", "disable"}});
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    driver_connect_result = SQL_SUCCESS;
+    DefaultPlugin plugin(&dbc_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_EQ("01S02", dbc_.err->sqlstate);
+
+    dbc_.err.reset();
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
+}
+
 // A connection attribute set before connect that the base driver then rejects makes the connect SQL_SUCCESS_WITH_INFO
 // with no record of the wrapper's (only a log line), so the base driver's records stay readable: the SSLmode change
 // isn't reported over them.

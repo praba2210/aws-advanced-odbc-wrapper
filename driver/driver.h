@@ -182,7 +182,8 @@ struct DBC {
     // Aurora DSQL with an auth type other than DSQL: the 01S02 text for the SSLmode this connect replaced
     // (DsqlCompatibility::PrepareConnect). A retry of the base connect within the connect (Secrets Manager's, after a
     // cached secret fails) prepares the first try's output again, which replaces nothing, and reports this text.
-    // RDS_InitializeConnection clears it for each connect.
+    // RDS_InitializeConnection clears it for each connect, and DsqlCompatibility::ConnectSucceeded once the base driver
+    // has connected, so a later reconnect (failover) reports nothing.
     std::string dsql_tls_warning;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;

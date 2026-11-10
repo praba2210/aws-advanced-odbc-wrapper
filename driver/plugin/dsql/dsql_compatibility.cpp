@@ -329,7 +329,13 @@ DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
 
 void DsqlCompatibility::ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at)
 {
-    if (dbc == nullptr || !started_at.has_value() || dbc->dsql_lifetime == nullptr) {
+    if (dbc == nullptr) {
+        return;
+    }
+    // This connect has reported its SSLmode change: a later base connect on the connection (a failover reconnect)
+    // reports none.
+    dbc->dsql_tls_warning.clear();
+    if (!started_at.has_value() || dbc->dsql_lifetime == nullptr) {
         return;
     }
     // RDS_InitializeConnection has checked the value, which is read again on every connect.

@@ -1365,6 +1365,21 @@ TEST_F(DsqlAuthPluginTest, Connect_PaddedProfile_SignsWithThatProfile) {
     }
 }
 
+// Without the AWS_PROFILE key, the AWS_PROFILE variable doesn't restrict the signer: the SDK's default chain signs, as
+// documented, and the environment's keys come before the variable's profile.
+TEST_F(DsqlAuthPluginTest, Connect_EnvProfileWithoutTheKey_KeepsTheDefaultChain) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    const ScopedEnvVars env_keys({
+        {"AWS_ACCESS_KEY_ID", "AKIDENVEXAMPLE"},
+        {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
+    });
+    SetEnvVar("AWS_PROFILE", "dsql_static");  // AKIDEXAMPLE in the credentials fixture
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    const std::string token = ConnectAndCaptureToken(plugin);
+    EXPECT_TRUE(SignedWith(token, "AKIDENVEXAMPLE"));
+    EXPECT_FALSE(SignedWith(token, "AKIDEXAMPLE"));
+}
+
 // With the AWS_PROFILE key only that profile signs: one that is in neither file fails the connect and is named,
 // though the environment has keys.
 TEST_F(DsqlAuthPluginTest, Connect_MissingProfileKey_FailsWithItsName) {

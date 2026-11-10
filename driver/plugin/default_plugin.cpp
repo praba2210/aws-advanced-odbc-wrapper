@@ -96,8 +96,8 @@ SQLRETURN DefaultPlugin::Connect(
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
     // It holds the password or token in PWD, as do the converted copies below. This string, its UTF-16 copy and the
-    // wide copy of the 4-byte retry are wiped when they go; the converters' own temporary copies (the by-value
-    // argument, ICU's buffer, a vector they grow) are not.
+    // wide copy of the 4-byte retry are wiped when they go; the builder's std::ostringstream buffer and the converters'
+    // own temporary copies (the by-value argument, ICU's buffer, a vector they grow) are not.
     std::string conn_in = ConnectionStringHelper::BuildMinimumConnectionString(dbc->conn_attr);
     const ScopedWipe wipe_conn_in(conn_in);
     DLOG(INFO) << "Built minimum connection string for underlying driver: " << ConnectionStringHelper::MaskSensitiveInformation(conn_in);

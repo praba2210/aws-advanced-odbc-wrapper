@@ -85,9 +85,10 @@ public:
     static std::string_view GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
                                             const std::string& error_message);
 
-    // When RDS_AUTH_TYPE is DSQL, replaces an Aurora DSQL cluster ID in SERVER or IAM_HOST with the cluster endpoint,
-    // <id>.dsql.<region>.on.aws. Returns false, with the connect error in out_error, when no region resolves or the
-    // region isn't a DNS host label. Public for tests.
+    // When RDS_AUTH_TYPE is DSQL: folds SERVERNAME (any key case) into SERVER and erases it, its value becoming SERVER
+    // when there is none, and replaces an Aurora DSQL cluster ID in SERVER or IAM_HOST with the cluster endpoint,
+    // <id>.dsql.<region>.on.aws. Returns false, with the connect error in out_error, when SERVER and SERVERNAME name
+    // different hosts, when no region resolves, or when the region isn't a DNS host label. Public for tests.
     static bool ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error);
 
     // The same for a connection handle; on false it has logged the error and set dbc->err (08001).

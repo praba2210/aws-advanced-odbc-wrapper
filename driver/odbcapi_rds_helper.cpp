@@ -4050,7 +4050,8 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         dbc->conn_attr.insert_or_assign(KEY_DRIVER, dbc->conn_attr.at(KEY_BASE_DRIVER));
     }
 
-    // An Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint before anything reads the host.
+    // Before anything reads the host, with RDS_AUTH_TYPE=DSQL: SERVERNAME is folded into SERVER (08001 when the two name
+    // different hosts), and an Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint.
     if (!DsqlAuthPlugin::ExpandClusterId(dbc)) {
         return SQL_ERROR;
     }

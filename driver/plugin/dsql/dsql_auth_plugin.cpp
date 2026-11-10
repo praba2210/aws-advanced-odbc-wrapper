@@ -114,7 +114,9 @@ namespace {
 
     // psqlODBC reads SERVERNAME as SERVER and the later one in its connection string wins; the wrapper writes the keys
     // in sorted order, so SERVERNAME would win. The token is signed for SERVER, so a DSQL connect keeps one host: the
-    // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. DSN keys keep the case typed.
+    // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. The parsers upper-case every key,
+    // and a DSN's Servername is read as SERVER (OdbcDsnHelper::LoadAll), so SERVERNAME comes only from the connection
+    // string or BASE_CONN; a key in any case matches all the same, defensively.
     void FoldServername(std::map<std::string, std::string>& conn_attr)
     {
         std::optional<std::string> servername;

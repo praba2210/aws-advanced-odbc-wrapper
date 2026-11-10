@@ -408,7 +408,8 @@ TEST_F(DsqlAuthPluginTest, Defaults_ServerAndServername_ServernameErased) {
     EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
 }
 
-// Keys from a DSN keep the case typed there.
+// The parsers upper-case every key (a DSN's Servername is even read as SERVER), so only a direct caller passes the key
+// in another case. It matches all the same, defensively.
 TEST_F(DsqlAuthPluginTest, Defaults_ServernameKeyInAnyCase) {
     std::map<std::string, std::string> conn_attr = {{"Servername", "a.dsql.us-east-1.on.aws"}};
     DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
@@ -1647,7 +1648,8 @@ TEST_F(DsqlAuthPluginTest, Connect_AfterTheServerRejectsTheToken_RebuildsTheProv
         ResetAttributes(dbc_, "p");
         EXPECT_CALL(*mock_odbc_helper_, GetSqlStateAndLogMessage(testing::An<DBC*>(), testing::_))
             .WillOnce(testing::DoAll(testing::SetArgReferee<1>(error.message), testing::Return(error.sql_state)));
-        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, nullptr, std::make_shared<DialectAuroraDsql>(), mock_odbc_helper_);
+        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, nullptr, std::make_shared<DialectAuroraDsql>(),
+                              mock_odbc_helper_);
         EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin, SQL_ERROR), "AKIDPROCESS"));
 
         credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");

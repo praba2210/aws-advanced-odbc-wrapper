@@ -30,11 +30,16 @@
 #include "../../error.h"
 #include "../../odbcapi.h"
 #include "../../odbcapi_rds_helper.h"
+#include "../../util/auth_provider.h"
+#include "../../util/connection_string_keys.h"
 #include "../../util/dsql_connection_lifetime.h"
 #include "../../util/logger_wrapper.h"
+#include "../../util/map_utils.h"
 #include "../../util/odbc_helper.h"
 #include "../../util/plugin_service.h"
 #include "../../util/rds_lib_loader.h"
+#include "dsql_auth_plugin.h"
+#include "dsql_plugin_helper.h"
 
 namespace {
     // A psqlODBC option the wrapper sets on every Aurora DSQL connection. key and short_key are psqlODBC's keywords,
@@ -118,6 +123,10 @@ namespace {
         }
         conn_attr.emplace(option.key, option.value);
     }
+
+    // psqlODBC's short keyword for Database, upper-cased as in conn_attr, and Aurora DSQL's only database.
+    constexpr const char* PG_KEY_DATABASE_SHORT = "DX";
+    constexpr const char* DSQL_DATABASE = "postgres";
 
     // An integer attribute value, which ODBC passes in the pointer itself.
     SQLULEN IntegerValue(SQLPOINTER value)
@@ -265,12 +274,26 @@ void DsqlCompatibility::ApplyBaseDriverOptions(std::map<std::string, std::string
     }
 }
 
-std::optional<DsqlConnectionLifetime::Instant> DsqlCompatibility::PrepareConnect(DBC* dbc)
+DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
 {
     if (!IsDsql(dbc)) {
-        return std::nullopt;
+        return {};
     }
     ApplyBaseDriverOptions(dbc->conn_attr);
+    PreparedConnect prepared;
+
+    // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. Another auth type (a token in PWD, a
+    // secret) gets TLS where psqlODBC would connect without it, which Aurora DSQL refuses, and keeps any other mode.
+    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, ""))
+        != AuthType::DSQL) {
+        prepared.tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH,
+            DsqlAuthPlugin::DefaultRootCert(
+                DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
+        // Aurora DSQL has only the postgres database; without one libpq would use the user name.
+        if (!dbc->conn_attr.contains(KEY_DATABASE) && !dbc->conn_attr.contains(PG_KEY_DATABASE_SHORT)) {
+            dbc->conn_attr.insert_or_assign(KEY_DATABASE, DSQL_DATABASE);
+        }
+    }
 
     // A level set before connect waits in attr_map; DefaultPlugin::Connect would replay it after psqlODBC connects,
     // and psqlODBC would send SET SESSION CHARACTERISTICS.
@@ -298,10 +321,11 @@ std::optional<DsqlConnectionLifetime::Instant> DsqlCompatibility::PrepareConnect
     // none.
     const std::shared_ptr<DsqlConnectionLifetime> lifetime = dbc->dsql_lifetime;
     if (lifetime == nullptr) {
-        return std::nullopt;
+        return prepared;
     }
     lifetime->Clear();
-    return lifetime->Now();
+    prepared.started_at = lifetime->Now();
+    return prepared;
 }
 
 void DsqlCompatibility::ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at)

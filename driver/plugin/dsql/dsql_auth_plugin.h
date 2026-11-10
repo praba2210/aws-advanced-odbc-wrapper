@@ -15,6 +15,7 @@
 #ifndef DSQL_AUTH_PLUGIN_H_
 #define DSQL_AUTH_PLUGIN_H_
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -45,16 +46,29 @@ public:
         SQLSMALLINT *  StringLengthPtr,
         SQLUSMALLINT   DriverCompletion) override;
 
-    // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes. root_cert is the
-    // sslrootcert value a verify-full connection gets when pqopt sets none (DefaultRootCert), or "" for no default.
-    // Public for tests.
-    static void ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
-                                        std::string_view root_cert = "system");
+    // Which SSLmode values ApplyTlsDefaults keeps.
+    enum class TlsPolicy : std::uint8_t {
+        DSQL_AUTH,   // RDS_AUTH_TYPE=DSQL: verify-full, verify-ca and require stay; anything else becomes verify-full
+        OTHER_AUTH,  // another auth type on an Aurora DSQL target: only what psqlODBC would run as disable changes
+    };
+
+    // Sets SSLMODE by the policy, dropping its short form CA, and merges pqopt: root_cert as sslrootcert for
+    // verify-full (none when it is ""), and the application name, each only when the user's pqopt doesn't set it.
+    // Returns the 01S02 text for a mode it replaced with verify-full, or "". DsqlCompatibility::PrepareConnect calls it
+    // for the other auth types. Public for tests.
+    static std::string ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, TlsPolicy policy,
+                                        std::string_view root_cert);
+
+    // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes, the TLS ones with
+    // ApplyTlsDefaults(DSQL_AUTH), and returns its 01S02 text. root_cert is the sslrootcert value a verify-full
+    // connection gets when pqopt sets none (DefaultRootCert), or "" for no default. Public for tests.
+    static std::string ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
+                                               std::string_view root_cert = "system");
 
     // The sslrootcert default for the base driver's libpq version: "system" for libpq 16 or later or an unknown
-    // version; before 16 that value is a file name in the working directory, so the first system CA bundle that
-    // is_trusted_file accepts, or "" when there is none (libpq then looks for ~/.postgresql/root.crt and fails closed).
-    // Public for tests.
+    // version (logged at INFO); before 16 that value is a file name in the working directory, so the first system CA
+    // bundle that is_trusted_file accepts, or "" when there is none (libpq then looks for ~/.postgresql/root.crt and
+    // fails closed). Public for tests.
     static std::string DefaultRootCert(std::optional<int> libpq_version,
                                        const std::function<bool(const char*)>& is_trusted_file = IsRootOwnedFile);
 

@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "../../driver/driver.h"
@@ -45,6 +46,14 @@ namespace {
 
     // The connection string the last SQLDriverConnect got, as ASCII.
     std::string captured_conn_str;
+    // What the base SQLDriverConnect returns.
+    SQLRETURN driver_connect_result = SQL_ERROR;
+    // The base driver's libpq version, as its PQlibVersion returns it; 0 for a base driver without that function.
+    int base_libpq_version = 0;
+
+    int FakePQlibVersion() {
+        return base_libpq_version;
+    }
 
     SQLRETURN FakeAllocHandle(SQLSMALLINT, SQLHANDLE, SQLHANDLE* output_handle) {
         *output_handle = static_cast<SQLHANDLE>(&captured_conn_str);
@@ -57,8 +66,8 @@ namespace {
         for (const SQLTCHAR* c = in_connection_string; *c != 0; ++c) {
             captured_conn_str.push_back(static_cast<char>(*c));
         }
-        // The tests only need the string psqlODBC would get.
-        return SQL_ERROR;
+        // Most tests only need the string psqlODBC would get.
+        return driver_connect_result;
     }
 
     // The base SQLEndTran, SQLSetConnectAttr and SQLExecDirect calls, in order, as EndTranCall, SetConnectAttrCall and
@@ -135,12 +144,16 @@ namespace {
         return SQL_SUCCESS;
     }
 
-    // Answers SQLAllocHandle, SQLDriverConnect, SQLEndTran, SQLSetConnectAttr, SQLExecDirect, SQLGetDiagRec and SQLGetInfo, records
-    // every lookup, and returns nullptr for anything else, so a forwarded call fails without reaching a real driver.
+    // Answers SQLAllocHandle, SQLDriverConnect, SQLEndTran, SQLSetConnectAttr, SQLExecDirect, SQLGetDiagRec and
+    // SQLGetInfo, and PQlibVersion when base_libpq_version is set, records every lookup, and returns nullptr for
+    // anything else, so a forwarded call fails without reaching a real driver.
     class FakeBaseDriver : public RdsLibLoader {
     public:
         RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
             requested_functions.push_back(function_name);
+            if (function_name == "PQlibVersion") {
+                return base_libpq_version != 0 ? reinterpret_cast<RdsPlatform::FuncHandle>(&FakePQlibVersion) : nullptr;
+            }
             const std::map<std::string_view, RdsPlatform::FuncHandle> functions = {
                 {RdsFuncNames::AllocHandle, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeAllocHandle)},
                 {RdsFuncNames::DriverConnect, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeDriverConnect)},
@@ -204,6 +217,8 @@ protected:
         dbc_.env = &env_;
         stmt_.dbc = &dbc_;
         captured_conn_str.clear();
+        driver_connect_result = SQL_ERROR;
+        base_libpq_version = 0;
         base_calls.clear();
         end_tran_result = SQL_SUCCESS;
         exec_direct_result = SQL_SUCCESS;
@@ -221,7 +236,13 @@ protected:
     // The attributes RDS_InitializeConnection leaves for this server, its answer to whether the connect is Aurora DSQL,
     // and the plugin service it builds.
     void UseServer(const std::string& server) {
-        dbc_.conn_attr = {{KEY_SERVER, server}, {KEY_DRIVER, PSQLODBC_PATH}};
+        UseConnAttr({{KEY_SERVER, server}});
+    }
+
+    // The same for these attributes and the base driver.
+    void UseConnAttr(std::map<std::string, std::string> conn_attr) {
+        dbc_.conn_attr = std::move(conn_attr);
+        dbc_.conn_attr.insert_or_assign(KEY_DRIVER, PSQLODBC_PATH);
         dbc_.is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_.conn_attr);
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
     }
@@ -332,8 +353,210 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_OtherDatabase_BaseDriverGetsN
     EXPECT_EQ(SQL_ERROR, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_NE(std::string::npos, captured_conn_str.find("SERVER=" + AURORA_HOST));
     for (const char* key : {"PROTOCOL=", "IGNORETIMEOUT=", "USEDECLAREFETCH=", "USESERVERSIDEPREPARE=",
-                            "UPDATABLECURSORS="}) {
+                            "UPDATABLECURSORS=", "SSLMODE=", "PQOPT=", "DATABASE=",}) {
         EXPECT_EQ(std::string::npos, captured_conn_str.find(key)) << key;
+    }
+}
+
+namespace {
+    const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
+    // The base driver's pqopt for verify-full: the root certificate (the fake base driver has no PQlibVersion, so it is
+    // libpq 16's system) and the application name.
+    const std::string VERIFY_FULL_PQOPT = "{sslrootcert=system application_name=" + APPLICATION_NAME + "}";
+
+    // The 01S02 text for an SSLmode replaced with verify-full, worded as the Aurora DSQL auth plugin's.
+    std::string SslModeChanged(const std::string& mode) {
+        return "SSLmode=" + mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
+               "verify-ca or require.";
+    }
+}  // namespace
+
+// psqlODBC runs an unset SSLmode as disable, and Aurora DSQL refuses that before any authentication. An auth type other
+// than DSQL (none, which is DATABASE: a token in PWD; or SECRETS_MANAGER) gets verify-full with the Aurora DSQL
+// plugin's root certificate default, and postgres, Aurora DSQL's only database, where libpq would use the user name.
+// No user name is added: the admin default is RDS_AUTH_TYPE=DSQL's, whose token is signed for it.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_UnsetSslMode_BecomesVerifyFull) {
+    for (const std::string auth_type : {"", VALUE_AUTH_DATABASE, VALUE_AUTH_SECRETS}) {
+        SCOPED_TRACE(auth_type);
+        std::map<std::string, std::string> conn_attr = {{KEY_SERVER, DSQL_HOST}};
+        if (!auth_type.empty()) {
+            conn_attr.emplace(KEY_AUTH_TYPE, auth_type);
+        }
+        UseConnAttr(conn_attr);
+        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ("verify-full", dbc_.conn_attr.at("SSLMODE"));
+        EXPECT_EQ(VERIFY_FULL_PQOPT, dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ("postgres", dbc_.conn_attr.at(KEY_DATABASE));
+        EXPECT_FALSE(dbc_.conn_attr.contains(KEY_DB_USERNAME));
+        EXPECT_EQ("", prepared.tls_warning);
+    }
+}
+
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsTheDatabaseSet) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_DATABASE, "mydb"}});
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ("mydb", dbc_.conn_attr.at(KEY_DATABASE));
+
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {"DX", "mydb"}});
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ("mydb", dbc_.conn_attr.at("DX"));
+    EXPECT_FALSE(dbc_.conn_attr.contains(KEY_DATABASE));
+}
+
+// psqlODBC reads the mode by its first byte, case-sensitively, and runs disable, d, Disable or a value it doesn't know
+// as disable. Each becomes verify-full, under either keyword, and the text for the connect's 01S02 says so.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_Disable_BecomesVerifyFullWith01S02Text) {
+    CapturingLogSink log;
+    for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+             {"SSLMODE", "disable"}, {"SSLMODE", "d"}, {"SSLMODE", "Disable"}, {"SSLMODE", "on"}, {"CA", "d"},}) {
+        SCOPED_TRACE(testing::Message() << key << "=" << mode);
+        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {key, mode}});
+        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ("verify-full", dbc_.conn_attr.at("SSLMODE"));
+        EXPECT_FALSE(dbc_.conn_attr.contains("CA"));
+        EXPECT_EQ(VERIFY_FULL_PQOPT, dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ(SslModeChanged(mode), prepared.tls_warning);
+    }
+    EXPECT_EQ(1, log.Count("[DSQL] Overriding SSLmode=Disable with verify-full"));
+    EXPECT_EQ(5, log.Count("[DSQL] Overriding SSLmode="));
+}
+
+// allow, prefer, require and verify-ca connect today, so they stay, psqlODBC's short forms (r, vc) as written. A full
+// name in another case would be disable to psqlODBC, so it is lowercased. libpq rejects sslrootcert=system below
+// verify-full, so only verify-full gets the root certificate. None of them is reported.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
+    CapturingLogSink log;
+    for (const auto& [requested, expected] : std::vector<std::pair<std::string, std::string>>{
+             {"allow", "allow"}, {"prefer", "prefer"}, {"require", "require"}, {"verify-ca", "verify-ca"},
+             {"r", "r"}, {"vc", "vc"}, {"Require", "require"}, {"VERIFY-CA", "verify-ca"},}) {
+        SCOPED_TRACE(requested);
+        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", requested}});
+        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ(expected, dbc_.conn_attr.at("SSLMODE"));
+        EXPECT_EQ("{application_name=" + APPLICATION_NAME + "}", dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ("", prepared.tls_warning);
+    }
+    for (const std::string requested : {"verify-full", "VERIFY-FULL"}) {
+        SCOPED_TRACE(requested);
+        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", requested}});
+        const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ("verify-full", dbc_.conn_attr.at("SSLMODE"));
+        EXPECT_EQ(VERIFY_FULL_PQOPT, dbc_.conn_attr.at("PQOPT"));
+        EXPECT_EQ("", prepared.tls_warning);
+    }
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"CA", "require"}});
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_FALSE(dbc_.conn_attr.contains("CA"));
+    EXPECT_EQ("require", dbc_.conn_attr.at("SSLMODE"));
+    EXPECT_EQ(0, log.Count("Overriding SSLmode"));
+}
+
+// RDS_AUTH_TYPE=DSQL (any case) applied its own, stricter defaults in DsqlAuthPlugin before the chain reached
+// DefaultPlugin: only the forced psqlODBC options change here.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_DsqlAuth_LeavesTlsToTheAuthPlugin) {
+    for (const std::string auth_type : {VALUE_AUTH_DSQL, "dsql"}) {
+        for (const std::string mode : {"require", "disable"}) {
+            SCOPED_TRACE(testing::Message() << auth_type << " " << mode);
+            UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, auth_type}, {"SSLMODE", mode}});
+            std::map<std::string, std::string> expected = dbc_.conn_attr;
+            DsqlCompatibility::ApplyBaseDriverOptions(expected);
+            const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+            EXPECT_EQ(expected, dbc_.conn_attr);
+            EXPECT_EQ("", prepared.tls_warning);
+        }
+    }
+}
+
+// DATABASE_DIALECT=AURORA_DSQL makes a connect to an IP address (a PrivateLink endpoint, say) an Aurora DSQL one. With
+// no SSLmode it gets verify-full, as any Aurora DSQL target, which fails on the host name rather than in plaintext; the
+// verify-ca the documentation gives for an IP address stays.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_DialectWithIp_GetsVerifyFull) {
+    UseConnAttr({{KEY_SERVER, "10.0.0.1"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}});
+    ASSERT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ("verify-full", dbc_.conn_attr.at("SSLMODE"));
+    EXPECT_EQ(VERIFY_FULL_PQOPT, dbc_.conn_attr.at("PQOPT"));
+
+    UseConnAttr(
+        {{KEY_SERVER, "10.0.0.1"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {"SSLMODE", "verify-ca"}});
+    DsqlCompatibility::PrepareConnect(&dbc_);
+    EXPECT_EQ("verify-ca", dbc_.conn_attr.at("SSLMODE"));
+}
+
+// Off Aurora DSQL nothing changes: psqlODBC's own TLS default and libpq's database default stay.
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherDatabase_Untouched) {
+    for (const std::string& server : {AURORA_HOST, std::string("10.0.0.1")}) {
+        for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+                 {"", ""}, {"SSLMODE", "disable"}, {"SSLMODE", "Disable"}, {"CA", "d"},}) {
+            SCOPED_TRACE(testing::Message() << server << " " << key << "=" << mode);
+            std::map<std::string, std::string> conn_attr = {{KEY_SERVER, server}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}};
+            if (!key.empty()) {
+                conn_attr.emplace(key, mode);
+            }
+            UseConnAttr(conn_attr);
+            ASSERT_FALSE(DsqlCompatibility::IsDsql(&dbc_));
+            const std::map<std::string, std::string> before = dbc_.conn_attr;
+            const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
+            EXPECT_EQ(before, dbc_.conn_attr);
+            EXPECT_EQ("", prepared.tls_warning);
+        }
+    }
+}
+
+#ifndef _WIN32
+// The root certificate is the Aurora DSQL plugin's choice for the base driver's libpq: before 16, libpq reads
+// sslrootcert=system as a file in the working directory. (On Windows the version comes from libpq.dll, not the loader.)
+TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_RootCertFollowsTheBaseLibpqVersion) {
+    for (const auto& [version, expect_system] : std::map<int, bool>{{150004, false}, {160004, true}}) {
+        base_libpq_version = version;
+        UseServer(DSQL_HOST);
+        DsqlCompatibility::PrepareConnect(&dbc_);
+        const std::string pqopt = dbc_.conn_attr.at("PQOPT");
+        // Before libpq 16 this holds with a system CA bundle or without one.
+        EXPECT_EQ(expect_system, pqopt.find("sslrootcert=system") != std::string::npos) << version << " " << pqopt;
+    }
+}
+#endif
+
+// A connect that succeeds reports the replaced mode, as RDS_AUTH_TYPE=DSQL does: SQL_SUCCESS_WITH_INFO and 01S02. The
+// base driver got verify-full and the database.
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDisable_Returns01S02) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", "disable"}});
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    driver_connect_result = SQL_SUCCESS;
+    DefaultPlugin plugin(&dbc_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_EQ("01S02", dbc_.err->sqlstate);
+    EXPECT_EQ(WARN_OPTION_VALUE_CHANGED, dbc_.err->native_err);
+    EXPECT_EQ(SslModeChanged("disable"), dbc_.err->error_msg);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
+    EXPECT_NE(std::string::npos, captured_conn_str.find("DATABASE=postgres")) << captured_conn_str;
+}
+
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetUnsetSslMode_NoWarning) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}});
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    driver_connect_result = SQL_SUCCESS;
+    DefaultPlugin plugin(&dbc_);
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
+}
+
+// The wrapper keeps one record per handle, and its record hides the base driver's: a connect that fails, or that the
+// base driver warns about, keeps the base driver's result and records.
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDisable_KeepsTheBaseDriversResult) {
+    for (const SQLRETURN result : std::initializer_list<SQLRETURN>{SQL_SUCCESS_WITH_INFO, SQL_ERROR}) {
+        SCOPED_TRACE(result);
+        UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", "disable"}});
+        env_.wrapped_env = static_cast<SQLHENV>(&env_);
+        driver_connect_result = result;
+        DefaultPlugin plugin(&dbc_);
+        EXPECT_EQ(result, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+        EXPECT_EQ(nullptr, dbc_.err);
+        dbc_.wrapped_dbc = SQL_NULL_HDBC;
+        dbc_.conn_status = CONN_NOT_CONNECTED;
     }
 }
 

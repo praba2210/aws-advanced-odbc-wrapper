@@ -91,7 +91,7 @@ SQLRETURN DefaultPlugin::Connect(
 
     // Keep psqlODBC from doing what Aurora DSQL can't handle, and clear the connection's age, which counts from here.
     // Does nothing on other connections.
-    const std::optional<DsqlConnectionLifetime::Instant> dsql_started = DsqlCompatibility::PrepareConnect(dbc);
+    const DsqlCompatibility::PreparedConnect dsql_connect = DsqlCompatibility::PrepareConnect(dbc);
 
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
@@ -211,8 +211,15 @@ SQLRETURN DefaultPlugin::Connect(
     // Successful Connection, but bad environment and/or connection attribute setting
     if (SQL_SUCCEEDED(ret)) {
         dbc->conn_status = CONN_CONNECTED;
-        DsqlCompatibility::ConnectSucceeded(dbc, dsql_started);
+        DsqlCompatibility::ConnectSucceeded(dbc, dsql_connect.started_at);
         if (has_conn_attr_errors) {
+            ret = SQL_SUCCESS_WITH_INFO;
+        }
+        // Aurora DSQL with another auth type than DSQL: an SSLmode PrepareConnect replaced. The wrapper keeps one
+        // record per handle, so it is reported only when nothing else is, as DsqlAuthPlugin does.
+        if (ret == SQL_SUCCESS && !dsql_connect.tls_warning.empty()) {
+            ClearError(dbc);
+            dbc->err = std::make_unique<ErrInfo>(dsql_connect.tls_warning.c_str(), WARN_OPTION_VALUE_CHANGED);
             ret = SQL_SUCCESS_WITH_INFO;
         }
 

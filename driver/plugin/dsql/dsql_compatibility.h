@@ -38,11 +38,21 @@ namespace DsqlCompatibility {
     // replaced, with a warning when it differs. Public for tests.
     void ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr);
 
+    // What PrepareConnect leaves for the rest of DefaultPlugin::Connect.
+    struct PreparedConnect {
+        // The moment the connect begins, for ConnectSucceeded; std::nullopt off Aurora DSQL or without a lifetime.
+        std::optional<DsqlConnectionLifetime::Instant> started_at;
+        // The 01S02 text for an SSLmode replaced with verify-full, or "".
+        std::string tls_warning;
+    };
+
     // Called by DefaultPlugin::Connect before it builds the base driver's connection string: sets the forced options
-    // and drops psqlODBC attributes set before connect that would undo them. Clears the connection's age and returns
-    // the moment the connect begins, for ConnectSucceeded. Does nothing and returns std::nullopt unless the connect
-    // targets Aurora DSQL; std::nullopt too without a lifetime.
-    std::optional<DsqlConnectionLifetime::Instant> PrepareConnect(DBC* dbc);
+    // and drops psqlODBC attributes set before connect that would undo them. With an auth type other than DSQL it also
+    // sets the TLS defaults (DsqlAuthPlugin::ApplyTlsDefaults, OTHER_AUTH), with their 01S02 text, and the postgres
+    // database when none is set. Clears the connection's age and returns the moment the connect begins, for
+    // ConnectSucceeded. Does nothing and returns no moment and no text unless the connect targets Aurora DSQL; no
+    // moment either without a lifetime.
+    PreparedConnect PrepareConnect(DBC* dbc);
 
     // Called by DefaultPlugin::Connect once the base driver has connected: starts the connection's age from the
     // moment PrepareConnect returned, with its MAX_CONNECTION_LIFETIME. Does nothing without that moment.

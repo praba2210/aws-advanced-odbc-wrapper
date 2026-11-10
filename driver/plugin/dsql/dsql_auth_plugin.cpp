@@ -51,6 +51,8 @@ namespace {
     const std::string SSLMODE_VERIFY_FULL = "verify-full";
     const std::string SSLMODE_VERIFY_CA = "verify-ca";
     const std::string SSLMODE_REQUIRE = "require";
+    const std::string SSLMODE_PREFER = "prefer";
+    const std::string SSLMODE_ALLOW = "allow";
     const std::string ROOT_CERT_KEYWORD = "sslrootcert";
     const std::string SYSTEM_ROOT_CERT = "system";
     constexpr int LIBPQ_16 = 160000;  // first libpq where sslrootcert=system means the system's roots
@@ -172,6 +174,49 @@ namespace {
             LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
         }
         return mode.empty() ? SSLMODE_VERIFY_FULL : mode;
+    }
+
+    // psqlODBC reads SSLmode by its first byte, case-sensitively, and runs what it doesn't know as disable.
+    bool RunsAsDisable(const std::string& mode)
+    {
+        return mode.empty() || (mode[0] != 'a' && mode[0] != 'p' && mode[0] != 'r' && mode[0] != 'v');
+    }
+
+    // Another auth type on Aurora DSQL keeps a mode that connects: a full mode name in any case, lowercased (psqlODBC
+    // would run Require as disable), or another value psqlODBC can run (r, vc), as written. What psqlODBC would run as
+    // disable, which Aurora DSQL always refuses, becomes verify-full.
+    std::string ResolveSslModeForOtherAuth(const std::string& requested_mode)
+    {
+        const std::string requested_lower = AsciiLower(requested_mode);
+        for (const std::string& mode :
+             {SSLMODE_ALLOW, SSLMODE_PREFER, SSLMODE_REQUIRE, SSLMODE_VERIFY_CA, SSLMODE_VERIFY_FULL}) {
+            if (requested_lower == mode) {
+                return mode;
+            }
+        }
+        if (!RunsAsDisable(requested_mode)) {
+            return requested_mode;
+        }
+        if (!requested_mode.empty()) {
+            LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL
+                         << ": psqlODBC would connect without TLS, which Aurora DSQL refuses";
+        }
+        return SSLMODE_VERIFY_FULL;
+    }
+
+    // The SSLmode the user set, under its long or short keyword, or "". The long one wins, as it does in psqlODBC,
+    // which reads the sorted connection string from left to right.
+    std::string RequestedSslMode(const std::map<std::string, std::string>& conn_attr)
+    {
+        return MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
+                                        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
+    }
+
+    // The 01S02 text for a requested SSLmode replaced with verify-full.
+    std::string SslModeChangedText(const std::string& requested_mode)
+    {
+        return "SSLmode=" + requested_mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to "
+               "verify-full, verify-ca or require.";
     }
 
     bool IsConninfoSpace(char c)
@@ -501,14 +546,8 @@ SQLRETURN DsqlAuthPlugin::Connect(
     if (built_for_ && !RebuildProviderIfNeeded(dbc)) {
         return SQL_ERROR;
     }
-    // Read before the defaults replace the requested mode.
-    const std::string tls_warning = GetTlsOverrideWarning(dbc->conn_attr);
-    const std::optional<int> libpq_version =
-        DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr);
-    if (!libpq_version) {
-        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; sslrootcert=system is used.";
-    }
-    ApplyConnectionDefaults(dbc->conn_attr, DefaultRootCert(libpq_version));
+    const std::string tls_warning = ApplyConnectionDefaults(dbc->conn_attr,
+        DefaultRootCert(DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
     const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
     // The token was for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect (the
@@ -537,7 +576,11 @@ void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, cons
 std::string DsqlAuthPlugin::DefaultRootCert(const std::optional<int> libpq_version,
                                             const std::function<bool(const char*)>& is_trusted_file)
 {
-    if (!libpq_version || *libpq_version >= LIBPQ_16) {
+    if (!libpq_version) {
+        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; sslrootcert=system is used.";
+        return SYSTEM_ROOT_CERT;
+    }
+    if (*libpq_version >= LIBPQ_16) {
         return SYSTEM_ROOT_CERT;
     }
     for (const char* bundle : SYSTEM_CA_BUNDLES) {
@@ -560,14 +603,31 @@ bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)
 #endif
 }
 
-void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
-                                              const std::string_view root_cert)
+std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, const TlsPolicy policy,
+                                             const std::string_view root_cert)
 {
-    FoldServername(conn_attr);
-    const std::string ssl_mode = ResolveSslMode(MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
-        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, "")));
+    const std::string requested = RequestedSslMode(conn_attr);
+    const std::string ssl_mode =
+        policy == TlsPolicy::DSQL_AUTH ? ResolveSslMode(requested) : ResolveSslModeForOtherAuth(requested);
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
     conn_attr.insert_or_assign(PG_KEY_SSLMODE, ssl_mode);
+
+    const std::string& pqopt_key = PqoptKey(conn_attr);
+    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode,
+                                                     root_cert));
+
+    // A mode that was set, and wasn't verify-full in any case, was replaced.
+    if (requested.empty() || ssl_mode != SSLMODE_VERIFY_FULL || AsciiLower(requested) == SSLMODE_VERIFY_FULL) {
+        return "";
+    }
+    return SslModeChangedText(requested);
+}
+
+std::string DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
+                                                    const std::string_view root_cert)
+{
+    FoldServername(conn_attr);
+    std::string tls_warning = ApplyTlsDefaults(conn_attr, TlsPolicy::DSQL_AUTH, root_cert);
 
     // A connection string keeps USER and USERNAME as typed (only DSN entries are mapped to UID), but the token is
     // signed for UID. Move an alias to UID, so psqlODBC also gets a single user name.
@@ -581,10 +641,7 @@ void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>&
     if (!ContainsAny(conn_attr, {KEY_DATABASE, PG_KEY_DATABASE_SHORT})) {
         conn_attr.insert_or_assign(KEY_DATABASE, DEFAULT_DATABASE);
     }
-
-    const std::string& pqopt_key = PqoptKey(conn_attr);
-    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode,
-                                                     root_cert));
+    return tls_warning;
 }
 
 std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
@@ -675,11 +732,9 @@ bool DsqlAuthPlugin::ExpandClusterId(DBC* dbc)
 
 std::string DsqlAuthPlugin::GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr)
 {
-    const std::string requested = MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
-        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
+    const std::string requested = RequestedSslMode(conn_attr);
     if (requested.empty() || !KeptSslMode(requested).empty()) {
         return "";
     }
-    return "SSLmode=" + requested + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
-           "verify-ca or require.";
+    return SslModeChangedText(requested);
 }

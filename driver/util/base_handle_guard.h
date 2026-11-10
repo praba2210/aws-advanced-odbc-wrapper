@@ -126,10 +126,14 @@ public:
         RunAll(teardowns);
     }
 
-    // Keeps object as long as the guard or a pin: past every teardown handed to the last pin.
+    // Keeps object as long as the guard or a pin: past every teardown handed to the last pin. A value it replaces is
+    // released after the lock: its last reference can free a base environment.
     void KeepAlive(std::shared_ptr<const void> object) {
-        const std::lock_guard<std::mutex> lock(state_->mutex);
-        state_->keep_alive = std::move(object);
+        {
+            const std::lock_guard<std::mutex> lock(state_->mutex);
+            state_->keep_alive.swap(object);
+        }
+        object.reset();
     }
 
     // Stores a statement's base handle.

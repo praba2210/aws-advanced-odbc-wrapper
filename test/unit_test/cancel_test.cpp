@@ -756,6 +756,27 @@ TEST(BaseHandleGuardTest, KeepAliveOutlivesTheGuardUntilTheLastPin) {
     EXPECT_TRUE(weak.expired());
 }
 
+// A value KeepAlive replaces is released after the guard's lock: its last reference can free a base environment, a base
+// driver call, which the lock is never held across. Here the release has another thread take the lock.
+TEST(BaseHandleGuardTest, KeepAlive_ReleasesTheValueItReplacesOutsideTheLock) {
+    BaseHandleGuard guard;
+    std::promise<void> locked;
+    std::future<void> locked_done = locked.get_future();
+    std::thread other;
+    bool released_unlocked = false;
+    guard.KeepAlive(std::shared_ptr<const int>(new int(0), [&](const int* value) {
+        delete value;
+        other = std::thread([&guard, &locked] {
+            static_cast<void>(guard.Busy());
+            locked.set_value();
+        });
+        released_unlocked = locked_done.wait_for(SAFETY_TIMEOUT) == std::future_status::ready;
+    }));
+    guard.KeepAlive(nullptr);
+    other.join();
+    EXPECT_TRUE(released_unlocked);
+}
+
 // A connected statement over the fake base driver, with only the default plugin.
 class CancelTest : public testing::Test {
 protected:

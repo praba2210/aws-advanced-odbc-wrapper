@@ -16,6 +16,7 @@
 #define DSQL_AUTH_PROVIDER_H_
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -26,6 +27,7 @@
 namespace Aws {
     namespace Auth {
         class AWSCredentialsProvider;
+        class AWSCredentialsProviderChain;
     }
     namespace Client {
         struct GenericClientConfiguration;
@@ -39,7 +41,11 @@ namespace Aws {
 // nothing is cached. DSQL tokens don't include the port.
 class DsqlAuthProvider : public AuthProvider {
 public:
-    DsqlAuthProvider(const std::string &region, const std::string &profile);
+    // Where the profile name comes from. With the AWS_PROFILE key, only that profile's credentials are used.
+    enum class ProfileSource : std::uint8_t { DEFAULT_CHAIN, KEY };
+
+    DsqlAuthProvider(const std::string &region, const std::string &profile,
+                     ProfileSource source = ProfileSource::DEFAULT_CHAIN);
     DsqlAuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials);
 
     std::pair<std::string, bool> GetToken(
@@ -57,6 +63,11 @@ public:
 
     // The DSQL client's configuration. Public for tests.
     static Aws::Client::GenericClientConfiguration MakeClientConfiguration(const std::string &region);
+    // Whether the AWS config file ("[profile p]", "[default]") or the credentials file ("[p]") has the profile.
+    static bool ProfileExists(const std::string& profile);
+    // The credentials source for the AWS_PROFILE key. Public for tests.
+    static std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> MakeProfileOnlyChain(const std::string& profile,
+                                                                                      const std::string& region);
 
 private:
     void SetUpDsqlClient(const std::string &region);

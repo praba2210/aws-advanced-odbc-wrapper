@@ -14,13 +14,20 @@
 
 #include "dsql_auth_provider.h"
 
+#include <optional>
 #include <string_view>
+#include <vector>
 
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/auth/LoginCredentialsProvider.h>
+#include <aws/core/auth/ProfileCredentialsProvider.h>
+#include <aws/core/auth/SSOCredentialsProvider.h>
+#include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/client/GenericClientConfiguration.h>
+#include <aws/core/config/AWSConfigFileProfileConfigLoader.h>
 #include <aws/dsql/DSQLClient.h>
 
 #include "aws_sdk_helper.h"
@@ -44,15 +51,51 @@ namespace {
         }
         return "";
     }
+
+    // The SDK's chain class has a protected constructor and AddProvider.
+    class ProfileOnlyChain final : public Aws::Auth::AWSCredentialsProviderChain {
+    public:
+        explicit ProfileOnlyChain(const std::vector<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>>& providers)
+        {
+            for (const auto& provider : providers) {
+                if (provider) {
+                    AddProvider(provider);
+                }
+            }
+        }
+    };
+
+    // The profile in the config file (with the "profile " prefix) or the credentials file, read now: the files can
+    // change after InitAPI, which the SDK's cached copy doesn't see.
+    std::optional<Aws::Config::Profile> FindProfile(const std::string& name, bool config_file)
+    {
+        Aws::Config::AWSConfigFileProfileConfigLoader loader(
+            config_file ? Aws::Auth::GetConfigProfileFilename()
+                        : Aws::Auth::ProfileCredentialsProvider::GetCredentialsProfileFilename(), config_file);
+        if (!loader.Load()) {
+            return std::nullopt;
+        }
+        const auto it = loader.GetProfiles().find(Aws::String(name.data(), name.size()));
+        return it == loader.GetProfiles().end() ? std::nullopt : std::optional(it->second);
+    }
 }  // namespace
 
-DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile) {
+DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile, ProfileSource source) {
     // The base default constructor skips Init, but the base destructor always calls Shutdown.
     AwsSdkHelper::Init();
-    if (profile.empty()) {
+    if (source == ProfileSource::KEY) {
+        if (ProfileExists(profile)) {
+            credentials_provider_ = MakeProfileOnlyChain(profile, region);
+        } else {
+            // Nothing to sign with, so the connect fails and names the profile, instead of signing with the
+            // environment, a container or the instance role.
+            credentials_provider_ =
+                std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(Aws::Auth::AWSCredentials{});
+        }
+    } else if (profile.empty()) {
         credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
     } else {
-        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config;
+        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config{};
         credential_config.profile = profile;
         credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
@@ -129,6 +172,59 @@ void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
 {
     dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(
         credentials_provider_, nullptr, MakeClientConfiguration(region));
+}
+
+bool DsqlAuthProvider::ProfileExists(const std::string& profile)
+{
+    return FindProfile(profile, true) || FindProfile(profile, false);
+}
+
+std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakeProfileOnlyChain(
+    const std::string& profile, const std::string& region)
+{
+    Aws::Client::ClientConfiguration::CredentialProviderConfiguration config{};
+    config.profile = Aws::String(profile.data(), profile.size());
+    config.region = Aws::String(region.data(), region.size());  // STS region for web identity
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> web_identity;
+    // role_arn + web_identity_token_file without source_profile/credential_source: the CRT profile provider can't
+    // read it, and the SDK's web identity provider would read AWS_ROLE_ARN / AWS_WEB_IDENTITY_TOKEN_FILE instead.
+    for (const bool config_file : {true, false}) {
+        const std::optional<Aws::Config::Profile> p = FindProfile(profile, config_file);
+        if (p && !p->GetRoleArn().empty() && !p->GetValue("web_identity_token_file").empty()
+            && p->GetSourceProfile().empty() && p->GetValue("credential_source").empty()) {
+            config.stsCredentialsProviderConfig.roleArn = p->GetRoleArn();
+            config.stsCredentialsProviderConfig.tokenFilePath = p->GetValue("web_identity_token_file");
+            config.stsCredentialsProviderConfig.sessionName = p->GetValue("role_session_name");  // "" -> a UUID
+            if (!p->GetRegion().empty()) {
+                config.region = p->GetRegion();
+            }
+            // The SDK reads config in this constructor (CrtCredentialsProvider calls the factory there).
+            web_identity = std::make_shared<Aws::Auth::STSAssumeRoleWebIdentityCredentialsProvider>(config);
+            break;
+        }
+    }
+    // The SDK's login provider doesn't pass the profile on: the CRT reads login_session from the profile the
+    // AWS_PROFILE variable names, or [default]. So it gets this profile's session, from the config file where
+    // `aws login` writes it, and is left out when the profile has none. Its region, which also names the sign-in
+    // endpoint, is the profile's (the CRT's own choice when none is passed), else the DSQL region.
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> login;
+    if (const std::optional<Aws::Config::Profile> p = FindProfile(profile, true);
+        p && !p->GetValue("login_session").empty()) {
+        Aws::Client::ClientConfiguration::CredentialProviderConfiguration login_config = config;
+        login_config.loginCredentialProviderConfig.loginSession = p->GetValue("login_session");
+        if (!p->GetRegion().empty()) {
+            login_config.region = p->GetRegion();
+        }
+        login = std::make_shared<Aws::Auth::LoginCredentialsProvider>(login_config);
+    }
+    return std::make_shared<ProfileOnlyChain>(std::vector<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>>{
+        // Access keys, role_arn with source_profile or credential_source (Ec2InstanceMetadata, EcsContainer,
+        // Environment: named in the profile, so allowed), credential_process.
+        std::make_shared<Aws::Auth::ProfileCredentialsProvider>(config),
+        web_identity,
+        std::make_shared<Aws::Auth::SSOCredentialsProvider>(config.profile),
+        login,
+    });
 }
 
 bool DsqlAuthProvider::HasResolvedCredentials() const

@@ -259,15 +259,12 @@ namespace {
         return profile.empty() ? DEFAULT_PROFILE : profile;
     }
 
-    // The profile DsqlAuthProvider signs with: the AWS_PROFILE key, else "" for the SDK's default chain, which reads
-    // the AWS_PROFILE variable itself. The SDK reads the variable as is, even when it's empty, so one with blanks
-    // around it is passed trimmed instead, and an empty or blank one as "default", the profile the SDK uses when the
-    // variable is unset.
+    // The profile the SDK's default chain is given when there is no AWS_PROFILE key: "", so that the chain reads the
+    // AWS_PROFILE variable itself. The SDK reads the variable as is, even when it's empty, so one with blanks around
+    // it is passed trimmed instead, and an empty or blank one as "default", the profile the SDK uses when the variable
+    // is unset.
     std::string GetProviderProfile(const std::map<std::string, std::string>& conn_attr)
     {
-        if (std::string profile = GetProfileKey(conn_attr); !profile.empty()) {
-            return profile;
-        }
         const char* value = std::getenv("AWS_PROFILE");
         if (value == nullptr || (value[0] != '\0' && TrimValue(value) == value)) {
             return "";
@@ -279,6 +276,12 @@ namespace {
     // expired AWS IAM Identity Center (SSO) session is the usual cause, so it says how to renew one.
     std::string CredentialsError(const std::map<std::string, std::string>& conn_attr)
     {
+        if (const std::string key = GetProfileKey(conn_attr); !key.empty() && !DsqlAuthProvider::ProfileExists(key)) {
+            return "Unable to resolve AWS credentials for DSQL authentication: the '" + std::string(KEY_AWS_PROFILE)
+                + "' profile '" + key + "' isn't in the AWS config or credentials file (~/.aws/config, "
+                  "~/.aws/credentials, or the files AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE name). Check the "
+                  "name, or remove " + std::string(KEY_AWS_PROFILE) + " to use the default credential chain.";
+        }
         const std::string profile = GetNamedProfile(conn_attr);
         if (profile.empty()) {
             return "Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such "
@@ -313,12 +316,23 @@ namespace {
         return AsciiLower(region);
     }
 
+    // With the AWS_PROFILE key only that profile signs. Without it the SDK's default chain does, which reads the
+    // AWS_PROFILE variable after the environment's keys.
+    std::shared_ptr<AuthProvider> MakeDsqlAuthProvider(const std::map<std::string, std::string>& conn_attr)
+    {
+        const std::string region = ResolveDsqlRegion(conn_attr);
+        if (const std::string key = GetProfileKey(conn_attr); !key.empty()) {
+            return std::make_shared<DsqlAuthProvider>(region, key, DsqlAuthProvider::ProfileSource::KEY);
+        }
+        return std::make_shared<DsqlAuthProvider>(region, GetProviderProfile(conn_attr));
+    }
+
     std::shared_ptr<AuthProvider> CreateDsqlAuthProvider(DBC* dbc, const std::shared_ptr<AuthProvider>& auth_provider)
     {
         if (auth_provider) {
             return auth_provider;
         }
-        return std::make_shared<DsqlAuthProvider>(ResolveDsqlRegion(dbc->conn_attr), GetProviderProfile(dbc->conn_attr));
+        return MakeDsqlAuthProvider(dbc->conn_attr);
     }
 }  // namespace
 

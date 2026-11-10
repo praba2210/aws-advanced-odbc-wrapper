@@ -274,8 +274,10 @@ std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLogi
 {
     const Aws::Crt::Io::ClientBootstrap* bootstrap = Aws::GetDefaultClientBootstrap();
     const Aws::Crt::Io::TlsConnectionOptions* tls = Aws::GetDefaultTlsConnectionOptions();
-    // With no profile name the CRT would pick one itself.
-    if (profile.empty() || bootstrap == nullptr || tls == nullptr || tls->GetUnderlyingHandle() == nullptr) {
+    // With no profile name the CRT would pick one itself. When the default TLS context failed to build (no CA store),
+    // the default connection options are there but were never initialized, and their ctx is garbage or null: the
+    // connect fails with 28000 (no login provider) instead of crashing in the CRT.
+    if (profile.empty() || bootstrap == nullptr || !*bootstrap || tls == nullptr || !*tls) {
         return nullptr;
     }
     // The CRT builds the sign-in endpoint from the region it is given, so one is always given: the profile's, which

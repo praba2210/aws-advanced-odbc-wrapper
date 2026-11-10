@@ -98,8 +98,9 @@ public:
     // first byte isn't a, p, r or v (psqlODBC reads it case-sensitively). Aurora DSQL refuses that connection.
     static bool SslModeRunsAsDisable(const std::map<std::string, std::string>& conn_attr);
 
-    // The 01S02 message for an SSLmode that ApplyConnectionDefaults replaces with verify-full, or "" when the mode is
-    // kept or not set. It reads the mode as the user set it, so call it before ApplyConnectionDefaults. Public for tests.
+    // The 01S02 message ApplyTlsDefaults(DSQL_AUTH) returns for the SSLmode set in conn_attr: for a mode it replaces
+    // with verify-full, else "" (kept or not set). conn_attr is left as it is: the rule runs on a copy, and logs as it
+    // does on a connect. Public for tests.
     static std::string GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr);
 
 protected:

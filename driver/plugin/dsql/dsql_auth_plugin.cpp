@@ -744,9 +744,7 @@ bool DsqlAuthPlugin::SslModeRunsAsDisable(const std::map<std::string, std::strin
 
 std::string DsqlAuthPlugin::GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr)
 {
-    const std::string requested = RequestedSslMode(conn_attr);
-    if (requested.empty() || !KeptSslMode(requested).empty()) {
-        return "";
-    }
-    return SslModeChangedText(requested);
+    // The rule a DSQL connect applies, on a copy.
+    std::map<std::string, std::string> copy = conn_attr;
+    return ApplyTlsDefaults(copy, TlsPolicy::DSQL_AUTH, "");
 }

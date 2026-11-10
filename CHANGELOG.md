@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery of the `odbcinst`/`iodbcinst` library on macOS and Linux, which ignored the configured `ODBC_ROOT`
 - The ANSI static library is now compiled with `SQL_NOUNICODEMAP`, matching the ANSI shared library
 - `SQLCancel` and `SQLCancelHandle` called from another thread no longer wait for the statement's running `SQLExecDirect` or `SQLExecute` to finish. A call canceled before its statement reaches the underlying driver returns `HY008` without running it, and during the underlying driver's execute the cancel goes to the underlying driver at once. Waits inside failover's reconnect and a Blue/Green switchover aren't interrupted: the call returns its own result
+- Freeing a statement, disconnecting, or freeing a connection or environment while another thread's `SQLCancel` is still in the underlying driver no longer crashes: the wrapper frees the underlying driver's handles when the cancel returns, and stays loaded while the cancel runs
+- `SQLDisconnect` frees the descriptors the application allocated on the connection before the underlying driver disconnects: psqlODBC before 18.00.0002 freed them itself, and the wrapper's later free crashed
+- `SQLConnect` with an empty user name or password keeps the DSN's `UID` and `PWD`, as psqlODBC does; on Aurora DSQL, with no `UID` in the DSN either, it connects as `admin`
 
 ## [1.3.1] - 2026-09-08
 

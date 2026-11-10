@@ -63,8 +63,9 @@ private:
 //   it.
 // - Teardowns run one at a time, in the order they came (a statement's free before its connection's disconnect): one
 //   that comes while handed-over ones run is handed over too.
-// - The pins and the teardowns handed over live as long as the last pin: the app can free the connection, and the DBC
-//   with this guard, while an SQLCancel is still in the base driver.
+// - The pins and the teardowns handed over live as long as the last pin: the app can free the connection, the DBC
+//   with this guard, and its environment while an SQLCancel is still in the base driver: the state keeps the base
+//   environment (KeepAlive).
 class BaseHandleGuard {
 public:
     using Teardown = std::function<void()>;
@@ -75,6 +76,9 @@ private:
         int pins = 0;                     // the base driver calls that use the connection's handles
         std::vector<Teardown> deferred;   // run when pins is back to 0
         bool running_deferred = false;    // an Unpin() runs handed-over teardowns
+        // What the teardowns need beyond their captures (the base environment): kept until the guard and the last pin
+        // are gone, after every teardown handed over.
+        std::shared_ptr<const void> keep_alive;
     };
 
 public:
@@ -120,6 +124,12 @@ public:
             teardowns.swap(state_->deferred);
         }
         RunAll(teardowns);
+    }
+
+    // Keeps object as long as the guard or a pin: past every teardown handed to the last pin.
+    void KeepAlive(std::shared_ptr<const void> object) {
+        const std::lock_guard<std::mutex> lock(state_->mutex);
+        state_->keep_alive = std::move(object);
     }
 
     // Stores a statement's base handle.

@@ -47,6 +47,7 @@
 #include "util/connection_string_helper.h"
 #include "util/connection_string_keys.h"
 #include "util/core_service.h"
+#include "util/driver_module.h"
 #include "util/dsql_connection_lifetime.h"
 #include "util/dsql_connection_validator.h"
 #include "util/logger_wrapper.h"
@@ -239,6 +240,8 @@ SQLRETURN RDS_AllocDbc(
 
     dbc = new DBC();
     dbc->env = env;
+    // The connection's base handles go before the base environment, also when a pinned SQLCancel frees them late.
+    dbc->base_handles.KeepAlive(env->base_env);
     *ConnectionHandlePointer = dbc;
 
     {
@@ -678,17 +681,16 @@ SQLRETURN RDS_FreeEnv(
         RDS_FreeConnect(env->dbc_list.front());
     }
 
-    if (env->driver_lib_loader) {
-        // Clean underlying Env
-        if (env->wrapped_env) {
-            const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(env->driver_lib_loader, RdsFuncNames::FreeHandle,
-                SQL_HANDLE_ENV, env->wrapped_env
-            );
-            RDS_ProcessLibRes(SQL_HANDLE_ENV, env, res);
-            env->wrapped_env = nullptr;
-        }
-        env->driver_lib_loader = nullptr;
+    // The base environment goes with its last holder: now, or when an SQLCancel still in the base driver on one of these
+    // connections returns and their base handles are freed. Freed now, psqlODBC would destroy those handles with it.
+    if (env->driver_lib_loader && env->wrapped_env) {
+        env->base_env->lib_loader = env->driver_lib_loader;
+        env->base_env->logger = env->logger_wrapper;
+        env->base_env->handle = env->wrapped_env;
     }
+    env->wrapped_env = nullptr;
+    env->base_env = nullptr;
+    env->driver_lib_loader = nullptr;
 
     ClearError(env);
     if (env->counted_by_core_service) {
@@ -809,6 +811,10 @@ SQLRETURN RDS_SQLCancel(
             // With no call running the cancel has no effect, as ODBC 3 says; the handle itself is valid.
             return SQL_SUCCESS;
         }
+        // The base call can block while the app frees the statement, the connection and the environment, and the
+        // driver manager may unload this library meanwhile. This thread returns into it and runs the teardowns handed
+        // over.
+        DriverModule::Pin();
         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLCancel>(env->driver_lib_loader, RdsFuncNames::Cancel,
             pinned.Handle()
         );

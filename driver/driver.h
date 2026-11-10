@@ -98,6 +98,21 @@ enum CONN_STATUS : std::uint8_t { CONN_NOT_CONNECTED, CONN_CONNECTED, CONN_DOWN,
 enum TRANSACTION_STATUS : std::uint8_t { TRANSACTION_CLOSED, TRANSACTION_OPEN, TRANSACTION_ERROR };
 
 /* Structures */
+// The base driver's environment, freed by the last of its holders: the ENV, and the base handle guard of each of its
+// connections (BaseHandleGuard::KeepAlive), which lives as long as an SQLCancel pinned in the base driver. psqlODBC
+// frees every connection and statement left in an environment with it, so the base handles that such a cancel's
+// teardowns free must go first. RDS_FreeEnv hands it the handle.
+struct BaseEnv {
+    std::shared_ptr<LoggerWrapper> logger;  // logging stays up for the late teardowns and this free
+    std::shared_ptr<RdsLibLoader> lib_loader;
+    SQLHENV handle = SQL_NULL_HENV;
+
+    BaseEnv() = default;
+    BaseEnv(const BaseEnv&) = delete;
+    BaseEnv& operator=(const BaseEnv&) = delete;
+    ~BaseEnv();
+};  // BaseEnv
+
 struct ENV {
     std::recursive_mutex lock;
     std::list<DBC*> dbc_list;
@@ -110,6 +125,7 @@ struct ENV {
     bool counted_by_core_service = false;
 
     SQLHENV wrapped_env = SQL_NULL_HENV;
+    std::shared_ptr<BaseEnv> base_env = std::make_shared<BaseEnv>();
     // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can
     // be cleared without the handle's lock (a statement's or descriptor's SQLAllocHandle clears the connection's).
     std::atomic<bool> base_diag_stale = false;

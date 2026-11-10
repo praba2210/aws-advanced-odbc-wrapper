@@ -56,6 +56,7 @@
 #include "../../driver/util/base_handle_guard.h"
 #include "../../driver/util/cancel_state.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/driver_module.h"
 #include "../../driver/util/odbc_helper.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
@@ -73,8 +74,9 @@ namespace {
     // The next blocked_execs executes wait until SQLCancel is called on their handle, ReleaseTheExec(), or
     // SAFETY_TIMEOUT. A canceled one returns SQL_ERROR, as psqlODBC does for a server-side cancel.
     // With block_cancel, SQLCancel stays inside until ReleaseTheCancel(), without ending the execute: a PQcancel that
-    // can't connect. A statement freed or disconnected, or a connection freed, while a cancel is inside counts as a
-    // dead-handle call.
+    // can't connect. A statement freed or disconnected, or its connection freed, while a cancel is inside on it counts
+    // as a dead-handle call. So does every call after the environment's free: psqlODBC frees every connection and
+    // statement of an environment with it.
     struct FakeBaseDriver {
         std::mutex mutex;
         std::condition_variable cv;
@@ -82,6 +84,11 @@ namespace {
         std::map<std::uintptr_t, int> stmt_frees;       // statement -> SQLFreeHandle calls
         std::map<std::uintptr_t, int> disconnects;      // connection -> SQLDisconnect calls
         std::map<std::uintptr_t, int> dbc_frees;        // connection -> SQLFreeHandle calls
+        std::map<std::uintptr_t, int> env_frees;        // environment -> SQLFreeHandle calls
+        bool freed_env = false;
+        std::vector<std::string> calls;                 // the frees, the disconnects and the cancels' ends, in order
+        std::multiset<std::uintptr_t> cancel_connections;  // the connections of the statements a cancel is inside on
+        bool module_pinned_at_cancel = false;           // DriverModule::IsPinned() as the last SQLCancel came in
         std::set<std::uintptr_t> lost;                  // statements whose execute lost the connection (08S01)
         std::uintptr_t next_handle = 0x1000;
         bool has_cancel = true;
@@ -128,8 +135,30 @@ namespace {
         return SQL_SUCCESS;
     }
 
+    // Call with base_driver->mutex held.
+    void LogCall(std::string call) {
+        if (base_driver->freed_env) {
+            ++base_driver->dead_handle_calls;
+        }
+        base_driver->calls.push_back(std::move(call));
+    }
+
+    std::string FreeHandleCall(SQLSMALLINT type) {
+        switch (type) {
+            case SQL_HANDLE_ENV:
+                return "FreeHandle(ENV)";
+            case SQL_HANDLE_DBC:
+                return "FreeHandle(DBC)";
+            case SQL_HANDLE_STMT:
+                return "FreeHandle(STMT)";
+            default:
+                return "FreeHandle(DESC)";
+        }
+    }
+
     SQLRETURN FakeFreeHandle(SQLSMALLINT type, SQLHANDLE handle) {
         const std::lock_guard<std::mutex> lock(base_driver->mutex);
+        LogCall(FreeHandleCall(type));
         if (type == SQL_HANDLE_STMT) {
             ++base_driver->stmt_frees[Id(handle)];
             if (base_driver->live.erase(Id(handle)) == 0) {
@@ -137,15 +166,19 @@ namespace {
             }
         } else if (type == SQL_HANDLE_DBC) {
             ++base_driver->dbc_frees[Id(handle)];
-            if (base_driver->cancels_inside > 0) {
+            if (base_driver->cancel_connections.contains(Id(handle))) {
                 ++base_driver->dead_handle_calls;
             }
+        } else if (type == SQL_HANDLE_ENV) {
+            ++base_driver->env_frees[Id(handle)];
+            base_driver->freed_env = true;
         }
         return SQL_SUCCESS;
     }
 
     SQLRETURN FakeDisconnect(SQLHDBC dbc) {
         const std::lock_guard<std::mutex> lock(base_driver->mutex);
+        LogCall("Disconnect");
         ++base_driver->disconnects[Id(dbc)];
         std::erase_if(base_driver->live, [dbc](const auto& stmt) { return stmt.second == Id(dbc); });
         return SQL_SUCCESS;
@@ -257,8 +290,11 @@ namespace {
             ++base_driver->dead_handle_calls;
             return SQL_INVALID_HANDLE;
         }
+        base_driver->module_pinned_at_cancel = DriverModule::IsPinned();
         ++base_driver->cancels;
         ++base_driver->cancels_inside;
+        const std::uintptr_t connection = base_driver->live.at(Id(stmt));
+        base_driver->cancel_connections.insert(connection);
         if (base_driver->executing == stmt) {
             ++base_driver->cancels_during_exec;
             if (!base_driver->block_cancel) {
@@ -278,7 +314,9 @@ namespace {
         if (!IsLive(stmt)) {
             ++base_driver->dead_handle_calls;
         }
+        LogCall("Cancel");
         --base_driver->cancels_inside;
+        base_driver->cancel_connections.erase(base_driver->cancel_connections.find(connection));
         base_driver->cv.notify_all();
         return base_driver->cancel_result;
     }
@@ -327,6 +365,16 @@ namespace {
     int ConnectionFrees(SQLHDBC dbc) {
         const std::lock_guard<std::mutex> lock(base_driver->mutex);
         return base_driver->dbc_frees[Id(dbc)];
+    }
+
+    int EnvironmentFrees(SQLHENV env) {
+        const std::lock_guard<std::mutex> lock(base_driver->mutex);
+        return base_driver->env_frees[Id(env)];
+    }
+
+    std::vector<std::string> Calls() {
+        const std::lock_guard<std::mutex> lock(base_driver->mutex);
+        return base_driver->calls;
     }
 
     int DeadHandleCalls() {
@@ -684,6 +732,27 @@ TEST(BaseHandleGuardTest, NoBaseHandleIsNotPinned) {
     }
 }
 
+// What the guard keeps alive outlives the guard while a call is pinned, and goes with the last pin, after the teardowns
+// handed to it: as the base environment of a connection the app freed during an SQLCancel.
+TEST(BaseHandleGuardTest, KeepAliveOutlivesTheGuardUntilTheLastPin) {
+    auto guard = std::make_unique<BaseHandleGuard>();
+    int base_stmt = 0;
+    WrappedStmt wrapped_stmt;
+    guard->Store(wrapped_stmt, &base_stmt);
+    auto kept = std::make_shared<int>(0);
+    const std::weak_ptr<int> weak = kept;
+    guard->KeepAlive(std::move(kept));
+    bool alive_in_the_teardown = false;
+    {
+        const BaseHandleGuard::PinnedStatement pinned(*guard, wrapped_stmt);
+        guard->RunOrDefer([&weak, &alive_in_the_teardown] { alive_in_the_teardown = !weak.expired(); });
+        guard = nullptr;
+        EXPECT_FALSE(weak.expired());
+    }
+    EXPECT_TRUE(alive_in_the_teardown);
+    EXPECT_TRUE(weak.expired());
+}
+
 // A connected statement over the fake base driver, with only the default plugin.
 class CancelTest : public testing::Test {
 protected:
@@ -694,6 +763,7 @@ protected:
     int base_dbc_ = 0;
     std::shared_ptr<OdbcHelper> odbc_helper_;
     std::shared_ptr<BasePlugin> plugin_chain_;
+    std::vector<std::shared_ptr<BasePlugin>> chains_;  // those of the connections NewConnectedStatement makes
     std::vector<SQLTCHAR> text_ = AppText("SELECT 1");
 
     void SetUp() override {
@@ -718,6 +788,7 @@ protected:
         }
         dbc_.plugin_head = nullptr;
         plugin_chain_ = nullptr;
+        chains_.clear();
         dbc_.plugin_service = nullptr;
         base_driver = nullptr;
     }
@@ -725,6 +796,43 @@ protected:
     void UsePluginChain(std::shared_ptr<BasePlugin> plugin_chain) {
         plugin_chain_ = std::move(plugin_chain);
         dbc_.plugin_head = plugin_chain_.get();
+    }
+
+    // An app's environment over the base environment base_env_, which SQLFreeHandle frees (the fixture's env_ stays).
+    // Not RDS_AllocEnv, which starts the driver's file logging.
+    ENV* NewEnvironment() {
+        auto* env = new ENV();
+        env->driver_lib_loader = env_.driver_lib_loader;
+        env->wrapped_env = &base_env_;
+        return env;
+    }
+
+    // A statement on a new app connection of env, connected to base_dbc, with only the default plugin.
+    STMT* NewConnectedStatement(ENV* env, int& base_dbc) {
+        SQLHDBC handle = SQL_NULL_HDBC;
+        EXPECT_EQ(SQL_SUCCESS, RDS_AllocDbc(env, &handle));
+        auto* dbc = static_cast<DBC*>(handle);
+        dbc->wrapped_dbc = &base_dbc;
+        dbc->conn_status = CONN_CONNECTED;
+        dbc->plugin_service = std::make_shared<TestPluginService>(odbc_helper_);
+        chains_.push_back(std::make_shared<DefaultPlugin>(dbc));
+        dbc->plugin_head = chains_.back().get();
+        return NewStatement(dbc);
+    }
+
+    // Another statement on dbc, with its base statement.
+    static STMT* NewStatement(DBC* dbc) {
+        SQLHSTMT handle = SQL_NULL_HSTMT;
+        EXPECT_EQ(SQL_SUCCESS, RDS_AllocStmt(dbc, &handle));
+        auto* stmt = static_cast<STMT*>(handle);
+        EXPECT_NE(nullptr, stmt->wrapped_stmt);
+        return stmt;
+    }
+
+    // An SQLCancel on stmt from another thread, which stays in the base driver until ReleaseTheCancel().
+    static std::future<SQLRETURN> BlockedCancel(STMT* stmt) {
+        base_driver->block_cancel = true;
+        return std::async(std::launch::async, [stmt] { return SQLCancel(stmt); });
     }
 
     // A WaitingPlugin in front of the default plugin.
@@ -1208,6 +1316,178 @@ TEST_F(CancelTest, Cancel_BlockedInTheBaseDriverOutlivesTheFreedConnection) {
         EXPECT_EQ(1, ConnectionFrees(&base_dbc));
         EXPECT_EQ(dead_before, DeadHandleCalls());
     }
+}
+
+// The app frees the environment while the base driver's SQLCancel is still inside: after freeing the statement and the
+// connection, after an SQLDisconnect that frees the statement (pyodbc's close()), or with both left. None of the frees
+// waits for the cancel, and the base driver gets no call meanwhile: psqlODBC frees every connection and statement of an
+// environment with it. When the cancel returns, the base statement is freed, then the base connection (disconnected
+// first after an SQLDisconnect), and last the base environment, each once.
+TEST_F(CancelTest, Cancel_BlockedInTheBaseDriverOutlivesTheFreedEnvironment) {
+    struct Sequence {
+        const char* name;
+        bool free_the_statement;
+        bool disconnect_and_free_the_connection;
+    };
+    const std::array<Sequence, 3> sequences{{
+        {"(a) SQLFreeHandle(STMT), SQLDisconnect, SQLFreeHandle(DBC), SQLFreeHandle(ENV)", true, true},
+        {"(b) SQLDisconnect with the statement left, SQLFreeHandle(DBC), SQLFreeHandle(ENV)", false, true},
+        {"(c) SQLFreeHandle(ENV) with the connection and the statement left", false, false},
+    }};
+    std::array<int, 3> base_dbcs{};  // only their addresses are used
+    for (size_t i = 0; i < sequences.size(); ++i) {
+        const Sequence& sequence = sequences.at(i);
+        SCOPED_TRACE(sequence.name);
+        {
+            const std::lock_guard<std::mutex> lock(base_driver->mutex);
+            base_driver->cancel_released = false;
+            base_driver->freed_env = false;
+            base_driver->calls.clear();
+            base_driver->env_frees.clear();
+        }
+        const int dead_before = DeadHandleCalls();
+        int& base_dbc = base_dbcs.at(i);
+        ENV* env = NewEnvironment();
+        STMT* stmt = NewConnectedStatement(env, base_dbc);
+        DBC* dbc = stmt->dbc;
+        const SQLHSTMT base_stmt = stmt->wrapped_stmt;
+        std::future<SQLRETURN> cancel = BlockedCancel(stmt);
+        const bool inside = WaitUntilTheCancelIsInside();
+
+        std::future<void> freeing = std::async(std::launch::async, [env, dbc, stmt, sequence] {
+            if (sequence.free_the_statement) {
+                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt));
+            }
+            if (sequence.disconnect_and_free_the_connection) {
+                EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
+                EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc));
+            }
+            EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_ENV, env));
+        });
+        const bool prompt = freeing.wait_for(PROMPT) == std::future_status::ready;
+        const std::vector<std::string> calls_during_the_cancel = Calls();
+        ReleaseTheCancel();
+        freeing.get();
+
+        EXPECT_TRUE(inside);
+        EXPECT_TRUE(prompt);
+        EXPECT_EQ(SQL_SUCCESS, cancel.get());
+        EXPECT_EQ(std::vector<std::string>{}, calls_during_the_cancel);
+        std::vector<std::string> expected_calls{"Cancel", "FreeHandle(STMT)"};
+        if (sequence.disconnect_and_free_the_connection) {
+            expected_calls.emplace_back("Disconnect");
+        }
+        expected_calls.insert(expected_calls.end(), {"FreeHandle(DBC)", "FreeHandle(ENV)"});
+        EXPECT_EQ(expected_calls, Calls());
+        EXPECT_EQ(1, StatementFrees(base_stmt));
+        EXPECT_EQ(1, ConnectionFrees(&base_dbc));
+        EXPECT_EQ(1, EnvironmentFrees(&base_env_));
+        EXPECT_EQ(dead_before, DeadHandleCalls());
+    }
+}
+
+// Without a cancel inside, the base environment goes in SQLFreeHandle(ENV), after its connections' base handles, as
+// before.
+TEST_F(CancelTest, FreeEnv_WithoutACancelFreesTheBaseEnvironmentAtOnce) {
+    ENV* env = NewEnvironment();
+    int base_dbc = 0;
+    const SQLHSTMT base_stmt = NewConnectedStatement(env, base_dbc)->wrapped_stmt;
+
+    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_ENV, env));
+
+    EXPECT_EQ((std::vector<std::string>{"FreeHandle(STMT)", "FreeHandle(DBC)", "FreeHandle(ENV)"}), Calls());
+    EXPECT_EQ(1, StatementFrees(base_stmt));
+    EXPECT_EQ(1, ConnectionFrees(&base_dbc));
+    EXPECT_EQ(1, EnvironmentFrees(&base_env_));
+    EXPECT_EQ(0, DeadHandleCalls());
+}
+
+// The app frees the environment while the base driver's SQLCancel is inside on one of its two connections. The other
+// connection's base handles go at once; the canceled one's when the cancel returns, and then the base environment,
+// once.
+TEST_F(CancelTest, FreeEnv_TwoConnectionsOneBlockedCancel_FreesTheBaseEnvironmentOnceAfterIt) {
+    ENV* env = NewEnvironment();
+    int canceled_base_dbc = 0;
+    int idle_base_dbc = 0;
+    STMT* canceled = NewConnectedStatement(env, canceled_base_dbc);
+    const SQLHSTMT canceled_base_stmt = canceled->wrapped_stmt;
+    const SQLHSTMT idle_base_stmt = NewConnectedStatement(env, idle_base_dbc)->wrapped_stmt;
+    std::future<SQLRETURN> cancel = BlockedCancel(canceled);
+    const bool inside = WaitUntilTheCancelIsInside();
+
+    std::future<SQLRETURN> freeing = std::async(std::launch::async, [env] { return SQLFreeHandle(SQL_HANDLE_ENV, env); });
+    const bool prompt = freeing.wait_for(PROMPT) == std::future_status::ready;
+    const std::vector<std::string> calls_during_the_cancel = Calls();
+    const int idle_frees_during_the_cancel = StatementFrees(idle_base_stmt) + ConnectionFrees(&idle_base_dbc);
+    ReleaseTheCancel();
+
+    EXPECT_TRUE(inside);
+    EXPECT_TRUE(prompt);
+    EXPECT_EQ(SQL_SUCCESS, freeing.get());
+    EXPECT_EQ(SQL_SUCCESS, cancel.get());
+    EXPECT_EQ((std::vector<std::string>{"FreeHandle(STMT)", "FreeHandle(DBC)"}), calls_during_the_cancel);
+    EXPECT_EQ(2, idle_frees_during_the_cancel);
+    EXPECT_EQ((std::vector<std::string>{"FreeHandle(STMT)", "FreeHandle(DBC)", "Cancel", "FreeHandle(STMT)",
+                                        "FreeHandle(DBC)", "FreeHandle(ENV)"}),
+              Calls());
+    EXPECT_EQ(1, StatementFrees(canceled_base_stmt));
+    EXPECT_EQ(1, ConnectionFrees(&canceled_base_dbc));
+    EXPECT_EQ(1, EnvironmentFrees(&base_env_));
+    EXPECT_EQ(0, DeadHandleCalls());
+}
+
+// The app frees another statement of the connection, then the environment, while the base driver's SQLCancel is
+// inside on one statement. Neither waits for it, and the base driver gets neither free meanwhile. When the cancel
+// returns, both base statements are freed, then the base connection, and last the base environment, each once.
+TEST_F(CancelTest, Cancel_BlockedOnOneStatement_OtherStatementFreedThenEnvironment) {
+    ENV* env = NewEnvironment();
+    int base_dbc = 0;
+    STMT* canceled = NewConnectedStatement(env, base_dbc);
+    STMT* other = NewStatement(canceled->dbc);
+    const SQLHSTMT canceled_base_stmt = canceled->wrapped_stmt;
+    const SQLHSTMT other_base_stmt = other->wrapped_stmt;
+    std::future<SQLRETURN> cancel = BlockedCancel(canceled);
+    const bool inside = WaitUntilTheCancelIsInside();
+
+    std::future<void> freeing = std::async(std::launch::async, [env, other] {
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, other));
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_ENV, env));
+    });
+    const bool prompt = freeing.wait_for(PROMPT) == std::future_status::ready;
+    const std::vector<std::string> calls_during_the_cancel = Calls();
+    ReleaseTheCancel();
+    freeing.get();
+
+    EXPECT_TRUE(inside);
+    EXPECT_TRUE(prompt);
+    EXPECT_EQ(SQL_SUCCESS, cancel.get());
+    EXPECT_EQ(std::vector<std::string>{}, calls_during_the_cancel);
+    EXPECT_EQ((std::vector<std::string>{"Cancel", "FreeHandle(STMT)", "FreeHandle(STMT)", "FreeHandle(DBC)",
+                                        "FreeHandle(ENV)"}),
+              Calls());
+    EXPECT_EQ(1, StatementFrees(other_base_stmt));
+    EXPECT_EQ(1, StatementFrees(canceled_base_stmt));
+    EXPECT_EQ(1, ConnectionFrees(&base_dbc));
+    EXPECT_EQ(1, EnvironmentFrees(&base_env_));
+    EXPECT_EQ(0, DeadHandleCalls());
+}
+
+// A cancel that reaches the base driver pins this library first: the base call can outlive the app's last free, and
+// the driver manager may unload the driver then, while this thread still has to return into it.
+TEST_F(CancelTest, Cancel_PinsTheDriverModuleBeforeTheBaseCall) {
+    EXPECT_EQ(SQL_SUCCESS, SQLCancel(stmt_));
+    ASSERT_EQ(1, base_driver->cancels);
+#ifndef _WIN32
+    if (!DriverModule::IsPinned()) {
+        // Here the library is the unit-test executable, which dlopen doesn't find by the name dladdr gives it (its
+        // argv[0]): nothing is pinned, and Pin() only has to be safe to call again.
+        DriverModule::Pin();
+        DriverModule::Pin();
+        EXPECT_FALSE(DriverModule::IsPinned());
+        return;
+    }
+#endif
+    EXPECT_TRUE(base_driver->module_pinned_at_cancel);
 }
 
 // The failover plugin (strict writer), then the default plugin.

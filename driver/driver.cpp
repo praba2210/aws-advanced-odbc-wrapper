@@ -20,6 +20,16 @@
 #include "util/plugin_service.h"
 #include "util/rds_lib_loader.h"
 
+BaseEnv::~BaseEnv() {
+    if (handle != SQL_NULL_HENV) {
+        const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(lib_loader,
+            RdsFuncNames::FreeHandle, SQL_HANDLE_ENV, handle);
+        if (!res.fn_load_success || !SQL_SUCCEEDED(res.fn_result)) {
+            LOG(WARNING) << "Unable to free the underlying environment handle";
+        }
+    }
+}  // `logger` goes last, after the line above
+
 ENV::~ENV() {
     logger_wrapper = nullptr;
 }

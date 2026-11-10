@@ -112,6 +112,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_keys.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/core_service.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/driver_module.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_lifetime.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_validator.h
@@ -235,6 +236,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/cluster_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/connection_string_helper.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/core_service.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/driver_module.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_auth_provider.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_lifetime.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/util/dsql_connection_validator.cpp

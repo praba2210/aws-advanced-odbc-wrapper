@@ -65,16 +65,23 @@ namespace {
     // Each SQLEndTran's handle and completion type, in order.
     std::vector<std::pair<SQLHANDLE, SQLSMALLINT>> g_end_trans;
 
-    // Text in the base driver's characters, to its NUL.
+    // Text in a 2-byte SQLWCHAR's characters (ANSI ones in the ANSI build), to its NUL: the app's in these tests.
+    std::string AppText(const SQLTCHAR* text) {
+#if UNICODE
+        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(const_cast<SQLTCHAR*>(text)));
+#else
+        return reinterpret_cast<const char*>(text);
+#endif
+    }
+
+    // Text in the base driver's characters, to its NUL: a 4-byte one's, or as AppText reads it.
     std::string BaseText(const SQLTCHAR* text) {
 #if UNICODE
         if (g_four_byte_base) {
             return Convert4ByteSqlWChar(text, SQL_NTS);
         }
-        return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(const_cast<SQLTCHAR*>(text)));
-#else
-        return reinterpret_cast<const char*>(text);
 #endif
+        return AppText(text);
     }
 
     // Writes the text, terminated, in the base driver's characters: a 4-byte one as two SQLTCHARs, low half first.
@@ -397,9 +404,8 @@ TEST_F(DsqlTransactionAbortTest, EnvCommit_TheKept25S03_IsTheEnvironmentsRecord)
     SQLSMALLINT length = 0;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_ENV, &env_, 1, state, &native_error, message, MAX_MSG_LEN,
                                              &length, false));
-    // The app's characters are the base driver's here (no 4-byte side).
-    EXPECT_EQ("25S03", BaseText(state));
-    EXPECT_EQ(ROLLED_BACK, BaseText(message));
+    EXPECT_EQ("25S03", AppText(state));
+    EXPECT_EQ(ROLLED_BACK, AppText(message));
     EXPECT_EQ(static_cast<SQLSMALLINT>(ROLLED_BACK.size()), length);
 }
 

@@ -46,7 +46,7 @@ namespace {
     // How many times the text size GetTransactionChange may read across all of its starts, but never less than 1 MiB:
     // in commented-out SQL (a -- line per statement, each with its ';') every ';' reads all the lines after it again.
     constexpr size_t SCAN_BUDGET_FACTOR = 4;
-    constexpr size_t SCAN_BUDGET_FLOOR = size_t{1} << 20;
+    constexpr size_t SCAN_BUDGET_FLOOR = size_t{1} << 20U;
 
     // What may follow the last statement of a text.
     constexpr std::string_view TRAILING_CHARACTERS = " \t\n\v\f\r;";

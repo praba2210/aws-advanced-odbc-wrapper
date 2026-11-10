@@ -24,9 +24,9 @@
 #include "../base_plugin.h"
 
 // Logs a hint when a statement fails on an Aurora DSQL limit the driver can't work around: advisory locks, and the
-// 60-minute connection limit. It looks at a statement only when it fails, and passes the return code and the
-// statement's diagnostics through; on a connection at least CONNECTION_AGE_HINT_THRESHOLD old, its dead check clears
-// psqlODBC's connection-level record. It reads the connection's age (dbc->dsql_lifetime).
+// 60-minute connection limit. It looks at a statement only when it fails on Aurora DSQL (dbc->is_dsql), and passes the
+// return code and the statement's diagnostics through; on a connection at least CONNECTION_AGE_HINT_THRESHOLD old, its
+// dead check clears psqlODBC's connection-level record. It reads the connection's age (dbc->dsql_lifetime).
 class DsqlErrorHintPlugin : public BasePlugin {
 public:
     DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin);

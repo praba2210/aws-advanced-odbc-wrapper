@@ -77,12 +77,13 @@ SQLRETURN DsqlErrorHintPlugin::Execute(
     SQLINTEGER     TextLength)
 {
     const SQLRETURN ret = ExecuteNext(StatementHandle, StatementText, TextLength);
-    // Only a failed statement is looked at, so a successful one costs nothing here.
-    if (ret != SQL_ERROR || StatementHandle == nullptr) {
+    STMT* stmt = static_cast<STMT*>(StatementHandle);
+    // Only a failed statement is looked at, so a successful one costs nothing here. On a handle reconnected to another
+    // engine, this plugin from its Aurora DSQL connect passes the call straight through.
+    if (ret != SQL_ERROR || stmt == nullptr || stmt->dbc == nullptr || !stmt->dbc->is_dsql) {
         return ret;
     }
 
-    STMT* stmt = static_cast<STMT*>(StatementHandle);
     std::string sql_state;
     std::string message;
     ReadStmtError(stmt, sql_state, message);
@@ -132,12 +133,7 @@ std::string_view DsqlErrorHintPlugin::GetAdvisoryLockHint(const std::string& sql
 
 void DsqlErrorHintPlugin::LogConnectionAgeHint(DBC* dbc, const std::string& sql_state)
 {
-    // Only while the handle is on Aurora DSQL: a reconnect to another engine keeps this plugin, and the age, from the
-    // handle's Aurora DSQL connect.
-    if (dbc == nullptr || !dbc->is_dsql) {
-        return;
-    }
-    const DsqlConnectionLifetime* lifetime = dbc->dsql_lifetime.get();
+    const DsqlConnectionLifetime* lifetime = dbc != nullptr ? dbc->dsql_lifetime.get() : nullptr;
     const std::optional<std::chrono::steady_clock::duration> age =
         lifetime != nullptr ? lifetime->Age() : std::nullopt;
     if (!age.has_value() || age_hint_logged_) {

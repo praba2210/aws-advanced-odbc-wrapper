@@ -389,6 +389,8 @@ protected:
         dbc_->plugin_service = plugin_service;
         dbc_->auto_commit = true;
         dbc_->transaction_status = TRANSACTION_CLOSED;
+        // RDS_InitializeConnection's answer: the plugins are only in the chain of an Aurora DSQL connect.
+        dbc_->is_dsql = true;
         stmt_ = new STMT();
         stmt_->dbc = dbc_;
         OdbcHelper::SetWrappedStmt(stmt_, static_cast<SQLHSTMT>(&base_stmt_stand_in_));
@@ -1324,6 +1326,26 @@ TEST_F(DsqlOccRetryExecuteTest, EndTran_EndsATrackedTransaction) {
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT));
     EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
     EXPECT_EQ(2U, AttemptsForAConflict());
+}
+
+// A handle whose first connect was Aurora DSQL keeps this plugin in its chain. Reconnected to another engine, the
+// plugin passes each call straight through: that engine's serialization failure isn't retried, and no transaction text
+// is followed.
+TEST_F(DsqlOccRetryExecuteTest, ReconnectedToAnotherEngine_PassesStraightThrough) {
+    ASSERT_EQ(2U, AttemptsForAConflict());
+    const size_t waits = sleeps_ms_.size();
+    // RDS_InitializeConnection's answer for the reconnect.
+    dbc_->is_dsql = false;
+
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(1U, chain->calls);
+    EXPECT_EQ(waits, sleeps_ms_.size());
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("40001", stmt_->err->sqlstate);
+
+    EXPECT_EQ(SQL_SUCCESS, RunPrepared(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "BEGIN"));
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
 }
 
 // What the OCC retry and error hint plugins share, over the fake base driver.

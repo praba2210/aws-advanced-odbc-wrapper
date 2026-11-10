@@ -188,6 +188,14 @@ protected:
         }
         return ret;
     }
+
+    // A reconnect on the handle to another engine: RDS_InitializeConnection decides it isn't Aurora DSQL, the chain
+    // stays from the first connect, and DefaultPlugin leaves the age alone.
+    SQLRETURN ReconnectToAnotherEngine(const std::shared_ptr<TestHintPlugin>& plugin) {
+        dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
+        dbc_->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_->conn_attr);
+        return plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+    }
 };
 
 TEST_F(DsqlErrorHintPluginTest, Execute_ReadsNoDiagnosticsUnlessTheStatementFails) {
@@ -562,15 +570,28 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ReconnectedToAnotherEngine_LogsNoAgeHint
     CapturingLogSink sink;
     ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
-    // The reconnect: RDS_InitializeConnection decides it isn't Aurora DSQL, and DefaultPlugin leaves the age alone.
-    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
-    dbc_->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_->conn_attr);
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ReconnectToAnotherEngine(plugin));
     const std::optional<std::chrono::steady_clock::duration> age = dbc_->dsql_lifetime->Age();
     ASSERT_TRUE(age.has_value() && age.value() >= DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
-    // No dead check either, so psqlODBC's connection-level record stays.
-    EXPECT_EQ((std::vector<std::string>{"read"}), plugin->calls);
+    // The call passes straight through: the record isn't read, and no dead check clears psqlODBC's connection record.
+    EXPECT_TRUE(plugin->calls.empty());
+}
+
+// The advisory-lock hint too: the other engine, Aurora PostgreSQL, has advisory locks.
+TEST_F(DsqlErrorHintPluginTest, Execute_ReconnectedToAnotherEngine_LogsNoAdvisoryLockHint) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("42883"),
+                                  std::string("ERROR: function pg_advisory_lock(bigint) does not exist"));
+
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
+    ASSERT_EQ(SQL_SUCCESS, ReconnectToAnotherEngine(plugin));
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+
+    EXPECT_EQ(0, sink.Count("[DSQL]"));
+    EXPECT_TRUE(plugin->calls.empty());
 }

@@ -32,7 +32,7 @@
 // base driver's diagnostics as they were. An SQLCancel from another thread ends a wait at once, and the call returns
 // HY008 without another attempt. It follows the transaction-control text it runs, so a transaction the
 // application opened with BEGIN while autocommit is on is never retried into. On with ENABLE_OCC_RETRY=1, on Aurora
-// DSQL only.
+// DSQL only; on a handle reconnected to another engine it passes calls straight through.
 class DsqlOccRetryPlugin : public BasePlugin {
 public:
     // Waits out a backoff delay on the statement's cancel state; returns true when an SQLCancel from another thread

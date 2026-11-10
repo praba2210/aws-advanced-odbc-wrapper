@@ -266,7 +266,8 @@ SQLRETURN DsqlOccRetryPlugin::Execute(
 {
     STMT* stmt = static_cast<STMT*>(StatementHandle);
     // With autocommit off nothing is retried, and the transaction state is DefaultPlugin's and SQLEndTran's to follow.
-    if (stmt == nullptr || stmt->dbc == nullptr || !stmt->dbc->auto_commit) {
+    // Likewise on a handle reconnected to another engine: its chain keeps this plugin from its Aurora DSQL connect.
+    if (stmt == nullptr || stmt->dbc == nullptr || !stmt->dbc->auto_commit || !stmt->dbc->is_dsql) {
         return ExecuteNext(StatementHandle, StatementText, TextLength);
     }
     DBC* dbc = stmt->dbc;

@@ -56,8 +56,8 @@ std::optional<std::chrono::seconds> DsqlConnectionLifetime::ParseMaxLifetime(
     const std::map<std::string, std::string>& conn_attr, std::string& error)
 {
     const auto it = conn_attr.find(KEY_MAX_CONNECTION_LIFETIME);
-    // A blank value, as the setup dialog leaves an empty field, is the same as unset.
-    if (it == conn_attr.end() || it->second.find_first_not_of(" \t") == std::string::npos) {
+    // A blank value (any ASCII whitespace), as the setup dialog leaves an empty field, is the same as unset.
+    if (it == conn_attr.end() || it->second.find_first_not_of(" \t\r\n\v\f") == std::string::npos) {
         return DEFAULT_MAX_LIFETIME;
     }
     const std::optional<int> seconds = NumberUtils::ParseInt(it->second);

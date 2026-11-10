@@ -69,7 +69,8 @@ TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_UnsetIsOff) {
     EXPECT_TRUE(error.empty());
 }
 
-// A value from the DSN is read; a blank one (the setup dialog's empty field) is the same as unset.
+// A value from the DSN is read; a blank one (the setup dialog's empty field), of any ASCII whitespace, is the same as
+// unset.
 TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_FromDsnAndBlank) {
     std::string error;
     std::optional<std::chrono::seconds> lifetime =
@@ -77,7 +78,7 @@ TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_FromDsnAndBlank) {
     ASSERT_TRUE(lifetime.has_value()) << error;
     EXPECT_EQ(600, lifetime->count());
 
-    for (const std::string& blank : {std::string(), std::string("  ")}) {
+    for (const std::string& blank : {std::string(), std::string("  "), std::string("\n"), std::string(" \t\r\n\v\f")}) {
         lifetime = DsqlConnectionLifetime::ParseMaxLifetime({{KEY_MAX_CONNECTION_LIFETIME, blank}}, error);
         ASSERT_TRUE(lifetime.has_value()) << "[" << blank << "] " << error;
         EXPECT_EQ(0, lifetime->count());

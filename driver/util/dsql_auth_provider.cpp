@@ -14,6 +14,8 @@
 
 #include "dsql_auth_provider.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -61,6 +63,21 @@ namespace {
                    "Center (SSO), run 'aws sso login'";
         }
         return "";
+    }
+
+    // The token with each '%' written again as %25, as AuthProvider::ExtraUrlEncodeString writes it (EXTRA_URL_ENCODE),
+    // into out, which is reserved at the final size first: that function grows its copy, freeing shorter ones unwiped.
+    void ExtraUrlEncodeInto(std::string_view token, std::string& out)
+    {
+        const auto percents = static_cast<size_t>(std::ranges::count(token, '%'));
+        out.reserve(token.size() + (2 * percents));
+        for (const char c : token) {
+            if (c == '%') {
+                out += "%25";
+            } else {
+                out += c;
+            }
+        }
     }
 
     // The SDK's chain class has a protected constructor and AddProvider.
@@ -190,14 +207,19 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
     }
-    // The SDK's result, our copy of it and the encoded one are wiped on every return; the caller gets the one it is
-    // returned. The SDK's own internal copies aren't.
+    // The SDK's result, its std::string copy and the token made from that are wiped on every return; the caller gets
+    // its own copy, in the returned pair. The SDK's internal copies aren't wiped.
     Aws::String& sdk_token = outcome.GetResult();
     const ScopedWipe wipe_sdk_token(sdk_token);
     std::string aws_token(sdk_token.data(), sdk_token.size());
     const ScopedWipe wipe_aws_token(aws_token);
-    std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
-    const ScopedWipe wipe_token(token);
+    std::string token;
+    const ScopedWipe wipe_token(token);  // reads the size when it wipes
+    if (extra_url_encode) {
+        ExtraUrlEncodeInto(aws_token, token);
+    } else {
+        token = aws_token;
+    }
     LOG(INFO) << "Generated new Aurora DSQL " << (is_admin ? "admin " : "") << "token length: " << token.length();
     return {token, false};
 }

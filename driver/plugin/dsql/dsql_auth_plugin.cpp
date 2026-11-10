@@ -446,14 +446,6 @@ namespace {
         }
         return std::make_shared<DsqlAuthProvider>(region, GetProviderProfile(conn_attr));
     }
-
-    std::shared_ptr<AuthProvider> CreateDsqlAuthProvider(DBC* dbc, const std::shared_ptr<AuthProvider>& auth_provider)
-    {
-        if (auth_provider) {
-            return auth_provider;
-        }
-        return MakeDsqlAuthProvider(dbc->conn_attr, ResolveDsqlRegion(dbc->conn_attr));
-    }
 }  // namespace
 
 DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin)
@@ -462,22 +454,21 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
 DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin, const std::shared_ptr<AuthProvider>& auth_provider)
     : DsqlAuthPlugin(dbc, next_plugin, auth_provider, nullptr, nullptr) {}
 
+// The plugin's own provider is built by the first connect, which resolves the region it needs.
 DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin,
                                const std::shared_ptr<AuthProvider>& auth_provider,
                                std::shared_ptr<Dialect> dialect,
                                std::shared_ptr<OdbcHelper> odbc_helper)
-    : BaseTokenAuthPlugin(dbc, next_plugin, CreateDsqlAuthProvider(dbc, auth_provider), dialect, odbc_helper)
+    : BaseTokenAuthPlugin(dbc, next_plugin, auth_provider, dialect, odbc_helper), owns_provider_(!auth_provider)
 {
     this->plugin_name_ = "DSQL";
-    if (!auth_provider) {
-        built_for_ = ReadProviderInputs(dbc->conn_attr);
-    }
 }
 
-DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map<std::string, std::string>& conn_attr)
+DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map<std::string, std::string>& conn_attr,
+                                                                  std::string region)
 {
     ProviderInputs inputs{.key_profile = GetProfileKey(conn_attr), .env_profile = std::nullopt,
-                          .region = ResolveDsqlRegion(conn_attr),
+                          .region = std::move(region),
     };
     if (const char* value = std::getenv("AWS_PROFILE"); inputs.key_profile.empty() && value) {
         inputs.env_profile = value;
@@ -485,9 +476,9 @@ DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map
     return inputs;
 }
 
-bool DsqlAuthPlugin::RebuildProviderIfNeeded(DBC* dbc)
+bool DsqlAuthPlugin::RebuildProviderIfNeeded(DBC* dbc, const std::string& region)
 {
-    ProviderInputs inputs = ReadProviderInputs(dbc->conn_attr);
+    ProviderInputs inputs = ReadProviderInputs(dbc->conn_attr, region);
     if (!rebuild_provider_ && built_for_ == inputs) {
         return true;
     }
@@ -506,9 +497,9 @@ bool DsqlAuthPlugin::RebuildProviderIfNeeded(DBC* dbc)
     return true;
 }
 
-std::string DsqlAuthPlugin::ResolveRegion(DBC* dbc)
+std::string DsqlAuthPlugin::ResolveRegion(DBC* /*dbc*/)
 {
-    return ResolveDsqlRegion(dbc->conn_attr);
+    return connect_region_;
 }
 
 bool DsqlAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error)
@@ -539,11 +530,14 @@ SQLRETURN DsqlAuthPlugin::Connect(
         return ConnectNext(ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr,
                            DriverCompletion);
     }
-    if (built_for_ && !RebuildProviderIfNeeded(dbc)) {
-        return SQL_ERROR;
-    }
     const std::string tls_warning = ApplyConnectionDefaults(dbc->conn_attr,
         DefaultRootCert(DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
+    // Once, after SERVERNAME is folded into SERVER: the provider is built for this region and the token signed for it
+    // (ResolveRegion).
+    connect_region_ = ResolveDsqlRegion(dbc->conn_attr);
+    if (owns_provider_ && !RebuildProviderIfNeeded(dbc, connect_region_)) {
+        return SQL_ERROR;
+    }
     const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
     // The token was for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect (the

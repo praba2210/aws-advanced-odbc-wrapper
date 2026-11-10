@@ -104,6 +104,7 @@ public:
     static std::string GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr);
 
 protected:
+    // The region Connect resolved for this connect.
     std::string ResolveRegion(DBC* dbc) override;
     bool EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error) override;
     void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;
@@ -117,14 +118,18 @@ private:
         std::string region;
         bool operator==(const ProviderInputs&) const = default;
     };
-    static ProviderInputs ReadProviderInputs(const std::map<std::string, std::string>& conn_attr);
+    static ProviderInputs ReadProviderInputs(const std::map<std::string, std::string>& conn_attr, std::string region);
 
-    // Builds a new provider when this connect's inputs differ from the last build's or the last connect found no
-    // credentials. Returns false, with the error set on dbc, when it can't.
-    bool RebuildProviderIfNeeded(DBC* dbc);
+    // Builds the provider for the first connect, and a new one when this connect's inputs differ from the last build's
+    // or the last connect found no credentials. Returns false, with the error set on dbc, when it can't.
+    bool RebuildProviderIfNeeded(DBC* dbc, const std::string& region);
 
-    std::optional<ProviderInputs> built_for_;  // nullopt: the provider was given to the constructor (tests)
+    // Connect and RebuildProviderIfNeeded change these with no lock of their own: a plugin belongs to one connection
+    // handle, and a connect holds its dbc->lock (RDS_SQLConnect, RDS_SQLDriverConnect), so one thread at a time.
+    bool owns_provider_;                       // false: the provider was given to the constructor (tests), and stays
+    std::optional<ProviderInputs> built_for_;  // what the provider was built from; nullopt before the first build
     bool rebuild_provider_ = false;            // set when the last connect found no usable credentials
+    std::string connect_region_;               // this connect's region, resolved once by Connect
 };
 
 #endif // DSQL_AUTH_PLUGIN_H_

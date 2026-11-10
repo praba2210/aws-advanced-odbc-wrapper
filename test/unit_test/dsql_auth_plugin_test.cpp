@@ -62,6 +62,11 @@ namespace {
     const std::string USERNAME = "admin";
     const std::pair<std::string, bool> FRESH_TOKEN("dsql_token", false);
 
+    // Whether a presigned token was signed with the access key.
+    bool SignedWith(const std::string& token, const std::string& access_key) {
+        return token.find("X-Amz-Credential=" + access_key + "%2F") != std::string::npos;
+    }
+
     using test_env::SetEnvVar;
     using test_env::UnsetEnvVar;
 }  // namespace
@@ -133,6 +138,22 @@ protected:
         const SQLRETURN ret = plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT);
         testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
         return ret;
+    }
+
+    // Connects through the plugin, whose base plugin is expected once and returns base_result, and returns the token
+    // the base plugin got.
+    std::string ConnectAndCaptureToken(DsqlAuthPlugin& plugin, const SQLRETURN base_result = SQL_SUCCESS) {
+        std::string token;
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, &token, base_result](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT,
+                                                                  SQLSMALLINT*, SQLUSMALLINT) {
+                token = dbc_->conn_attr.at(KEY_DB_PASSWORD);
+                return base_result;
+            }));
+        EXPECT_EQ(base_result, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT))
+            << (dbc_->err ? dbc_->err->error_msg : "");
+        testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+        return token;
     }
 };
 
@@ -1531,6 +1552,62 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvide
     EXPECT_EQ("28000", dbc_->err->sqlstate);
     EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
 }
+
+// One region per connect: the provider is built for it and the token signed for it. With no other source it comes
+// from the profile, so a missing config file is logged once a connect, not at each step.
+TEST_F(DsqlAuthPluginTest, Connect_ResolvesTheRegionOnce) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    UseConfigFile("no_such_config_file");
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    CapturingLogSink sink;
+    nglog::AddLogSink(&sink);
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const long first_connect = sink.Count("Unable to load AWS config file while resolving region");
+    ResetAttributes(dbc_, "");
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const long both_connects = sink.Count("Unable to load AWS config file while resolving region");
+    nglog::RemoveLogSink(&sink);
+
+    EXPECT_EQ(1, first_connect);
+    EXPECT_EQ(2, both_connects);
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("Region")) << dbc_->err->error_msg;
+}
+
+#ifndef _WIN32
+namespace {
+    // Credentials file text for profile p, with keys from a credential_process (which the provider built for it runs on
+    // every read) or static ones (which it reads from the file every time). A provider keeps the kind it was built
+    // for, so after the file changes from one to the other, the key that signs shows whether it was built again.
+    std::string ProcessProfile(const std::string& access_key) {
+        return "[p]\ncredential_process = echo '{\"Version\": 1, \"AccessKeyId\": \"" + access_key
+            + "\", \"SecretAccessKey\": \"processSecret\"}'\n";
+    }
+}  // namespace
+
+// The region is an input of the provider (the key's chain uses it for STS and the sign-in endpoint): another region
+// builds it again, the same one keeps it.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionChange_RebuildsTheProvider) {
+    const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+    ResetAttributes(dbc_, "p");
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+    credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+    ResetAttributes(dbc_, "p");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+    ResetAttributes(dbc_, "p");
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
+}
+#endif
 
 // libpq before 16 reads sslrootcert=system as a file named "system" in the working directory, so the plugin adds a
 // system CA bundle there instead (SEC-2). An unknown version keeps system, and the log says that is only the default:

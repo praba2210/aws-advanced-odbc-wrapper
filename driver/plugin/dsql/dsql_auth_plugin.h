@@ -17,6 +17,7 @@
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -68,6 +69,24 @@ protected:
     std::string ResolveRegion(DBC* dbc) override;
     bool EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error) override;
     void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;
+
+private:
+    // What decides the provider: the AWS_PROFILE key (trimmed), else the AWS_PROFILE variable as is, and the region
+    // the chain is built with.
+    struct ProviderInputs {
+        std::string key_profile;
+        std::optional<std::string> env_profile;
+        std::string region;
+        bool operator==(const ProviderInputs&) const = default;
+    };
+    static ProviderInputs ReadProviderInputs(const std::map<std::string, std::string>& conn_attr);
+
+    // Builds a new provider when this connect's inputs differ from the last build's or the last connect found no
+    // credentials. Returns false, with the error set on dbc, when it can't.
+    bool RebuildProviderIfNeeded(DBC* dbc);
+
+    std::optional<ProviderInputs> built_for_;  // nullopt: the provider was given to the constructor (tests)
+    bool rebuild_provider_ = false;            // set when the last connect found no usable credentials
 };
 
 #endif // DSQL_AUTH_PLUGIN_H_

@@ -16,10 +16,12 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <initializer_list>
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_auth_provider.h"
@@ -318,9 +320,9 @@ namespace {
 
     // With the AWS_PROFILE key only that profile signs. Without it the SDK's default chain does, which reads the
     // AWS_PROFILE variable after the environment's keys.
-    std::shared_ptr<AuthProvider> MakeDsqlAuthProvider(const std::map<std::string, std::string>& conn_attr)
+    std::shared_ptr<AuthProvider> MakeDsqlAuthProvider(const std::map<std::string, std::string>& conn_attr,
+                                                       const std::string& region)
     {
-        const std::string region = ResolveDsqlRegion(conn_attr);
         if (const std::string key = GetProfileKey(conn_attr); !key.empty()) {
             return std::make_shared<DsqlAuthProvider>(region, key, DsqlAuthProvider::ProfileSource::KEY);
         }
@@ -332,7 +334,7 @@ namespace {
         if (auth_provider) {
             return auth_provider;
         }
-        return MakeDsqlAuthProvider(dbc->conn_attr);
+        return MakeDsqlAuthProvider(dbc->conn_attr, ResolveDsqlRegion(dbc->conn_attr));
     }
 }  // namespace
 
@@ -349,6 +351,40 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
     : BaseTokenAuthPlugin(dbc, next_plugin, CreateDsqlAuthProvider(dbc, auth_provider), dialect, odbc_helper)
 {
     this->plugin_name_ = "DSQL";
+    if (!auth_provider) {
+        built_for_ = ReadProviderInputs(dbc->conn_attr);
+    }
+}
+
+DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map<std::string, std::string>& conn_attr)
+{
+    ProviderInputs inputs{.key_profile = GetProfileKey(conn_attr), .env_profile = std::nullopt,
+                          .region = ResolveDsqlRegion(conn_attr),};
+    if (const char* value = std::getenv("AWS_PROFILE"); inputs.key_profile.empty() && value) {
+        inputs.env_profile = value;
+    }
+    return inputs;
+}
+
+bool DsqlAuthPlugin::RebuildProviderIfNeeded(DBC* dbc)
+{
+    ProviderInputs inputs = ReadProviderInputs(dbc->conn_attr);
+    if (!rebuild_provider_ && built_for_ == inputs) {
+        return true;
+    }
+    try {
+        // Built before the old one goes, so the SDK's reference count never reaches 0 in between.
+        auth_provider_ = MakeDsqlAuthProvider(dbc->conn_attr, inputs.region);
+    } catch (const std::exception& ex) {
+        const std::string message = std::string("Unable to create the AWS credentials provider: ") + ex.what();
+        LOG(ERROR) << message;
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(message.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        return false;
+    }
+    built_for_ = std::move(inputs);
+    rebuild_provider_ = false;
+    return true;
 }
 
 std::string DsqlAuthPlugin::ResolveRegion(DBC* dbc)
@@ -365,6 +401,7 @@ bool DsqlAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std:
     if (auth_provider_->HasResolvedCredentials()) {
         return true;
     }
+    rebuild_provider_ = true;
     out_error = CredentialsError(dbc->conn_attr);
     return false;
 }
@@ -378,6 +415,14 @@ SQLRETURN DsqlAuthPlugin::Connect(
     SQLUSMALLINT   DriverCompletion)
 {
     DBC* dbc = static_cast<DBC*>(ConnectionHandle);
+    // A reused handle keeps its first connect's plugin chain: a connect without RDS_AUTH_TYPE=DSQL gets no token.
+    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
+        return ConnectNext(ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr,
+                           DriverCompletion);
+    }
+    if (built_for_ && !RebuildProviderIfNeeded(dbc)) {
+        return SQL_ERROR;
+    }
     // Read before the defaults replace the requested mode.
     const std::string tls_warning = GetTlsOverrideWarning(dbc->conn_attr);
     ApplyConnectionDefaults(dbc->conn_attr);

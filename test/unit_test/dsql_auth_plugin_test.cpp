@@ -16,7 +16,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <initializer_list>
 #include <map>
 #include <mutex>
@@ -88,6 +90,7 @@ protected:
         dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
         dbc_->conn_attr.insert_or_assign(KEY_PORT, PORT);
         dbc_->conn_attr.insert_or_assign(KEY_DB_USERNAME, USERNAME);
+        dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, VALUE_AUTH_DSQL);
     }
     void TearDown() override {
         delete dbc_;
@@ -1225,3 +1228,133 @@ TEST_F(DsqlAuthPluginTest, ClusterId_EmptyEnvProfile_UsesDefaultProfileRegion) {
     EXPECT_EQ(CLUSTER_ID + ".dsql.eu-north-1.on.aws", conn_attr.at(KEY_SERVER));
 }
 #endif
+
+namespace {
+    // A connect on a reused handle starts from a fresh conn_attr.
+    void ResetAttributes(DBC* dbc, const std::string& profile_key, const std::string& auth_type = VALUE_AUTH_DSQL) {
+        dbc->conn_attr.clear();
+        dbc->conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
+        dbc->conn_attr.insert_or_assign(KEY_PORT, PORT);
+        dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, USERNAME);
+        dbc->conn_attr.insert_or_assign(KEY_AUTH_TYPE, auth_type);
+        if (!profile_key.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_AWS_PROFILE, profile_key);
+        }
+    }
+}  // namespace
+
+// A handle keeps its first connect's plugin chain, so the plugin builds the provider again for another profile.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_ProfileKeyChange_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dsql_static");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+
+    ResetAttributes(dbc_, "no_such_profile");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
+}
+
+// The profile variable decides the provider when there is no key.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_EnvProfileChange_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_PROFILE", "dsql_static");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+
+    SetEnvVar("AWS_PROFILE", "no_such_profile");
+    ResetAttributes(dbc_, "");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+}
+
+// A profile that was missing when the chain was built stays missing for that chain: the connect after the user
+// created it gets a new one.
+TEST_F(DsqlAuthPluginTest, Connect_AfterCredentialFailure_RebuildsTheProvider) {
+    const std::string credentials_path = ::testing::TempDir() + "dsql_sec1_credentials";
+    const auto write_credentials = [&credentials_path](const std::string& content) {
+        std::ofstream(credentials_path, std::ios::trunc) << content;
+    };
+    write_credentials("[other]\naws_access_key_id = AKIDOTHER\naws_secret_access_key = otherSecret\n");
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials_path);
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "p");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+
+    write_credentials("[p]\naws_access_key_id = AKIDEXAMPLE\n"
+                      "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n");
+    ResetAttributes(dbc_, "p");
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    std::remove(credentials_path.c_str());
+}
+
+// A connect without RDS_AUTH_TYPE=DSQL on the same handle gets no token and keeps the application's password.
+TEST_F(DsqlAuthPluginTest, Connect_NotDsqlAuthType_PassesThrough) {
+    dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, "DATABASE");
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    std::string password_seen;
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke([&password_seen](SQLHDBC handle, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                   SQLUSMALLINT) {
+            password_seen = static_cast<DBC*>(handle)->conn_attr.at(KEY_DB_PASSWORD);
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+    EXPECT_EQ("app_password", password_seen);
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_InjectedProvider_IsNeverReplaced) {
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(2))
+        .WillRepeatedly(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "first");
+
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ResetAttributes(dbc_, "second");
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+}
+
+// DSQL with profile a, then a connect that isn't DSQL, then DSQL with profile b: the last one signs with b.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dsql_static");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+
+    ResetAttributes(dbc_, "dsql_static", "DATABASE");
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+
+    ResetAttributes(dbc_, "no_such_profile");
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
+}

@@ -1468,15 +1468,17 @@ SQLRETURN RDS_SQLConnect(
         return SQL_ERROR;
     }
 
-    // Replace with input parameters
+    // Replace with input parameters. An empty user name or password isn't given: the DSN's UID and PWD stay.
     if (UserName) {
 #ifdef UNICODE
         current_utf8 = ConvertUserAppToUTF8(use_4_bytes_user_app, UserName, NameLength2);
 #else
         current_utf8 = AnsiAppText(UserName, NameLength2);
 #endif
-        dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, current_utf8);
-        conn_str_utf8 += "UID=" + current_utf8 + ";";
+        if (!current_utf8.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, current_utf8);
+            conn_str_utf8 += "UID=" + current_utf8 + ";";
+        }
     }
     if (Authentication) {
 #ifdef UNICODE
@@ -1484,8 +1486,10 @@ SQLRETURN RDS_SQLConnect(
 #else
         current_utf8 = AnsiAppText(Authentication, NameLength3);
 #endif
-        dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, current_utf8);
-        conn_str_utf8 += "PWD=" + current_utf8 + ";";
+        if (!current_utf8.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, current_utf8);
+            conn_str_utf8 += "PWD=" + current_utf8 + ";";
+        }
     }
 
     dbc->allow_interactive_auth = MapUtils::GetBooleanValue(dbc->conn_attr, KEY_SSO_ALLOW_INTERACTIVE, false);

@@ -37,6 +37,7 @@
 #include "../../driver/plugin/base_plugin.h"
 #include "../../driver/plugin/default_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/odbc_dsn_helper.h"
 #include "../../driver/util/odbc_helper.h"
 #include "../../driver/util/rds_lib_loader.h"
 #include "../../driver/util/rds_strings.h"
@@ -609,6 +610,58 @@ TEST_F(InputTextLengthTest, DriverConnect_AnsiApp_ParsesStringLength1Characters)
     EXPECT_EQ("admin", dbc_->conn_attr[KEY_DB_USERNAME]);
 }
 #endif
+
+// An empty user name or password isn't a value to give: it stays absent, so the DSN's UID and PWD (or the plugin's
+// default user) apply. A NameLength of 0 is the same as an empty text.
+TEST_F(InputTextLengthTest, Connect_EmptyUserAndPassword_AreNotGiven) {
+    AppText server("no-such-dsn-input-length-test");
+    AppText empty("");
+    AppText admin("admin");
+    AppText secret("secret");
+
+    // No base driver to load: the connect fails after reading the arguments.
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, server.Get(), SQL_NTS, empty.Get(), SQL_NTS, empty.Get(), SQL_NTS));
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_USERNAME));
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, server.Get(), SQL_NTS, admin.Get(), 0, secret.Get(), 0));
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_USERNAME));
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+
+    // A value still overrides.
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, server.Get(), SQL_NTS, admin.Get(), SQL_NTS, secret.Get(), SQL_NTS));
+    EXPECT_EQ("admin", dbc_->conn_attr[KEY_DB_USERNAME]);
+    EXPECT_EQ("secret", dbc_->conn_attr[KEY_DB_PASSWORD]);
+}
+
+// The DSN's UID and PWD (test/unit_test/resources/odbc.ini) stay when SQLConnect's are empty, and a given one wins.
+TEST_F(InputTextLengthTest, Connect_EmptyUser_KeepsTheDsnUid) {
+    if (OdbcDsnHelper::Load("dsn-with-uid", "UID").empty()) {
+        GTEST_SKIP() << "the driver manager doesn't read the odbc.ini fixture";
+    }
+    AppText server("dsn-with-uid");
+    AppText empty("");
+    AppText bob("bob");
+
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, server.Get(), SQL_NTS, empty.Get(), SQL_NTS, empty.Get(), SQL_NTS));
+    EXPECT_EQ("app_user", dbc_->conn_attr[KEY_DB_USERNAME]);
+    EXPECT_EQ("dsn_password", dbc_->conn_attr[KEY_DB_PASSWORD]);
+
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, server.Get(), SQL_NTS, bob.Get(), SQL_NTS, empty.Get(), SQL_NTS));
+    EXPECT_EQ("bob", dbc_->conn_attr[KEY_DB_USERNAME]);
+    EXPECT_EQ("dsn_password", dbc_->conn_attr[KEY_DB_PASSWORD]);
+
+#if UNICODE
+    // An app with a 4-byte SQLWCHAR.
+    env_->use_4_bytes_user_app = true;
+    std::u32string server_32 = U"dsn-with-uid";
+    std::u32string empty_32 = U"";
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(dbc_, FourByte(server_32), SQL_NTS, FourByte(empty_32), SQL_NTS,
+                                        FourByte(empty_32), SQL_NTS));
+    EXPECT_EQ("app_user", dbc_->conn_attr[KEY_DB_USERNAME]);
+    EXPECT_EQ("dsn_password", dbc_->conn_attr[KEY_DB_PASSWORD]);
+#endif
+}
 
 #if UNICODE
 // "COMMITX" cut to 6 runs a COMMIT. The X right after the 6 characters is a sentinel the wrapper mustn't reach.

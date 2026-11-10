@@ -35,7 +35,7 @@ For Aurora DSQL behaviors such as OCC retries, see [Support for Amazon Aurora DS
 
 ### Installing psqlODBC
 
-On Debian and Ubuntu, install psqlODBC with `sudo apt install odbc-postgresql`. Its Unicode driver is `/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so` (`/usr/lib/aarch64-linux-gnu/odbc/psqlodbcw.so` on Arm), and its ANSI driver, `psqlodbca.so`, is in the same folder. For Windows, see [Windows](#windows).
+On Debian and Ubuntu, install psqlODBC with `sudo apt install odbc-postgresql`. Its Unicode driver is `/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so` (`/usr/lib/aarch64-linux-gnu/odbc/psqlodbcw.so` on Arm), and its ANSI driver, `psqlodbca.so`, is in the same folder. For Windows, install psqlODBC with an installer from [psqlODBC's releases](https://www.postgresql.org/ftp/odbc/releases/).
 
 ### Minimal Connection String
 

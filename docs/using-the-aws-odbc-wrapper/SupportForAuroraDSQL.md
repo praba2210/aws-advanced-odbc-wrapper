@@ -54,7 +54,7 @@ psqlODBC's connection attributes `SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE`, `SQL_ATTR
 
 With `RDS_AUTH_TYPE=DSQL`, the [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md#tls) sets TLS. With another authentication type, an `SSLmode` that psqlODBC doesn't run as `disable`, such as `allow`, `prefer`, `require`, `verify-ca` or `verify-full`, is left exactly as you set it: the wrapper adds no root certificate and no `application_name` to `pqopt`. Only `verify-full` checks the host name.
 
-An `SSLmode` that psqlODBC would run as `disable` (not set, `disable`, or a value it doesn't know) becomes `verify-full`, with the same root certificate default as the Aurora DSQL plugin (see [Root Certificates](./plugins/aurora-dsql-authentication-plugin.md#root-certificates)); a full mode name in another case, such as `Require`, which psqlODBC also runs as `disable`, becomes that mode in lowercase instead. In both cases, when neither `DATABASE` nor its short form `DX` is set, the wrapper uses `postgres`. When the wrapper replaces a value you set with `verify-full`, the connect returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01S02`, unless it returns another warning.
+An `SSLmode` that psqlODBC would run as `disable` (not set, `disable`, or a value that doesn't start with `a`, `p`, `r` or `v`: psqlODBC reads only the first letter, case-sensitively) becomes `verify-full`, with the same root certificate default as the Aurora DSQL plugin (see [Root Certificates](./plugins/aurora-dsql-authentication-plugin.md#root-certificates)); a full mode name in another case, such as `Require`, which psqlODBC also runs as `disable`, becomes that mode in lowercase instead. When the wrapper replaces a value you set with `verify-full`, it logs `[DSQL] Overriding SSLmode=<value> with verify-full: psqlODBC would connect without TLS, which Aurora DSQL refuses` at WARNING level, where `<value>` is your value, and the connect returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01S02`, unless it returns another warning.
 
 With an IP address or a PrivateLink name in `SERVER`, `verify-full` fails: set `SSLmode=verify-ca` with a root certificate file, or `require`, and the cluster ID in libpq's `options`, as in [AWS PrivateLink Without Private DNS](./plugins/aurora-dsql-authentication-plugin.md#aws-privatelink-without-private-dns).
 
@@ -66,7 +66,7 @@ If the application commits instead, and a call to `SQLExecDirect`, `SQLExecute` 
 
 Setting `SQL_ATTR_AUTOCOMMIT` on or off while a transaction is open commits it first, with the same check. When that commit fails, for example with an OCC conflict (`40001`) or `25S03`, `SQLSetConnectAttr` returns its error and autocommit stays as it was.
 
-Run transactions with autocommit off, and end them with `SQLEndTran`. A `COMMIT` sent as SQL text still returns success and saves nothing. After a `BEGIN` sent as SQL text with autocommit on, the Windows driver manager doesn't pass `SQLEndTran` to the wrapper, so no check runs there.
+Run transactions with autocommit off, and end them with `SQLEndTran`. After an error, a `COMMIT` sent as SQL text still returns success and saves nothing. After a `BEGIN` sent as SQL text with autocommit on, the Windows driver manager doesn't pass `SQLEndTran` to the wrapper, so no check runs there.
 
 `SAVEPOINT`, `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT` statements that the application sends fail with Aurora DSQL's error.
 
@@ -152,7 +152,7 @@ Other authentication types are allowed:
 - `DATABASE`, or no `RDS_AUTH_TYPE`: `PWD` must be an Aurora DSQL token that you generate.
 - `SECRETS_MANAGER`: the secret's password must be a current Aurora DSQL token. The wrapper logs at INFO level: `[DSQL] With RDS_AUTH_TYPE=SECRETS_MANAGER, the secret's password must be a current Aurora DSQL token: DSQL accepts no other password. RDS_AUTH_TYPE=DSQL generates the token instead.`
 
-With either, see [TLS](#tls) for the `SSLmode` to use.
+With either, when neither `DATABASE` nor its short form `DX` is set, the wrapper uses `postgres`, whatever the `SSLmode`. See [TLS](#tls) for the `SSLmode` to use.
 
 ### Aurora-Only Plugins
 

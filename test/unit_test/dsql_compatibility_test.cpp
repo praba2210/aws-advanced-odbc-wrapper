@@ -107,6 +107,11 @@ namespace {
         return exec_direct_result;
     }
 
+    SQLRETURN FakeGetInfo(SQLHDBC /*connection*/, SQLUSMALLINT /*info_type*/, SQLPOINTER /*value*/,
+                          SQLSMALLINT /*buffer_length*/, SQLSMALLINT* /*length*/) {
+        return SQL_SUCCESS;
+    }
+
     SQLRETURN FakeGetDiagRec(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT record, SQLTCHAR* state,
                              SQLINTEGER* native_error, SQLTCHAR* message, SQLSMALLINT buffer_length,
                              SQLSMALLINT* text_length) {
@@ -130,7 +135,7 @@ namespace {
         return SQL_SUCCESS;
     }
 
-    // Answers SQLAllocHandle, SQLDriverConnect, SQLEndTran, SQLSetConnectAttr, SQLExecDirect and SQLGetDiagRec, records
+    // Answers SQLAllocHandle, SQLDriverConnect, SQLEndTran, SQLSetConnectAttr, SQLExecDirect, SQLGetDiagRec and SQLGetInfo, records
     // every lookup, and returns nullptr for anything else, so a forwarded call fails without reaching a real driver.
     class FakeBaseDriver : public RdsLibLoader {
     public:
@@ -143,6 +148,7 @@ namespace {
                 {RdsFuncNames::SetConnectAttr, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeSetConnectAttr)},
                 {RdsFuncNames::ExecDirect, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeExecDirect)},
                 {RdsFuncNames::GetDiagRec, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeGetDiagRec)},
+                {RdsFuncNames::GetInfo, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeGetInfo)},
             };
             const auto it = functions.find(function_name);
             return it != functions.end() ? it->second : nullptr;
@@ -708,6 +714,94 @@ TEST_F(DsqlCompatibilityTest, GetInfo_OtherDatabase_ReachesBaseDriver) {
     SQLUINTEGER value = 0;
     RDS_SQLGetInfo(&dbc_, SQL_TXN_ISOLATION_OPTION, &value, static_cast<SQLSMALLINT>(sizeof(value)), nullptr);
     EXPECT_TRUE(base_driver_->Requested(RdsFuncNames::GetInfo));
+}
+
+// ODBC-2: a record psqlODBC left on the connection before the wrapper's own answer isn't this call's.
+class DsqlStaleDiagTest : public DsqlCompatibilityTest {
+protected:
+    // psqlODBC has an earlier record (HY000) on the connection.
+    static void LeaveEarlierBaseRecord() { base_sql_state = "HY000"; }
+
+    void ExpectNoBaseRecordReadable() {
+        SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+        SQLTCHAR message[MAX_MSG_LEN] = {0};
+        SQLINTEGER native_error = 0;
+        SQLSMALLINT length = 0;
+        EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagRec(SQL_HANDLE_DBC, &dbc_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                                 &length, false));
+        SQLINTEGER count = -1;
+        EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagField(SQL_HANDLE_DBC, &dbc_, 0, SQL_DIAG_NUMBER, &count, 0, nullptr));
+        EXPECT_EQ(0, count);
+        EXPECT_FALSE(base_driver_->Requested(RdsFuncNames::GetDiagRec));
+    }
+};
+
+TEST_F(DsqlStaleDiagTest, GetInfo_Dsql_LeavesNoEarlierBaseRecord) {
+    UseServer(DSQL_HOST);
+    Connect();
+    LeaveEarlierBaseRecord();
+    SQLUINTEGER value = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetInfo(&dbc_, SQL_TXN_ISOLATION_OPTION, &value,
+                                          static_cast<SQLSMALLINT>(sizeof(value)), nullptr));
+    ExpectNoBaseRecordReadable();
+}
+
+TEST_F(DsqlStaleDiagTest, GetTxnIsolation_Dsql_LeavesNoEarlierBaseRecord) {
+    UseServer(DSQL_HOST);
+    Connect();
+    LeaveEarlierBaseRecord();
+    SQLUINTEGER level = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, &level, 0, nullptr));
+    ExpectNoBaseRecordReadable();
+}
+
+TEST_F(DsqlStaleDiagTest, SetTxnIsolation_DsqlRepeatableRead_LeavesNoEarlierBaseRecord) {
+    UseServer(DSQL_HOST);
+    Connect();
+    LeaveEarlierBaseRecord();
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_TXN_ISOLATION, AsPointer(SQL_TXN_REPEATABLE_READ), 0));
+    ExpectNoBaseRecordReadable();
+}
+
+TEST_F(DsqlStaleDiagTest, SetForcedPgopt_DsqlForcedValue_LeavesNoEarlierBaseRecord) {
+    UseServer(DSQL_HOST);
+    Connect();
+    LeaveEarlierBaseRecord();
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, PGOPT_SERVER_SIDE_PREPARE, AsPointer(0), 0));
+    ExpectNoBaseRecordReadable();
+}
+
+// A failed commit before an autocommit change returns the commit's own error, whose records stay readable.
+TEST_F(DsqlStaleDiagTest, SetAutocommit_DsqlCommitFails_KeepsTheCommitsBaseRecordReadable) {
+    UseServer(DSQL_HOST);
+    Connect();
+    dbc_.auto_commit = false;
+    dbc_.transaction_status = TRANSACTION_OPEN;
+    end_tran_result = SQL_ERROR;
+    LeaveEarlierBaseRecord();
+    EXPECT_EQ(SQL_ERROR, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(SQL_AUTOCOMMIT_ON), 0));
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_DBC, &dbc_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_TRUE(base_driver_->Requested(RdsFuncNames::GetDiagRec));
+}
+
+TEST_F(DsqlStaleDiagTest, GetInfo_OtherDatabase_StillReadsTheBaseRecord) {
+    UseServer(AURORA_HOST);
+    Connect();
+    LeaveEarlierBaseRecord();
+    SQLUINTEGER value = 0;
+    RDS_SQLGetInfo(&dbc_, SQL_TXN_ISOLATION_OPTION, &value, static_cast<SQLSMALLINT>(sizeof(value)), nullptr);
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_DBC, &dbc_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_TRUE(base_driver_->Requested(RdsFuncNames::GetDiagRec));
 }
 
 TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_DropsIsolationSetBeforeConnect) {

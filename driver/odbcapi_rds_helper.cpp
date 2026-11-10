@@ -852,6 +852,7 @@ SQLRETURN RDS_GetConnectAttr(
 
     // Aurora DSQL has one isolation level, whatever psqlODBC would report.
     if (DsqlCompatibility::TryGetConnectAttr(dbc, Attribute, ValuePtr)) {
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;  // the wrapper answered: psqlODBC's records are older
         return SQL_SUCCESS;
     }
 
@@ -864,6 +865,7 @@ SQLRETURN RDS_GetConnectAttr(
         if (StringLengthPtr != nullptr) {
             *StringLengthPtr = static_cast<SQLINTEGER>(sizeof(SQLUINTEGER));
         }
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;
         return SQL_SUCCESS;
     }
 
@@ -1038,6 +1040,7 @@ SQLRETURN RDS_SQLSetConnectAttr(
 #endif
         // The ANSI driver gets no wide text: iODBC converts a wide app's text to ANSI from the app's type whatever the
         // driver answers (conv_text_m2d, CD_W2A), so it takes any value.
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;  // moot before connect
         return SQL_SUCCESS;
     }
 
@@ -1046,6 +1049,11 @@ SQLRETURN RDS_SQLSetConnectAttr(
 
     // Attributes that would make psqlODBC undo a forced option or send a statement Aurora DSQL rejects are answered here.
     if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetConnectAttr(dbc, Attribute, ValuePtr)) {
+        // The wrapper answered: its record, if any, is this call's, and psqlODBC's are older. Not for autocommit: that
+        // answer is the commit's own result, whose records (psqlODBC's included) are the ones to read.
+        if (Attribute != SQL_ATTR_AUTOCOMMIT) {
+            dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;
+        }
         return *dsql_ret;
     }
 

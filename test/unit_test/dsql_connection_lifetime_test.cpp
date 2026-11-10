@@ -22,6 +22,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -282,10 +283,42 @@ namespace {
         return SQL_SUCCESS;
     }
 
-    // Answers SQLGetConnectAttr (W in Unicode builds) and nothing else.
+    // How often the base driver's SQLGetDiagRec ran.
+    int base_get_diag_rec_calls = 0;
+
+    // psqlODBC's record 1 on the connection: an earlier HY000.
+    SQLRETURN FakeGetDiagRec(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT record, SQLTCHAR* state,
+                             SQLINTEGER* native_error, SQLTCHAR* message, SQLSMALLINT buffer_length,
+                             SQLSMALLINT* text_length) {
+        ++base_get_diag_rec_calls;
+        if (record != 1) {
+            return SQL_NO_DATA;
+        }
+        if (state != nullptr) {
+            const std::string_view earlier = "HY000";
+            for (size_t i = 0; i <= earlier.size(); ++i) {
+                state[i] = static_cast<SQLTCHAR>(i < earlier.size() ? earlier[i] : 0);
+            }
+        }
+        if (message != nullptr && buffer_length > 0) {
+            message[0] = 0;
+        }
+        if (native_error != nullptr) {
+            *native_error = 0;
+        }
+        if (text_length != nullptr) {
+            *text_length = 0;
+        }
+        return SQL_SUCCESS;
+    }
+
+    // Answers SQLGetConnectAttr and SQLGetDiagRec (W in Unicode builds) and nothing else.
     class FakeBaseDriver : public RdsLibLoader {
     public:
         RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
+            if (function_name == RdsFuncNames::GetDiagRec) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeGetDiagRec);
+            }
             return function_name == RdsFuncNames::GetConnectAttr
                    ? reinterpret_cast<RdsPlatform::FuncHandle>(&FakeGetConnectAttr)
                    : nullptr;
@@ -333,6 +366,7 @@ protected:
         env_.driver_lib_loader = base_driver_;
         dbc_.env = &env_;
         base_get_connect_attr_calls = 0;
+        base_get_diag_rec_calls = 0;
         base_last_attribute = 0;
     }
 
@@ -402,6 +436,22 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_AtTheLifetime_IsTrueWithou
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, nullptr, 0, nullptr));
     EXPECT_EQ(0, base_get_connect_attr_calls);
     EXPECT_EQ(nullptr, dbc_.err);
+}
+
+// ODBC-2: the wrapper's own retirement answer leaves no earlier psqlODBC record readable.
+TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_Retired_LeavesNoEarlierBaseRecord) {
+    Connect(DSQL_HOST);
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME;
+    SQLUINTEGER dead = SQL_CD_FALSE;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, 0, nullptr));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_CD_TRUE), dead);
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagRec(SQL_HANDLE_DBC, &dbc_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_EQ(0, base_get_diag_rec_calls);
 }
 
 // unixODBC's pool reads it into an SQLULEN set to 0, with SQL_IS_INTEGER, and asks on every reuse.

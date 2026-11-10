@@ -332,7 +332,7 @@ SQLRETURN DsqlOccRetryPlugin::RetryOccConflicts(STMT* stmt, SQLTCHAR* statement_
         LOG(INFO) << "[DSQL] OCC conflict (" << DescribeConflict(sql_state, message) << "): retry " << retry << "/"
                   << config_.max_retries << " in " << delay.count() << " ms";
         if (sleep_(stmt->cancel, delay)) {
-            // No attempt after it: HY008, ahead of the conflict's record.
+            // No attempt after it: HY008 replaces the conflict's record (the wrapper keeps one record per handle).
             LOG(INFO) << "[DSQL] OCC retry " << retry << " canceled during its wait";
             ClearError(stmt);
             stmt->err = std::make_unique<ErrInfo>("Operation canceled: SQLCancel was called while an OCC retry waited",
@@ -343,6 +343,16 @@ SQLRETURN DsqlOccRetryPlugin::RetryOccConflicts(STMT* stmt, SQLTCHAR* statement_
         const std::chrono::steady_clock::time_point attempt_started_at = clock_();
         ret = ExecuteNext(stmt, statement_text, text_length);
         last_attempt = clock_() - attempt_started_at;
+        // SQLCancel came after the wait and before the base driver (DefaultPlugin's EnterBaseDriver): the wrapper's
+        // HY008 says the statement never ran. The first attempt did; say which one didn't. stmt->err holds only the
+        // wrapper's records, so a server-side cancel (psqlODBC's 57014) or an HY008 from psqlODBC isn't taken for it.
+        if (ret == SQL_ERROR && stmt->err != nullptr && stmt->err->sqlstate == "HY008") {
+            LOG(INFO) << "[DSQL] OCC retry " << retry << " canceled before it ran";
+            stmt->err = std::make_unique<ErrInfo>(
+                "Operation canceled: SQLCancel was called before OCC retry " + std::to_string(retry) + " ran",
+                ERR_OPERATION_CANCELED);
+            return SQL_ERROR;
+        }
         if (ret != SQL_ERROR) {
             return ret;
         }

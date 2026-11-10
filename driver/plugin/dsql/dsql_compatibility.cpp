@@ -390,6 +390,7 @@ bool DsqlCompatibility::TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER 
         return false;
     }
     ClearError(dbc);
+    dbc->base_diag_stale = true;  // the wrapper answers: psqlODBC's records are older (HasWrappedHandle was checked)
     // SQL_TXN_ISOLATION_OPTION is a bitmask of the supported levels; Aurora DSQL has one.
     if (value != nullptr) {
         *static_cast<SQLUINTEGER*>(value) = DSQL_ISOLATION;

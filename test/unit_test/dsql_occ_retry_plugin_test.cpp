@@ -337,6 +337,9 @@ namespace {
             // Like psqlODBC, every execution starts with no record of its own.
             g_base_state.clear();
             g_base_message.clear();
+            if (step.code == ERR_OPERATION_CANCELED) {
+                return RDS_StatementCanceled(stmt);
+            }
             if (step.ret == SQL_ERROR) {
                 if (report_ == Report::BASE_RECORD) {
                     g_base_state = step.state;
@@ -460,6 +463,8 @@ namespace {
     Step Fail(SQL_STATE_CODE code, const std::string& state, const std::string& message) {
         return {SQL_ERROR, code, state, message};
     }
+    // SQLCancel came after the retry's wait and before the base driver: the wrapper's HY008 (the step runs RDS_StatementCanceled).
+    Step CanceledBeforeTheBase() { return {SQL_ERROR, ERR_OPERATION_CANCELED, "HY008", ""}; }
 
     // Collects log lines, so a test can count what the plugin logged.
     class OccLogSink : public nglog::LogSink {
@@ -911,7 +916,7 @@ TEST_F(DsqlOccRetryExecuteTest, ZeroMaxRetries_RunsOnce) {
     EXPECT_EQ(0, g_get_stmt_attr_calls);
 }
 
-// An SQLCancel during a retry's wait ends the call: no other attempt, and HY008 ahead of the conflict's record.
+// An SQLCancel during a retry's wait ends the call: no other attempt, and HY008 replaces the conflict's record.
 TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnotherAttempt) {
     const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
     canceled_during_wait_ = true;
@@ -920,6 +925,30 @@ TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnother
     EXPECT_EQ((std::vector<int64_t>{100}), sleeps_ms_);
     ASSERT_NE(nullptr, stmt_->err);
     EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+    // The conflict's 40001 isn't kept behind it.
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_EQ("HY008", ToUtf8(state));
+    EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 2, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+}
+
+// A cancel after the wait and before the base driver: the first attempt ran, the retry didn't, and the message says so.
+TEST_F(DsqlOccRetryExecuteTest, CanceledAfterTheWait_SaysWhichRetryDidntRun) {
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), CanceledBeforeTheBase(), Ok()});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(2U, chain->calls);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+    EXPECT_EQ("Operation canceled: SQLCancel was called before OCC retry 1 ran", std::string(stmt_->err->error_msg));
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC retry 1 canceled before it ran"));
 }
 
 // The plugin's own wait is the statement's CancelState::WaitFor: a canceled call doesn't wait out the delay.

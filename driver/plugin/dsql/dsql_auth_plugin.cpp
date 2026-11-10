@@ -359,7 +359,8 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
 DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map<std::string, std::string>& conn_attr)
 {
     ProviderInputs inputs{.key_profile = GetProfileKey(conn_attr), .env_profile = std::nullopt,
-                          .region = ResolveDsqlRegion(conn_attr),};
+                          .region = ResolveDsqlRegion(conn_attr),
+    };
     if (const char* value = std::getenv("AWS_PROFILE"); inputs.key_profile.empty() && value) {
         inputs.env_profile = value;
     }

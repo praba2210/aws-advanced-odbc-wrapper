@@ -1345,16 +1345,20 @@ TEST_F(DsqlAuthPluginTest, Connect_InjectedProvider_IsNeverReplaced) {
 TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvider) {
     const ScopedEnvVars env = OnlyProfileCredentials();
     dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dsql_static");
+    // Only the first two connects reach the base driver; the third fails on its credentials.
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(2))
         .WillRepeatedly(testing::Return(SQL_SUCCESS));
     DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
     ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
 
-    ResetAttributes(dbc_, "dsql_static", "DATABASE");
+    // The pass-through names another profile; it must not count as a build for it.
+    ResetAttributes(dbc_, "no_such_profile", "DATABASE");
     ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
 
     ResetAttributes(dbc_, "no_such_profile");
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
     EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
 }

@@ -16,6 +16,7 @@
 #define AUTH_MOCK_OBJECTS_H_
 
 #include <aws/core/auth/AWSCredentials.h>
+#include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/Aws.h>
 #include <aws/core/http/HttpClient.h>
 #include <aws/rds/RDSClient.h>
@@ -33,6 +34,12 @@
 #include "../../driver/util/aws_sdk_helper.h"
 
 #include <sqlext.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <utility>
+#include <vector>
 
 class MockSamlUtil : public SamlUtil {
 public:
@@ -154,6 +161,23 @@ public:
     MockSsoLoginUtil() : SsoBrowserLoginUtil() { AwsSdkHelper::Init(); };
 
     MOCK_METHOD(Aws::Auth::AWSCredentials, GetAwsCredentials, (bool allow_interactive, std::string& out_error), (override));
+};
+
+// A credentials source that answers from a fixed list (the last one repeats) and counts the reads.
+class CountingCredentialsProvider : public Aws::Auth::AWSCredentialsProvider {
+public:
+    explicit CountingCredentialsProvider(std::vector<Aws::Auth::AWSCredentials> answers)
+        : answers_(std::move(answers)) {}
+
+    Aws::Auth::AWSCredentials GetAWSCredentials() override {
+        const int index = reads_++;
+        return answers_[std::min<std::size_t>(static_cast<std::size_t>(index), answers_.size() - 1)];
+    }
+    [[nodiscard]] int Reads() const { return reads_; }
+
+private:
+    std::vector<Aws::Auth::AWSCredentials> answers_;
+    std::atomic<int> reads_{0};
 };
 
 #endif // AUTH_MOCK_OBJECTS_H_

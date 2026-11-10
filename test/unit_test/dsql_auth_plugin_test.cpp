@@ -38,6 +38,7 @@
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_auth_provider.h"
 #include "../../driver/util/logger_wrapper.h"
 
 #ifndef AWS_PROFILE_TEST_RESOURCES_DIR
@@ -259,6 +260,17 @@ TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
     EXPECT_EQ("Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such as "
               "environment variables, ~/.aws/credentials, an AWS IAM Identity Center (SSO) session, or a container "
               "or instance role)", dbc_->err->error_msg);
+}
+
+// The plugin checks the credentials and then asks for the token; the real provider reads its source once for both.
+TEST_F(DsqlAuthPluginTest, Connect_ReadsCredentialsOnce) {
+    const auto source = std::make_shared<CountingCredentialsProvider>(
+        std::vector{Aws::Auth::AWSCredentials("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")});
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, std::make_shared<DsqlAuthProvider>("us-west-2", source));
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(1, source->Reads());
 }
 
 namespace {

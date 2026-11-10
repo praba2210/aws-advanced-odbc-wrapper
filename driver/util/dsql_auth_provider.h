@@ -18,8 +18,12 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
+
+#include <aws/core/auth/AWSCredentials.h>
 
 #include "auth_provider.h"
 
@@ -50,6 +54,8 @@ public:
     DsqlAuthProvider(const std::string &region, const std::string &profile,
                      ProfileSource source = ProfileSource::DEFAULT_CHAIN);
     DsqlAuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials);
+    // Reads the credentials from the given source. Public for tests.
+    DsqlAuthProvider(const std::string &region, std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source);
 
     std::pair<std::string, bool> GetToken(
         const std::string &server,
@@ -59,7 +65,9 @@ public:
         bool use_cache = true,
         bool extra_url_encode = false,
         std::chrono::milliseconds time_to_expire_ms = DEFAULT_EXPIRATION_MS) override;
-    // Checked against the provider on every call, so a handle recovers after `aws sso login` and stops at expiry.
+    // Reads the credentials source once and keeps the result for the next GetToken, which then doesn't read again, so a
+    // connect reads once. Checked against the source on every call, so a handle recovers after `aws sso login` and
+    // stops at expiry. A failed check keeps nothing.
     [[nodiscard]] bool HasResolvedCredentials() const override;
 
     static inline const std::string ADMIN_USER = "admin";
@@ -77,10 +85,19 @@ public:
                                                                                     const std::string& region);
 
 private:
-    void SetUpDsqlClient(const std::string &region);
+    class SnapshotCredentialsProvider;
 
-    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider_;
+    void SetUpDsqlClient(const std::string &region);
+    // The credentials HasResolvedCredentials kept, which are then gone; else one read of the source.
+    Aws::Auth::AWSCredentials TakeCheckedCredentials() const;
+
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source_;
+    // What the DSQL client signs with: the checked credentials for the length of one signing call.
+    std::shared_ptr<SnapshotCredentialsProvider> signing_;
     std::shared_ptr<Aws::DSQL::DSQLClient> dsql_client_;
+    std::mutex sign_mutex_;  // one signing call at a time, so the snapshot is not replaced under it
+    mutable std::mutex pending_mutex_;
+    mutable std::optional<Aws::Auth::AWSCredentials> pending_;
 };
 
 #endif // DSQL_AUTH_PROVIDER_H_

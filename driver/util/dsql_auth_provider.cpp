@@ -14,6 +14,7 @@
 
 #include "dsql_auth_provider.h"
 
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -89,37 +90,58 @@ namespace {
     }
 }  // namespace
 
+// What DSQLClient signs with: the credentials GetToken checked, set just before signing and cleared after.
+class DsqlAuthProvider::SnapshotCredentialsProvider final : public Aws::Auth::AWSCredentialsProvider {
+public:
+    Aws::Auth::AWSCredentials GetAWSCredentials() override
+    {
+        const std::lock_guard lock(mutex_);
+        return credentials_;
+    }
+    void Set(Aws::Auth::AWSCredentials credentials)
+    {
+        const std::lock_guard lock(mutex_);
+        credentials_ = std::move(credentials);
+    }
+
+private:
+    std::mutex mutex_;
+    Aws::Auth::AWSCredentials credentials_;
+};
+
 DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile, ProfileSource source) {
     // The base default constructor skips Init, but the base destructor always calls Shutdown.
     AwsSdkHelper::Init();
     if (source == ProfileSource::KEY) {
         if (ProfileExists(profile)) {
-            credentials_provider_ = MakeProfileOnlyChain(profile, region);
+            source_ = MakeProfileOnlyChain(profile, region);
         } else {
             // Nothing to sign with, so the connect fails and names the profile, instead of signing with the
             // environment, a container or the instance role.
-            credentials_provider_ =
+            source_ =
                 std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(Aws::Auth::AWSCredentials{});
         }
     } else if (profile.empty()) {
-        credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+        source_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
     } else {
         Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config{};
         credential_config.profile = profile;
-        credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
+        source_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
-    // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own.
-    // Qualified: a virtual call from a constructor never reaches an override anyway.
-    if (!DsqlAuthProvider::HasResolvedCredentials()) {
-        LOG(ERROR) << "Unable to resolve AWS credentials for Aurora DSQL authentication"
-                   << (profile.empty() ? "" : " with profile '" + profile + "'");
-    }
+    // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own. It is
+    // read once per connect, not here: the failure is reported by the connect.
     SetUpDsqlClient(region);
 }
 
 DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials) {
     AwsSdkHelper::Init();
-    credentials_provider_ = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials);
+    source_ = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials);
+    SetUpDsqlClient(region);
+}
+
+DsqlAuthProvider::DsqlAuthProvider(const std::string &region, std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source) {
+    AwsSdkHelper::Init();
+    source_ = std::move(source);
     SetUpDsqlClient(region);
 }
 
@@ -134,7 +156,9 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
 {
     // Check before signing, so an unusable token is never sent. Credentials can disappear or expire after
     // construction, for example when an SSO session ends.
-    if (const std::string_view problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
+    // The credentials the connect's check read, else one read here. Either way this is the connect's only read.
+    const Aws::Auth::AWSCredentials credentials = TakeCheckedCredentials();
+    if (const std::string_view problem = CredentialsProblem(credentials); !problem.empty()) {
         LOG(ERROR) << problem;
         return {"", false};
     }
@@ -152,9 +176,13 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     // without custom memory management. Not .c_str(): clang-tidy flags it as redundant even where that build needs it.
     const Aws::String aws_host(host.data(), host.size());
     const Aws::String aws_region(region.data(), region.size());
+    // The presigner reads its provider, so give it the credentials checked above and take them back after.
+    const std::lock_guard sign_lock(sign_mutex_);
+    signing_->Set(credentials);
     const auto outcome = is_admin
         ? dsql_client_->GenerateDBConnectAdminAuthToken(aws_host, aws_region, lifetime.count())
         : dsql_client_->GenerateDBConnectAuthToken(aws_host, aws_region, lifetime.count());
+    signing_->Set(Aws::Auth::AWSCredentials{});
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
@@ -179,8 +207,9 @@ Aws::Client::GenericClientConfiguration DsqlAuthProvider::MakeClientConfiguratio
 
 void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
 {
+    signing_ = std::make_shared<SnapshotCredentialsProvider>();
     dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(
-        credentials_provider_, nullptr, MakeClientConfiguration(region));
+        signing_, nullptr, MakeClientConfiguration(region));
 }
 
 bool DsqlAuthProvider::ProfileExists(const std::string& profile)
@@ -264,5 +293,23 @@ std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLogi
 
 bool DsqlAuthProvider::HasResolvedCredentials() const
 {
-    return CredentialsProblem(credentials_provider_->GetAWSCredentials()).empty();
+    Aws::Auth::AWSCredentials credentials = source_->GetAWSCredentials();
+    const bool usable = CredentialsProblem(credentials).empty();
+    // Only a usable read is kept for the GetToken that follows; a failed check leaves nothing for the next token.
+    const std::lock_guard lock(pending_mutex_);
+    pending_ = usable ? std::optional(std::move(credentials)) : std::nullopt;
+    return usable;
+}
+
+Aws::Auth::AWSCredentials DsqlAuthProvider::TakeCheckedCredentials() const
+{
+    {
+        const std::lock_guard lock(pending_mutex_);
+        if (pending_) {
+            Aws::Auth::AWSCredentials credentials = std::move(*pending_);
+            pending_.reset();
+            return credentials;
+        }
+    }
+    return source_->GetAWSCredentials();
 }

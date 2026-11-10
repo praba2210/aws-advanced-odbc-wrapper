@@ -28,6 +28,7 @@
 #include <aws/core/utils/DateTime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +39,7 @@
 #include <type_traits>
 #include <typeinfo>
 
+#include "auth_mock_objects.h"
 #include "scoped_ctype_locale.h"
 #include "scoped_env_vars.h"
 
@@ -120,6 +122,8 @@ namespace {
     bool SignsWith(const std::string& token, const std::string& access_key) {
         return token.find("X-Amz-Credential=" + access_key + "%2F") != std::string::npos;
     }
+
+    const std::string SECRET_KEY = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 }  // namespace
 
 // DSQL tokens are presigned locally, so these tests run the real SDK with fake keys and never reach AWS.
@@ -409,4 +413,65 @@ TEST_F(DsqlAuthProviderTest, GetToken_NonPositiveExpiration_UsesDefault) {
         const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, expiration).first;
         EXPECT_NE(std::string::npos, token.find("X-Amz-Expires=900")) << expiration.count();
     }
+}
+
+// A connect checks the credentials, then signs. That is one read of the source, not a read per step.
+TEST_F(DsqlAuthProviderTest, OneCredentialsReadPerConnect) {
+    const auto source = std::make_shared<CountingCredentialsProvider>(
+        std::vector{Aws::Auth::AWSCredentials("AKIDEXAMPLE", SECRET_KEY)});
+    DsqlAuthProvider provider(REGION, source);
+    EXPECT_EQ(0, source->Reads());
+
+    EXPECT_TRUE(provider.HasResolvedCredentials());
+    EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDEXAMPLE"));
+    EXPECT_EQ(1, source->Reads());
+
+    // Without a check first, GetToken reads once itself. The check's read was used up by the token before.
+    EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDEXAMPLE"));
+    EXPECT_EQ(2, source->Reads());
+}
+
+// The token is signed with the credentials the check read, not with a second read that may differ.
+TEST_F(DsqlAuthProviderTest, SignsWithTheCheckedCredentials) {
+    const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY)});
+    DsqlAuthProvider provider(REGION, source);
+    ASSERT_TRUE(provider.HasResolvedCredentials());
+    const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first;
+    EXPECT_TRUE(SignsWith(token, "AKIDKEYA"));
+    EXPECT_FALSE(SignsWith(token, "AKIDKEYB"));
+}
+
+// A check that failed keeps nothing: the next token reads the source again and signs with what it finds.
+TEST_F(DsqlAuthProviderTest, FailedCheck_DoesNotLeaveCredentialsForTheNextToken) {
+    const Aws::Auth::AWSCredentials expired("AKIDOLD", SECRET_KEY, "", Aws::Utils::DateTime::Now() - std::chrono::hours(1));
+    const auto source = std::make_shared<CountingCredentialsProvider>(
+        std::vector{expired, Aws::Auth::AWSCredentials("AKIDNEW", SECRET_KEY)});
+    DsqlAuthProvider provider(REGION, source);
+    EXPECT_FALSE(provider.HasResolvedCredentials());
+    EXPECT_EQ(1, source->Reads());
+
+    const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first;
+    EXPECT_EQ(2, source->Reads());
+    EXPECT_TRUE(SignsWith(token, "AKIDNEW"));
+}
+
+// A snapshot signs one token. A later connect that skips the check does not sign with an earlier connect's credentials.
+TEST_F(DsqlAuthProviderTest, CheckedCredentials_AreUsedByOneToken) {
+    const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY)});
+    DsqlAuthProvider provider(REGION, source);
+    ASSERT_TRUE(provider.HasResolvedCredentials());
+    EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDKEYA"));
+    EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDKEYB"));
+}
+
+// The client signs only while a token is being made: an expired source after a signed token yields no token.
+TEST_F(DsqlAuthProviderTest, Snapshot_IsClearedAfterSigning) {
+    const Aws::Auth::AWSCredentials expired("AKIDGONE", SECRET_KEY, "", Aws::Utils::DateTime::Now() - std::chrono::hours(1));
+    const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), expired});
+    DsqlAuthProvider provider(REGION, source);
+    ASSERT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
+    EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);
 }

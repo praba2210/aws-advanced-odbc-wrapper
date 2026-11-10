@@ -53,6 +53,8 @@ namespace {
     std::string g_state;
     // A base driver built with a 4-byte SQLWCHAR: its text and SQLSTATEs are UCS-4.
     bool g_four_byte_base = false;
+    // What SQLEndTran returns for a handle; SQL_SUCCESS for one not in it.
+    std::map<SQLHANDLE, SQLRETURN> g_end_tran_results;
 
     // What it got.
     int g_probe_stand_in = 0;
@@ -131,7 +133,8 @@ namespace {
 
     SQLRETURN FakeEndTran(SQLSMALLINT /*handle_type*/, SQLHANDLE handle, SQLSMALLINT completion_type) {
         g_end_trans.emplace_back(handle, completion_type);
-        return SQL_SUCCESS;
+        const auto it = g_end_tran_results.find(handle);
+        return it != g_end_tran_results.end() ? it->second : SQL_SUCCESS;
     }
 
     SQLRETURN FakeParamData(SQLHSTMT /*statement*/, SQLPOINTER* /*value*/) {
@@ -209,6 +212,7 @@ protected:
         g_param_data_result = SQL_SUCCESS;
         g_state.clear();
         g_four_byte_base = false;
+        g_end_tran_results.clear();
         g_alloc_calls = 0;
         g_exec_texts.clear();
         g_diag_handle_types.clear();
@@ -397,6 +401,37 @@ TEST_F(DsqlTransactionAbortTest, EnvCommit_TheKept25S03_IsTheEnvironmentsRecord)
     EXPECT_EQ("25S03", BaseText(state));
     EXPECT_EQ(ROLLED_BACK, BaseText(message));
     EXPECT_EQ(static_cast<SQLSMALLINT>(ROLLED_BACK.size()), length);
+}
+
+// On any database: a connection's failed commit is the environment's result, although the base environment's own call
+// after the loop succeeds. The other connections are still committed, and the environment gets no record of its own.
+TEST_F(DsqlTransactionAbortTest, EnvCommit_AConnectionsCommitFails_IsKeptOverTheEnvironmentsSuccess) {
+    dbc_.is_dsql = false;
+    Open(second_, second_base_dbc_stand_in_);
+    second_.is_dsql = false;
+    g_end_tran_results[static_cast<SQLHANDLE>(&base_dbc_stand_in_)] = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    const std::vector<std::pair<SQLHANDLE, SQLSMALLINT>> expected = {
+        {static_cast<SQLHANDLE>(&base_dbc_stand_in_), SQL_COMMIT},
+        {static_cast<SQLHANDLE>(&second_base_dbc_stand_in_), SQL_COMMIT},
+        {static_cast<SQLHANDLE>(&base_env_stand_in_), SQL_COMMIT},
+    };
+    EXPECT_EQ(expected, g_end_trans);
+    EXPECT_EQ(TRANSACTION_OPEN, dbc_.transaction_status);
+    EXPECT_EQ(TRANSACTION_CLOSED, second_.transaction_status);
+    EXPECT_EQ(nullptr, env_.err);
+}
+
+// On any database: with every connection committed, the base environment's failure is the result.
+TEST_F(DsqlTransactionAbortTest, EnvCommit_EveryConnectionCommits_ReturnsTheEnvironmentsFailure) {
+    dbc_.is_dsql = false;
+    Open(second_, second_base_dbc_stand_in_);
+    second_.is_dsql = false;
+    g_end_tran_results[static_cast<SQLHANDLE>(&base_env_stand_in_)] = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    EXPECT_EQ(3U, g_end_trans.size());
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_.transaction_status);
+    EXPECT_EQ(TRANSACTION_CLOSED, second_.transaction_status);
 }
 
 #if UNICODE && !defined(_WIN32)

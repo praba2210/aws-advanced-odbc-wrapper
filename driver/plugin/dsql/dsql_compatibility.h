@@ -50,7 +50,8 @@ namespace DsqlCompatibility {
 
     // SQLSetConnectAttr on an Aurora DSQL connection, for the attributes that would undo a forced psqlODBC option or
     // make psqlODBC send a statement Aurora DSQL rejects: the result to return without calling psqlODBC, or nullopt to
-    // call it as usual.
+    // call it as usual. An autocommit change on a connected Aurora DSQL connection commits first (SQLEndTran): when
+    // that fails, its result, and autocommit isn't switched.
     std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
 
     // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without

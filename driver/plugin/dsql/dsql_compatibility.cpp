@@ -29,6 +29,7 @@
 #include "../../driver.h"
 #include "../../error.h"
 #include "../../odbcapi.h"
+#include "../../odbcapi_rds_helper.h"
 #include "../../util/dsql_connection_lifetime.h"
 #include "../../util/logger_wrapper.h"
 #include "../../util/odbc_helper.h"
@@ -335,6 +336,20 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEG
             // Never forwarded: psqlODBC would send SET SESSION CHARACTERISTICS, which Aurora DSQL rejects.
             if (IsDsql(dbc)) {
                 return SetIsolation(dbc, value);
+            }
+            return std::nullopt;
+        case SQL_ATTR_AUTOCOMMIT:
+            // Switching autocommit inside a transaction commits it, and psqlODBC drops that COMMIT's result
+            // (CC_set_autocommit), while Aurora DSQL reports OCC conflicts at COMMIT. So commit through SQLEndTran
+            // first, which also rolls back a failed transaction (25S03), and on an error leave autocommit as it is.
+            // SQLEndTran takes only the connection's lock, which is recursive and held here.
+            if (const SQLULEN mode = IntegerValue(value);
+                (mode == SQL_AUTOCOMMIT_ON || mode == SQL_AUTOCOMMIT_OFF)
+                && (mode == SQL_AUTOCOMMIT_ON) != dbc->auto_commit && IsDsql(dbc) && HasWrappedHandle(dbc)
+                && dbc->conn_status == CONN_CONNECTED) {
+                if (const SQLRETURN commit = RDS_SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT); !SQL_SUCCEEDED(commit)) {
+                    return commit;
+                }
             }
             return std::nullopt;
         default:

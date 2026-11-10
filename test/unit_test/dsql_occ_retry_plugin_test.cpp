@@ -302,11 +302,13 @@ namespace {
     };
 
     // One scripted result of the rest of the chain. code is the wrapper's error code, state the base driver's SQLSTATE.
+    // cancel: SQLCancel came before the base driver, which DefaultPlugin answers with RDS_StatementCanceled.
     struct Step {
         SQLRETURN ret;
         SQL_STATE_CODE code;
         std::string state;
         std::string message;
+        bool cancel = false;
     };
 
     Step Ok() { return {SQL_SUCCESS, ERR_GENERAL_ERROR, "", ""}; }
@@ -337,7 +339,7 @@ namespace {
             // Like psqlODBC, every execution starts with no record of its own.
             g_base_state.clear();
             g_base_message.clear();
-            if (step.code == ERR_OPERATION_CANCELED) {
+            if (step.cancel) {
                 return RDS_StatementCanceled(stmt);
             }
             if (step.ret == SQL_ERROR) {
@@ -463,8 +465,9 @@ namespace {
     Step Fail(SQL_STATE_CODE code, const std::string& state, const std::string& message) {
         return {SQL_ERROR, code, state, message};
     }
-    // SQLCancel came after the retry's wait and before the base driver: the wrapper's HY008 (the step runs RDS_StatementCanceled).
-    Step CanceledBeforeTheBase() { return {SQL_ERROR, ERR_OPERATION_CANCELED, "HY008", ""}; }
+    // SQLCancel came after the retry's wait and before the base driver: the wrapper's HY008 (the step runs
+    // RDS_StatementCanceled).
+    Step CanceledBeforeTheBase() { return {SQL_ERROR, ERR_OPERATION_CANCELED, "HY008", "", true}; }
 
     // Collects log lines, so a test can count what the plugin logged.
     class OccLogSink : public nglog::LogSink {
@@ -979,7 +982,8 @@ TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnother
 
 // A cancel after the wait and before the base driver: the first attempt ran, the retry didn't, and the message says so.
 TEST_F(DsqlOccRetryExecuteTest, CanceledAfterTheWait_SaysWhichRetryDidntRun) {
-    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), CanceledBeforeTheBase(), Ok()});
+    const auto chain =
+        std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), CanceledBeforeTheBase(), Ok()});
     OccLogSink sink;
     nglog::AddLogSink(&sink);
     EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));

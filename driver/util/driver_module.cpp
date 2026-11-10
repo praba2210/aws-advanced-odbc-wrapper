@@ -17,6 +17,7 @@
 #include "windows_headers.h"
 
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <string>
 
@@ -28,9 +29,11 @@
 
 namespace {
 std::atomic<bool> g_pinned{false};  // its address is in this library
+std::atomic<std::size_t> g_pin_calls{0};
 }  // namespace
 
 void DriverModule::Pin() {
+    ++g_pin_calls;
     static std::once_flag once;
     std::call_once(once, [] {
 #ifdef _WIN32
@@ -61,3 +64,5 @@ void DriverModule::Pin() {
 }
 
 bool DriverModule::IsPinned() { return g_pinned; }
+
+std::size_t DriverModule::PinCalls() { return g_pin_calls; }

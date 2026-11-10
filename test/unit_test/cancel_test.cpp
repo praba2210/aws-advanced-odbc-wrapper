@@ -25,6 +25,7 @@
 #include <chrono>
 #include <algorithm>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -89,6 +90,7 @@ namespace {
         std::vector<std::string> calls;                 // the frees, the disconnects and the cancels' ends, in order
         std::multiset<std::uintptr_t> cancel_connections;  // the connections of the statements a cancel is inside on
         bool module_pinned_at_cancel = false;           // DriverModule::IsPinned() as the last SQLCancel came in
+        std::size_t pin_calls_at_cancel = 0;            // DriverModule::PinCalls() then
         std::set<std::uintptr_t> lost;                  // statements whose execute lost the connection (08S01)
         std::uintptr_t next_handle = 0x1000;
         bool has_cancel = true;
@@ -291,6 +293,7 @@ namespace {
             return SQL_INVALID_HANDLE;
         }
         base_driver->module_pinned_at_cancel = DriverModule::IsPinned();
+        base_driver->pin_calls_at_cancel = DriverModule::PinCalls();
         ++base_driver->cancels;
         ++base_driver->cancels_inside;
         const std::uintptr_t connection = base_driver->live.at(Id(stmt));
@@ -1473,10 +1476,14 @@ TEST_F(CancelTest, Cancel_BlockedOnOneStatement_OtherStatementFreedThenEnvironme
 }
 
 // A cancel that reaches the base driver pins this library first: the base call can outlive the app's last free, and
-// the driver manager may unload the driver then, while this thread still has to return into it.
+// the driver manager may unload the driver then, while this thread still has to return into it. The base driver sees
+// the cancel's Pin() call already made, on every platform, also where nothing can be pinned.
 TEST_F(CancelTest, Cancel_PinsTheDriverModuleBeforeTheBaseCall) {
+    const std::size_t pin_calls = DriverModule::PinCalls();
     EXPECT_EQ(SQL_SUCCESS, SQLCancel(stmt_));
     ASSERT_EQ(1, base_driver->cancels);
+    EXPECT_EQ(pin_calls + 1, base_driver->pin_calls_at_cancel);
+    EXPECT_EQ(pin_calls + 1, DriverModule::PinCalls());
 #ifndef _WIN32
     if (!DriverModule::IsPinned()) {
         // Here the library is the unit-test executable, which dlopen doesn't find by the name dladdr gives it (its

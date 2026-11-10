@@ -494,8 +494,12 @@ std::string DsqlAuthPlugin::DefaultRootCert(const std::optional<int> libpq_versi
     if (!libpq_version || *libpq_version >= LIBPQ_16) {
         return SYSTEM_ROOT_CERT;
     }
-    const auto* const bundle = std::ranges::find_if(SYSTEM_CA_BUNDLES, is_trusted_file);
-    return bundle == SYSTEM_CA_BUNDLES.end() ? "" : *bundle;
+    for (const char* bundle : SYSTEM_CA_BUNDLES) {
+        if (is_trusted_file(bundle)) {
+            return bundle;
+        }
+    }
+    return "";
 }
 
 bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)

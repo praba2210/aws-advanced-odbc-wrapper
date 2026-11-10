@@ -1463,29 +1463,58 @@ TEST_F(DsqlAuthPluginTest, Defaults_BundleRootCert_IsAdded) {
 #ifndef _WIN32
 namespace {
     constexpr int FAKE_LIBPQ_VERSION = 150004;
-    int FakePQlibVersion() { return FAKE_LIBPQ_VERSION; }
+    int g_fake_libpq_version = FAKE_LIBPQ_VERSION;
+    int FakePQlibVersion() { return g_fake_libpq_version; }
 
+    // A loader whose PQlibVersion returns the given version, or that has none.
     class FakeLibpqLoader : public RdsLibLoader {
     public:
-        explicit FakeLibpqLoader(const bool has_function) : RdsLibLoader(""), has_function_(has_function) {}
+        explicit FakeLibpqLoader(const std::optional<int> version) : RdsLibLoader(""), version_(version) {}
 
         RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
-            if (!has_function_ || function_name != "PQlibVersion") {
+            if (!version_ || function_name != "PQlibVersion") {
                 return nullptr;
             }
+            g_fake_libpq_version = *version_;
             return reinterpret_cast<RdsPlatform::FuncHandle>(&FakePQlibVersion);
         }
 
     private:
-        bool has_function_;
+        std::optional<int> version_;
     };
 }  // namespace
 
 TEST_F(DsqlAuthPluginTest, BaseLibpqVersion_ReadsTheBaseDriversLibpq) {
     EXPECT_EQ(std::optional<int>(FAKE_LIBPQ_VERSION),
-              DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(true)));
-    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(false)));
+              DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(FAKE_LIBPQ_VERSION)));
+    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(std::nullopt)));
     EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(nullptr));
+}
+
+// Connect picks the root certificate from the base driver's libpq version. The tests above run without an ENV, which
+// reads as an unknown version, so only this one fails if Connect stops passing the choice on.
+TEST_F(DsqlAuthPluginTest, Connect_RootCertFollowsTheBaseLibpqVersion) {
+    for (const auto& [version, expect_system] : std::map<int, bool>{{150004, false}, {160004, true}}) {
+        ENV env;
+        env.driver_lib_loader = std::make_shared<FakeLibpqLoader>(version);
+        dbc_->env = &env;
+        dbc_->conn_attr.erase("PQOPT");
+        EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_, testing::_,
+                                                   testing::_, testing::_))
+            .WillOnce(testing::Return(FRESH_TOKEN));
+        std::string pqopt;
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, &pqopt](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                     SQLUSMALLINT) {
+                pqopt = dbc_->conn_attr.at("PQOPT");
+                return SQL_SUCCESS;
+            }));
+
+        EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider()) << version;
+        // Before libpq 16 this holds with a bundle or without one: "system" is never added.
+        EXPECT_EQ(expect_system, pqopt.find("sslrootcert=system") != std::string::npos) << version << " " << pqopt;
+        dbc_->env = nullptr;
+    }
 }
 
 TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RejectsFilesAndDirectoriesNotOwnedByRoot) {

@@ -78,11 +78,24 @@ TEST(SecureWipeTest, WipeString_ZeroesTheWholeBuffer) {
     EXPECT_EQ(std::vector<char>(capacity, '\0'), std::vector<char>(text.data(), text.data() + capacity));
 }
 
+// A value in the small-string buffer, inside the string object, is wiped there up to the capacity, an earlier and
+// longer value too.
 TEST(SecureWipeTest, WipeString_EmptyAndSmallStrings) {
     std::string empty;
     SecureWipeString(empty);
     EXPECT_TRUE(empty.empty());
-    std::string small = "abc";
+
+    std::string small = "abcdefgh";
+    small.assign("abc");  // the bytes past the new end still hold the earlier value
+    const char* const buffer = small.data();
+    const size_t capacity = small.capacity();
+    const auto* const object = reinterpret_cast<const char*>(&small);
+    ASSERT_TRUE(buffer >= object && buffer < object + sizeof(small));  // the small-string buffer
+    ASSERT_EQ('h', std::string_view(buffer, capacity)[7]);
+
     SecureWipeString(small);
+
     EXPECT_TRUE(small.empty());
+    EXPECT_TRUE(buffer == small.data());
+    EXPECT_EQ(std::vector<char>(capacity, '\0'), std::vector<char>(small.data(), small.data() + capacity));
 }

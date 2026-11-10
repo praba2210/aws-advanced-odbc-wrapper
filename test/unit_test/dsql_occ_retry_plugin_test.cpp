@@ -635,6 +635,29 @@ TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_ManySemicolonsWithU
     EXPECT_LT(elapsed, TIME_LIMIT);
 }
 
+// Commented-out SQL before a statement: each ';' in a -- line starts a read that runs over the lines after it, which
+// adds up to many times the text. Under the scan's floor that is still read through, so no transaction is found where
+// there is none.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_CommentedOutStatementsBeforeAStatement_None) {
+    constexpr int COMMENT_LINES = 50;
+    std::string statement;
+    for (int i = 0; i < COMMENT_LINES; ++i) {
+        statement += "-- UPDATE t SET v = " + std::to_string(i) + ";\n";
+    }
+    statement += "UPDATE t SET v = 1";
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement));
+}
+
+// A long batch of ordinary statements reads each one once: no transaction.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_LongBatch_None) {
+    constexpr int STATEMENTS = 20000;
+    std::string statement;
+    for (int i = 0; i < STATEMENTS; ++i) {
+        statement += "SELECT 1;";
+    }
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement));
+}
+
 TEST(DsqlOccRetryBackoffTest, DoublesFromTheBaseUpToTheCap) {
     const OccRetryConfig config;
     const std::vector<int64_t> expected = {100, 200, 400, 800, 1600, 3200, 5000, 5000};

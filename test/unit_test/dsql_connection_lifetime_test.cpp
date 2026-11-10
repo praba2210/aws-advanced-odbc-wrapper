@@ -30,6 +30,7 @@
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi.h"
 #include "../../driver/odbcapi_rds_helper.h"
+#include "../../driver/plugin/dsql/dsql_compatibility.h"
 #include "../../driver/util/attribute_validator.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_connection_lifetime.h"
@@ -661,7 +662,15 @@ TEST_F(DsqlConnectionLifetimeChainTest, InitializeConnection_DsqlThenOtherThenDs
     ASSERT_NO_FATAL_FAILURE(ConnectTo(DSQL_HOST));
     EXPECT_TRUE(dbc_->is_dsql);
     EXPECT_EQ(lifetime, dbc_->dsql_lifetime.get());
+    // ConnectTo makes no base connect, so the age is still connect 1's. A real connect never shows it: the age goes
+    // as the connect begins (PrepareConnect) and starts again when it succeeds (ConnectSucceeded).
     EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+    const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(dbc_);
+    EXPECT_FALSE(dbc_->dsql_lifetime->Age().has_value());
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+    DsqlCompatibility::ConnectSucceeded(dbc_, prepared.started_at);
+    ASSERT_TRUE(dbc_->dsql_lifetime->Age().has_value());
+    EXPECT_LT(dbc_->dsql_lifetime->Age().value(), std::chrono::minutes(1));
 }
 
 TEST_F(DsqlConnectionLifetimeChainTest, AuroraDsqlChain_HasALifetimeWithNoAgeBeforeTheConnect) {

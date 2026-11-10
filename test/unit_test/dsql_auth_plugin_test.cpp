@@ -1167,6 +1167,21 @@ TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
     EXPECT_EQ(nullptr, dbc_->err);
 }
 
+// DsqlCompatibility::PrepareConnect calls ApplyTlsDefaults(OTHER_AUTH) only for a mode psqlODBC would run as disable.
+// Given one psqlODBC runs, in any form or under either keyword, the function itself leaves it and pqopt exactly as set
+// and returns no text.
+TEST_F(DsqlAuthPluginTest, TlsDefaults_OtherAuth_KeepsAModePsqlodbcRuns) {
+    for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+             {"SSLMODE", "allow"}, {"SSLMODE", "prefer"}, {"SSLMODE", "require"}, {"SSLMODE", "r"},
+             {"SSLMODE", "verify-ca"}, {"SSLMODE", "verify-full"}, {"CA", "vf"},}) {
+        std::map<std::string, std::string> conn_attr = {{key, mode}, {"PQOPT", "{application_name=billing}"}};
+        const std::map<std::string, std::string> before = conn_attr;
+        EXPECT_EQ("", DsqlAuthPlugin::ApplyTlsDefaults(conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, "system"))
+            << key << "=" << mode;
+        EXPECT_EQ(before, conn_attr) << key << "=" << mode;
+    }
+}
+
 // Only the three long names are kept; psqlODBC's short forms (d, a, p, r, vc, vf) are replaced too.
 TEST_F(DsqlAuthPluginTest, TlsOverrideWarning_OnlyForReplacedModes) {
     for (const std::string mode : {"disable", "allow", "prefer", "d", "vf", "verify-fulll"}) {

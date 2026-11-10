@@ -458,9 +458,10 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
 }
 
 // A full mode name in another case is disable to psqlODBC, which reads the first byte case-sensitively. It is
-// lowercased rather than replaced, so nothing is reported, and it gets the defaults of a raised mode. libpq rejects
-// sslrootcert=system below verify-full, so only VERIFY-FULL gets the root certificate.
+// lowercased rather than replaced, so the app gets no 01S02, only an INFO line in the log, and it gets the defaults of
+// a raised mode. libpq rejects sslrootcert=system below verify-full, so only VERIFY-FULL gets the root certificate.
 TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_ModeNameInAnotherCase_IsLowercased) {
+    CapturingLogSink log;
     const std::string application_name_only = "{application_name=" + APPLICATION_NAME + "}";
     for (const auto& [requested, expected, pqopt] : std::vector<std::tuple<std::string, std::string, std::string>>{
              {"Allow", "allow", application_name_only},
@@ -475,7 +476,11 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_ModeNameInAnotherCase_IsL
         EXPECT_EQ(pqopt, dbc_.conn_attr.at("PQOPT"));
         EXPECT_EQ("postgres", dbc_.conn_attr.at(KEY_DATABASE));
         EXPECT_EQ("", prepared.tls_warning);
+        EXPECT_EQ(1, log.Count("[DSQL] Lowercasing SSLmode=" + requested + " to " + expected
+                               + ": psqlODBC reads the mode case-sensitively and would connect without TLS"));
     }
+    EXPECT_EQ(5, log.Count("[DSQL] Lowercasing SSLmode="));
+    EXPECT_EQ(0, log.Count("Overriding SSLmode"));
 }
 
 // RDS_AUTH_TYPE=DSQL (any case) applied its own, stricter defaults in DsqlAuthPlugin before the chain reached

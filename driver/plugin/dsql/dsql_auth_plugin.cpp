@@ -185,6 +185,11 @@ namespace {
         for (const std::string& mode :
              {SSLMODE_ALLOW, SSLMODE_PREFER, SSLMODE_REQUIRE, SSLMODE_VERIFY_CA, SSLMODE_VERIFY_FULL}) {
             if (requested_lower == mode) {
+                // The mode the user meant, so the app gets no 01S02; the log still says it changed.
+                if (requested_mode != mode) {
+                    LOG(INFO) << "[DSQL] Lowercasing SSLmode=" << requested_mode << " to " << mode
+                              << ": psqlODBC reads the mode case-sensitively and would connect without TLS";
+                }
                 return mode;
             }
         }

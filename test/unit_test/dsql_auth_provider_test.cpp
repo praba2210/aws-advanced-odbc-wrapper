@@ -31,8 +31,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -77,29 +75,6 @@ namespace {
             {"AWS_EC2_METADATA_DISABLED", "true"},
         });
     }
-
-    // An AWS config file with the given text in the temp directory, removed at the end of the scope.
-    class TempConfigFile {
-    public:
-        explicit TempConfigFile(const std::string& text)
-            : path_(std::filesystem::temp_directory_path()
-                    / ("dsql_auth_provider_test_config_"
-                       + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))) {
-            std::ofstream(path_) << text;
-        }
-        ~TempConfigFile() {
-            std::filesystem::remove(path_);
-        }
-        TempConfigFile(const TempConfigFile&) = delete;
-        TempConfigFile& operator=(const TempConfigFile&) = delete;
-
-        [[nodiscard]] std::string Path() const {
-            return path_.string();
-        }
-
-    private:
-        std::filesystem::path path_;
-    };
 
     // Whether the chain has a provider of type T. Only the composition is checked: the providers are never asked for
     // credentials, which could reach SSO, STS or the sign-in service.

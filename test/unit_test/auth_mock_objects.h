@@ -37,7 +37,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+#include <vector>
 #include <utility>
 #include <vector>
 
@@ -178,6 +184,37 @@ public:
 private:
     std::vector<Aws::Auth::AWSCredentials> answers_;
     std::atomic<int> reads_{0};
+};
+
+// An AWS config or credentials file with the given text in the temp directory, under a name no other one has. Removed
+// when the scope ends, also when the test fails.
+class TempConfigFile {
+public:
+    explicit TempConfigFile(const std::string& text)
+        : path_(std::filesystem::temp_directory_path()
+                / ("aws_test_config_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
+                   + "_" + std::to_string(next_id_++))) {
+        Write(text);
+    }
+    ~TempConfigFile() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+    TempConfigFile(const TempConfigFile&) = delete;
+    TempConfigFile& operator=(const TempConfigFile&) = delete;
+
+    // Replaces the file's text.
+    void Write(const std::string& text) const {
+        std::ofstream(path_, std::ios::trunc) << text;
+    }
+
+    [[nodiscard]] std::string Path() const {
+        return path_.string();
+    }
+
+private:
+    static inline std::atomic<unsigned> next_id_{0};
+    std::filesystem::path path_;
 };
 
 #endif // AUTH_MOCK_OBJECTS_H_

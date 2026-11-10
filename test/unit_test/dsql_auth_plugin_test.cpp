@@ -1443,13 +1443,9 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_EnvProfileChange_RebuildsTheProv
 // A profile that was missing when the chain was built stays missing for that chain: the connect after the user
 // created it gets a new one.
 TEST_F(DsqlAuthPluginTest, Connect_AfterCredentialFailure_RebuildsTheProvider) {
-    const std::string credentials_path = ::testing::TempDir() + "dsql_sec1_credentials";
-    const auto write_credentials = [&credentials_path](const std::string& content) {
-        std::ofstream(credentials_path, std::ios::trunc) << content;
-    };
-    write_credentials("[other]\naws_access_key_id = AKIDOTHER\naws_secret_access_key = otherSecret\n");
+    const TempConfigFile credentials("[other]\naws_access_key_id = AKIDOTHER\naws_secret_access_key = otherSecret\n");
     const ScopedEnvVars env = OnlyProfileCredentials();
-    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials_path);
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
     dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "p");
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
@@ -1459,11 +1455,10 @@ TEST_F(DsqlAuthPluginTest, Connect_AfterCredentialFailure_RebuildsTheProvider) {
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ("28000", dbc_->err->sqlstate);
 
-    write_credentials("[p]\naws_access_key_id = AKIDEXAMPLE\n"
+    credentials.Write("[p]\naws_access_key_id = AKIDEXAMPLE\n"
                       "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n");
     ResetAttributes(dbc_, "p");
     EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    std::remove(credentials_path.c_str());
 }
 
 // A connect without RDS_AUTH_TYPE=DSQL on the same handle gets no token and keeps the application's password.

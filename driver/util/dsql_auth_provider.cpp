@@ -108,6 +108,21 @@ namespace {
     }
 }  // namespace
 
+// The profile as the config file and the credentials file have it, so a build reads each file once.
+struct DsqlAuthProvider::ProfileFiles {
+    std::optional<Aws::Config::Profile> config;
+    std::optional<Aws::Config::Profile> credentials;
+
+    static ProfileFiles Find(const std::string& name)
+    {
+        return {.config = FindProfile(name, true), .credentials = FindProfile(name, false)};
+    }
+    [[nodiscard]] bool HasProfile() const
+    {
+        return config.has_value() || credentials.has_value();
+    }
+};
+
 // What DSQLClient signs with: the credentials GetToken checked, set just before signing and cleared after.
 class DsqlAuthProvider::SnapshotCredentialsProvider final : public Aws::Auth::AWSCredentialsProvider {
 public:
@@ -131,8 +146,8 @@ DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string 
     // The base default constructor skips Init, but the base destructor always calls Shutdown.
     AwsSdkHelper::Init();
     if (source == ProfileSource::KEY) {
-        if (ProfileExists(profile)) {
-            source_ = MakeProfileOnlyChain(profile, region);
+        if (const ProfileFiles files = ProfileFiles::Find(profile); files.HasProfile()) {
+            source_ = BuildProfileOnlyChain(profile, region, files);
         } else {
             // Nothing to sign with, so the connect fails and names the profile, instead of signing with the
             // environment, a container or the instance role.
@@ -251,14 +266,28 @@ bool DsqlAuthProvider::ProfileExists(const std::string& profile)
 std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakeProfileOnlyChain(
     const std::string& profile, const std::string& region)
 {
+    return BuildProfileOnlyChain(profile, region, ProfileFiles::Find(profile));
+}
+
+std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLoginCrtProvider(
+    const std::string& profile, const std::string& region)
+{
+    // The login provider reads only the config file.
+    const ProfileFiles files{.config = FindProfile(profile, true), .credentials = std::nullopt};
+    return BuildLoginCrtProvider(profile, region, files);
+}
+
+std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::BuildProfileOnlyChain(
+    const std::string& profile, const std::string& region, const ProfileFiles& files)
+{
     Aws::Client::ClientConfiguration::CredentialProviderConfiguration config{};
     config.profile = Aws::String(profile.data(), profile.size());
     config.region = Aws::String(region.data(), region.size());  // STS region for web identity
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> web_identity;
     // role_arn + web_identity_token_file without source_profile/credential_source: the CRT profile provider can't
     // read it, and the SDK's web identity provider would read AWS_ROLE_ARN / AWS_WEB_IDENTITY_TOKEN_FILE instead.
-    for (const bool config_file : {true, false}) {
-        const std::optional<Aws::Config::Profile> p = FindProfile(profile, config_file);
+    for (const std::optional<Aws::Config::Profile>* file : {&files.config, &files.credentials}) {
+        const std::optional<Aws::Config::Profile>& p = *file;
         if (p && !p->GetRoleArn().empty() && !p->GetValue("web_identity_token_file").empty()
             && p->GetSourceProfile().empty() && p->GetValue("credential_source").empty()) {
             config.stsCredentialsProviderConfig.roleArn = p->GetRoleArn();
@@ -276,7 +305,8 @@ std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakePr
     // and endpoint settings of the profile the AWS_PROFILE variable names, or of [default]. The CRT provider is built
     // here for this profile instead, and wrapped as the SDK wraps its own.
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> login;
-    if (std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> login_crt = MakeLoginCrtProvider(profile, region)) {
+    if (std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> login_crt =
+            BuildLoginCrtProvider(profile, region, files)) {
         // The SDK calls the factory once, in the constructor.
         login = std::make_shared<Aws::Auth::CrtCredentialsProvider>(
             [crt = std::move(login_crt)]() mutable { return std::move(crt); },
@@ -293,8 +323,8 @@ std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakePr
     });
 }
 
-std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLoginCrtProvider(
-    const std::string& profile, const std::string& region)
+std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::BuildLoginCrtProvider(
+    const std::string& profile, const std::string& region, const ProfileFiles& files)
 {
     const Aws::Crt::Io::ClientBootstrap* bootstrap = Aws::GetDefaultClientBootstrap();
     const Aws::Crt::Io::TlsConnectionOptions* tls = Aws::GetDefaultTlsConnectionOptions();
@@ -304,9 +334,9 @@ std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLogi
     if (profile.empty() || bootstrap == nullptr || !*bootstrap || tls == nullptr || !*tls) {
         return nullptr;
     }
-    // The CRT builds the sign-in endpoint from the region it is given, so one is always given: the profile's, which
-    // the CRT would pick, else the DSQL region.
-    const std::optional<Aws::Config::Profile> config_profile = FindProfile(profile, true);
+    // The CRT builds the sign-in endpoint from the region it is given, so one is always given: the profile's in the
+    // config file, which the CRT would pick, else the DSQL region.
+    const std::optional<Aws::Config::Profile>& config_profile = files.config;
     const std::string login_region = config_profile && !config_profile->GetRegion().empty()
         ? std::string(config_profile->GetRegion().data(), config_profile->GetRegion().size())
         : region;

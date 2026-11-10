@@ -86,6 +86,13 @@ public:
 
 private:
     class SnapshotCredentialsProvider;
+    struct ProfileFiles;
+
+    // MakeProfileOnlyChain and MakeLoginCrtProvider for the profile as the files have it, read once for a build.
+    static std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> BuildProfileOnlyChain(const std::string& profile,
+        const std::string& region, const ProfileFiles& files);
+    static std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> BuildLoginCrtProvider(const std::string& profile,
+        const std::string& region, const ProfileFiles& files);
 
     void SetUpDsqlClient(const std::string &region);
     // The credentials HasResolvedCredentials kept, which are then gone; else one read of the source.

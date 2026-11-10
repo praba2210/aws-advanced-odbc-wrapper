@@ -75,6 +75,31 @@ namespace {
         return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
     }
 
+    // psqlODBC reads SERVERNAME as SERVER and the later one in its connection string wins; the wrapper writes the keys
+    // in sorted order, so SERVERNAME would win. The token is signed for SERVER, so a DSQL connect keeps one host: the
+    // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. DSN keys keep the case typed.
+    void FoldServername(std::map<std::string, std::string>& conn_attr)
+    {
+        std::optional<std::string> servername;
+        bool has_server = false;
+        for (auto it = conn_attr.begin(); it != conn_attr.end();) {
+            const std::string key = ToAsciiUpper(it->first);
+            if (key == KEY_SERVER) {
+                has_server = true;
+            } else if (key == ALIAS_KEY_SERVER_1) {
+                if (!servername) {
+                    servername = std::move(it->second);
+                }
+                it = conn_attr.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        if (servername && !has_server) {
+            conn_attr.emplace(KEY_SERVER, std::move(*servername));
+        }
+    }
+
     // Letters match in any case, as the endpoint pattern does; the expansion lowercases them.
     bool IsClusterId(const std::string& host)
     {
@@ -517,6 +542,7 @@ bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)
 void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
                                               const std::string_view root_cert)
 {
+    FoldServername(conn_attr);
     const std::string ssl_mode = ResolveSslMode(MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
         MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, "")));
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
@@ -580,6 +606,8 @@ bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_at
     if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
         return true;
     }
+    // This runs before the plugin chain and reads SERVER.
+    FoldServername(conn_attr);
     std::string region;
     for (const char* key : {KEY_SERVER, KEY_IAM_HOST}) {
         const auto it = conn_attr.find(key);

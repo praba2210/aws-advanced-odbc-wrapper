@@ -151,6 +151,25 @@ TEST_F(DsqlAuthPluginTest, Connect_RegionFromDsqlHost) {
 }
 
 // The token is for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect.
+// The token is signed for the host the base driver connects to: SERVERNAME is folded into SERVER, not passed on.
+TEST_F(DsqlAuthPluginTest, Connect_ServernameOnly_SignsForTheHostItConnectsTo) {
+    dbc_->conn_attr.erase(KEY_SERVER);
+    dbc_->conn_attr.insert_or_assign("SERVERNAME", DSQL_HOST);
+    EXPECT_CALL(*mock_auth_provider_, GetToken(DSQL_HOST, "us-west-2", PORT, USERNAME,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(1))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(1))
+        .WillOnce(testing::Invoke([this](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*, SQLUSMALLINT) {
+            EXPECT_EQ(DSQL_HOST, dbc_->conn_attr.at(KEY_SERVER));
+            EXPECT_FALSE(dbc_->conn_attr.contains("SERVERNAME"));
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
 TEST_F(DsqlAuthPluginTest, Connect_Dsql_ErasesThePasswordAfterTheConnect) {
     for (const SQLRETURN base_result : std::initializer_list<SQLRETURN>{SQL_SUCCESS, SQL_ERROR}) {
         dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
@@ -346,6 +365,31 @@ TEST_F(DsqlAuthPluginTest, Defaults_EmptyAttributes) {
     EXPECT_EQ("admin", conn_attr.at(KEY_DB_USERNAME));
     EXPECT_EQ("postgres", conn_attr.at(KEY_DATABASE));
     EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// psqlODBC reads Servername as SERVER (the later one in the string wins, and the wrapper writes SERVER first), so a
+// SERVERNAME would send the token to a host it wasn't signed for. A DSQL connect folds it into SERVER.
+TEST_F(DsqlAuthPluginTest, Defaults_ServernameOnly_BecomesServer) {
+    std::map<std::string, std::string> conn_attr = {{"SERVERNAME", "abc.dsql.us-east-1.on.aws"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("abc.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_ServerAndServername_ServernameErased) {
+    std::map<std::string, std::string> conn_attr = {{"SERVER", "a.dsql.us-east-1.on.aws"},
+                                                    {"SERVERNAME", "b.example.com"},};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("a.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+// Keys from a DSN keep the case typed there.
+TEST_F(DsqlAuthPluginTest, Defaults_ServernameKeyInAnyCase) {
+    std::map<std::string, std::string> conn_attr = {{"Servername", "a.dsql.us-east-1.on.aws"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("a.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("Servername"));
 }
 
 // DSQL rejects plaintext, and Go, .NET, PHP, Ruby and Rust always verify the server. A mode that may not encrypt,
@@ -590,6 +634,27 @@ TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
     EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
     EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
     EXPECT_EQ("", error);
+}
+
+// The cluster-ID expansion runs before the plugin chain and reads SERVER, so it folds the alias too.
+TEST_F(DsqlAuthPluginTest, ClusterId_ServernameOnly_IsExpanded) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVERNAME", CLUSTER_ID},
+                                                    {KEY_REGION, "eu-west-1"},};
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+// Other auth types keep SERVERNAME as it is.
+TEST_F(DsqlAuthPluginTest, Defaults_OtherAuth_ServernameUntouched) {
+    for (const char* auth : {"IAM", "SECRETS_MANAGER", "DATABASE"}) {
+        std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, auth}, {"SERVERNAME", "h.example.com"}};
+        const auto before = conn_attr;
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+        EXPECT_EQ(before, conn_attr) << auth;
+    }
 }
 
 TEST_F(DsqlAuthPluginTest, ClusterId_AuthTypeIsCaseInsensitive) {

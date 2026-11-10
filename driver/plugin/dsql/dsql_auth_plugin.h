@@ -122,8 +122,9 @@ private:
     };
     static ProviderInputs ReadProviderInputs(const std::map<std::string, std::string>& conn_attr, std::string region);
 
-    // Builds the provider for the first connect, and a new one when this connect's inputs differ from the last build's
-    // or the last connect found no credentials. Returns false, with the error set on dbc, when it can't.
+    // Builds the provider for the first connect, and a new one when this connect's inputs differ from the last build's,
+    // the last connect found no credentials, or the server rejected its token. Returns false, with the error set on
+    // dbc, when it can't.
     bool RebuildProviderIfNeeded(DBC* dbc, const std::string& region);
 
     // Connect and RebuildProviderIfNeeded change these with no lock of their own: a plugin belongs to one connection

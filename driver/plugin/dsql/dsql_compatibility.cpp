@@ -280,7 +280,7 @@ DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
 
     // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. With another auth type (a token in PWD,
     // a secret) a mode psqlODBC runs works today and is left as set. One it would run as disable, which Aurora DSQL
-    // refuses, gets TLS. Either way the connect gets the database default: without it, it can't work.
+    // refuses, gets TLS. Either way the connect gets the database default, without which it can't work.
     const bool other_auth =
         AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL;
     if (other_auth) {

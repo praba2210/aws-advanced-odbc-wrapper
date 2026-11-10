@@ -60,6 +60,10 @@ public:
     static std::string ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, TlsPolicy policy,
                                         std::string_view root_cert);
 
+    // Sets DATABASE to postgres, Aurora DSQL's only database, when neither DATABASE nor its short form DX is set:
+    // libpq would use the user name. ApplyConnectionDefaults and DsqlCompatibility::PrepareConnect call it.
+    static void ApplyDatabaseDefault(std::map<std::string, std::string>& conn_attr);
+
     // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes, the TLS ones with
     // ApplyTlsDefaults(DSQL_AUTH), and returns its 01S02 text. root_cert is the sslrootcert value a verify-full
     // connection gets when pqopt sets none (DefaultRootCert), or "" for no default. Public for tests.

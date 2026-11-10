@@ -72,11 +72,6 @@ namespace {
     // The characters libpq's isspace() skips between conninfo options.
     constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";
 
-    bool ContainsAny(const std::map<std::string, std::string>& conn_attr, std::initializer_list<std::string> keys)
-    {
-        return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
-    }
-
     // The error for a connect that names two different hosts in SERVER and SERVERNAME (any key case; hosts compare
     // ASCII case-insensitively), or "" when there is at most one. The token is signed for one host, and the key that
     // loses would be dropped without a word: a DSN's SERVER would beat the connection string's SERVERNAME.
@@ -640,10 +635,15 @@ std::string DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::s
         }
     }
     conn_attr.try_emplace(KEY_DB_USERNAME, DsqlAuthProvider::ADMIN_USER);
-    if (!ContainsAny(conn_attr, {KEY_DATABASE, PG_KEY_DATABASE_SHORT})) {
-        conn_attr.insert_or_assign(KEY_DATABASE, DEFAULT_DATABASE);
-    }
+    ApplyDatabaseDefault(conn_attr);
     return tls_warning;
+}
+
+void DsqlAuthPlugin::ApplyDatabaseDefault(std::map<std::string, std::string>& conn_attr)
+{
+    if (!conn_attr.contains(KEY_DATABASE) && !conn_attr.contains(PG_KEY_DATABASE_SHORT)) {
+        conn_attr.emplace(KEY_DATABASE, DEFAULT_DATABASE);
+    }
 }
 
 std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,

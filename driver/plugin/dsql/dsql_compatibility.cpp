@@ -124,10 +124,6 @@ namespace {
         conn_attr.emplace(option.key, option.value);
     }
 
-    // psqlODBC's short keyword for Database, upper-cased as in conn_attr, and Aurora DSQL's only database.
-    constexpr const char* PG_KEY_DATABASE_SHORT = "DX";
-    constexpr const char* DSQL_DATABASE = "postgres";
-
     // An integer attribute value, which ODBC passes in the pointer itself.
     SQLULEN IntegerValue(SQLPOINTER value)
     {
@@ -284,17 +280,16 @@ DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
 
     // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. With another auth type (a token in PWD,
     // a secret) a mode psqlODBC runs works today and is left as set. One it would run as disable, which Aurora DSQL
-    // refuses, gets TLS and the database default.
+    // refuses, gets TLS. Either way the connect gets the database default: without it, it can't work.
     const bool other_auth =
         AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL;
-    if (other_auth && DsqlAuthPlugin::SslModeRunsAsDisable(dbc->conn_attr)) {
-        prepared.tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH,
-            DsqlAuthPlugin::DefaultRootCert(
-                DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
-        // Aurora DSQL has only the postgres database; without one libpq would use the user name.
-        if (!dbc->conn_attr.contains(KEY_DATABASE) && !dbc->conn_attr.contains(PG_KEY_DATABASE_SHORT)) {
-            dbc->conn_attr.insert_or_assign(KEY_DATABASE, DSQL_DATABASE);
+    if (other_auth) {
+        if (DsqlAuthPlugin::SslModeRunsAsDisable(dbc->conn_attr)) {
+            prepared.tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr,
+                DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, DsqlAuthPlugin::DefaultRootCert(
+                    DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
         }
+        DsqlAuthPlugin::ApplyDatabaseDefault(dbc->conn_attr);
     }
 
     // A level set before connect waits in attr_map; DefaultPlugin::Connect would replay it after psqlODBC connects,

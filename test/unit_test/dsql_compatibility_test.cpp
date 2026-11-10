@@ -390,15 +390,25 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_UnsetSslMode_BecomesVerif
     }
 }
 
+// The database the user set stays, with a mode that is raised (none) or kept (require).
 TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsTheDatabaseSet) {
-    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_DATABASE, "mydb"}});
-    DsqlCompatibility::PrepareConnect(&dbc_);
-    EXPECT_EQ("mydb", dbc_.conn_attr.at(KEY_DATABASE));
+    for (const std::string mode : {"", "require"}) {
+        SCOPED_TRACE(mode);
+        std::map<std::string, std::string> conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_DATABASE, "mydb"}};
+        if (!mode.empty()) {
+            conn_attr.emplace("SSLMODE", mode);
+        }
+        UseConnAttr(conn_attr);
+        DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ("mydb", dbc_.conn_attr.at(KEY_DATABASE));
 
-    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {"DX", "mydb"}});
-    DsqlCompatibility::PrepareConnect(&dbc_);
-    EXPECT_EQ("mydb", dbc_.conn_attr.at("DX"));
-    EXPECT_FALSE(dbc_.conn_attr.contains(KEY_DATABASE));
+        conn_attr.erase(KEY_DATABASE);
+        conn_attr.emplace("DX", "mydb");
+        UseConnAttr(conn_attr);
+        DsqlCompatibility::PrepareConnect(&dbc_);
+        EXPECT_EQ("mydb", dbc_.conn_attr.at("DX"));
+        EXPECT_FALSE(dbc_.conn_attr.contains(KEY_DATABASE));
+    }
 }
 
 // psqlODBC reads the mode by its first byte, case-sensitively, and runs disable, d, Disable or a value it doesn't know
@@ -420,9 +430,10 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_Disable_BecomesVerifyFull
 }
 
 // A mode psqlODBC runs (allow, prefer, require, verify-ca, verify-full, or its short forms r, vc and vf, under either
-// keyword) connects today, maybe with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT),
-// PGAPPNAME or PGDATABASE, which a pqopt or database default would override. It is left exactly as set, pqopt
-// included, and nothing is reported.
+// keyword) connects today, maybe with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT) or
+// PGAPPNAME, which a pqopt default would override. Its SSLmode and pqopt are left exactly as set, and nothing is
+// reported. Only the database default is added: without one libpq uses the user name, and Aurora DSQL has only
+// postgres, so such a connect can't work today.
 TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
     CapturingLogSink log;
     for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
@@ -432,6 +443,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
         UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {key, mode}});
         std::map<std::string, std::string> expected = dbc_.conn_attr;
         DsqlCompatibility::ApplyBaseDriverOptions(expected);
+        expected.emplace(KEY_DATABASE, "postgres");
         const DsqlCompatibility::PreparedConnect prepared = DsqlCompatibility::PrepareConnect(&dbc_);
         EXPECT_EQ(expected, dbc_.conn_attr);
         EXPECT_EQ("", prepared.tls_warning);
@@ -439,6 +451,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_KeepsWorkingModes) {
     UseConnAttr({{KEY_SERVER, DSQL_HOST}, {"SSLMODE", "verify-full"}, {"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}});
     std::map<std::string, std::string> expected = dbc_.conn_attr;
     DsqlCompatibility::ApplyBaseDriverOptions(expected);
+    expected.emplace(KEY_DATABASE, "postgres");
     DsqlCompatibility::PrepareConnect(&dbc_);
     EXPECT_EQ(expected, dbc_.conn_attr);
     EXPECT_EQ(0, log.Count("Overriding SSLmode"));

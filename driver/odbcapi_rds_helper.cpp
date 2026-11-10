@@ -4057,6 +4057,7 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
 
     // Decided once per connect, after the cluster ID is expanded: failover can rewrite conn_attr later.
     dbc->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr);
+    dbc->dsql_tls_warning.clear();  // the SSLmode change of an earlier connect on the handle
     if (dbc->is_dsql && dbc->dsql_lifetime == nullptr) {
         dbc->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
     }

@@ -237,11 +237,12 @@ protected:
         UseConnAttr({{KEY_SERVER, server}});
     }
 
-    // The same for these attributes and the base driver.
+    // The same for these attributes and the base driver. A new connect has no SSLmode change of an earlier one.
     void UseConnAttr(std::map<std::string, std::string> conn_attr) {
         dbc_.conn_attr = std::move(conn_attr);
         dbc_.conn_attr.insert_or_assign(KEY_DRIVER, PSQLODBC_PATH);
         dbc_.is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_.conn_attr);
+        dbc_.dsql_tls_warning.clear();
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
     }
 
@@ -587,6 +588,33 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDatabaseAuthUnsetSs
     const std::string padded = ";" + captured_conn_str + ";";
     EXPECT_NE(std::string::npos, padded.find(";SSLMODE=verify-full;")) << captured_conn_str;
     EXPECT_NE(std::string::npos, padded.find(";PQOPT=" + VERIFY_FULL_PQOPT + ";")) << captured_conn_str;
+}
+
+// A retry of the base connect within one connect (Secrets Manager's, after a cached secret fails) runs
+// DefaultPlugin::Connect again on the first try's attributes, where the SSLmode is already verify-full: the app still
+// gets the 01S02 for the mode it set. The next connect on the handle starts without it.
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_RetryInTheSameConnect_KeepsThe01S02) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_SECRETS}, {"SSLMODE", "disable"}});
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    DefaultPlugin plugin(&dbc_);
+    driver_connect_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    driver_connect_result = SQL_SUCCESS;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_.err);
+    EXPECT_EQ("01S02", dbc_.err->sqlstate);
+    EXPECT_EQ(SslModeChanged("disable"), dbc_.err->error_msg);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
+
+    // RDS_InitializeConnection starts the next connect (here it stops after that, with no base driver to load). Its
+    // kept mode reports nothing.
+    dbc_.conn_status = CONN_NOT_CONNECTED;
+    dbc_.conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_SECRETS}, {"SSLMODE", "require"}};
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(&dbc_, ""));
+    dbc_.err.reset();
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=require")) << captured_conn_str;
 }
 
 // The wrapper keeps one record per handle, and its record hides the base driver's: a connect that fails, or that the

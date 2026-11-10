@@ -179,6 +179,11 @@ struct DBC {
     // Aurora DSQL connect, started by each successful base connect (DefaultPlugin), read by SQL_ATTR_CONNECTION_DEAD
     // and the 60-minute hint.
     std::shared_ptr<DsqlConnectionLifetime> dsql_lifetime;
+    // Aurora DSQL with an auth type other than DSQL: the 01S02 text for the SSLmode this connect replaced
+    // (DsqlCompatibility::PrepareConnect). A retry of the base connect within the connect (Secrets Manager's, after a
+    // cached secret fails) prepares the first try's output again, which replaces nothing, and reports this text.
+    // RDS_InitializeConnection clears it for each connect.
+    std::string dsql_tls_warning;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
     // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can

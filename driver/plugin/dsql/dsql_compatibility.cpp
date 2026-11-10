@@ -285,11 +285,13 @@ DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
         AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL;
     if (other_auth) {
         if (DsqlAuthPlugin::SslModeRunsAsDisable(dbc->conn_attr)) {
-            prepared.tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr,
+            dbc->dsql_tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr,
                 DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, DsqlAuthPlugin::DefaultRootCert(
                     DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
         }
         DsqlAuthPlugin::ApplyDatabaseDefault(dbc->conn_attr);
+        // A retry within this connect finds the mode raised already, and reports the first try's change.
+        prepared.tls_warning = dbc->dsql_tls_warning;
     }
 
     // A level set before connect waits in attr_map; DefaultPlugin::Connect would replay it after psqlODBC connects,

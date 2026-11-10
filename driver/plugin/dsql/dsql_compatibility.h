@@ -49,7 +49,8 @@ namespace DsqlCompatibility {
     // Called by DefaultPlugin::Connect before it builds the base driver's connection string: sets the forced options
     // and drops psqlODBC attributes set before connect that would undo them. With an auth type other than DSQL it also
     // sets the postgres database when none is set (DsqlAuthPlugin::ApplyDatabaseDefault) and, for an SSLmode psqlODBC
-    // would run as disable, the TLS defaults (DsqlAuthPlugin::ApplyTlsDefaults, OTHER_AUTH) with their 01S02 text.
+    // would run as disable, the TLS defaults (DsqlAuthPlugin::ApplyTlsDefaults, OTHER_AUTH) with their 01S02 text, which
+    // a retry of the base connect within the connect returns too (DBC::dsql_tls_warning).
     // Clears the connection's age and returns the moment the connect begins, for ConnectSucceeded. Does nothing and
     // returns no moment and no text unless the connect targets Aurora DSQL; no moment either without a lifetime.
     PreparedConnect PrepareConnect(DBC* dbc);

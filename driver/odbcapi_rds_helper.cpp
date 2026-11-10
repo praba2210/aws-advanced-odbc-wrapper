@@ -504,8 +504,9 @@ SQLRETURN RDS_SQLEndTran(
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
                 ClearError(env);
 
-                // Each connection's transaction ends, also after one fails; the first error is the result. Only
-                // without a driver manager: they call the connection form for each connection.
+                // Each connection's transaction ends, also after one fails; the first error is the result. The
+                // Windows driver manager calls this form, as an app without one does; unixODBC and iODBC call the
+                // connection form for each connection.
                 for (DBC* dbc : env->dbc_list) {
                     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
                     ClearError(dbc);
@@ -517,6 +518,9 @@ SQLRETURN RDS_SQLEndTran(
                     if (CompletionType == SQL_COMMIT) {
                         dbc_ret = DsqlCompatibility::RollBackAbortedTransaction(dbc);
                     }
+                    // Aurora DSQL: a rolled-back transaction's 25S03 is the wrapper's record, so the environment
+                    // gets it too when it is the result.
+                    const bool rolled_back = dbc_ret.has_value();
                     if (!dbc_ret) {
                         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader,
                             RdsFuncNames::EndTran, SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
@@ -529,6 +533,9 @@ SQLRETURN RDS_SQLEndTran(
                     dbc->dsql_statement_failed_in_transaction = false;
                     if (!SQL_SUCCEEDED(*dbc_ret) && SQL_SUCCEEDED(ret)) {
                         ret = *dbc_ret;
+                        if (rolled_back && dbc->err) {
+                            env->err = std::make_unique<ErrInfo>(*dbc->err);
+                        }
                     }
                 }
 

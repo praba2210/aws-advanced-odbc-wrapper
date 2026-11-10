@@ -360,8 +360,9 @@ TEST_F(DsqlTransactionAbortTest, Commit_OtherDatabase_NoProbe) {
     EXPECT_EQ(0, sink.Count());
 }
 
-// Without a driver manager, SQLEndTran on the environment ends each connection's transaction: an aborted one is rolled
-// back, the others are committed, and the environment's call returns the error, which the later calls don't replace.
+// SQLEndTran on the environment (from the Windows driver manager, or an app without one) ends each connection's
+// transaction: an aborted one is rolled back, the others are committed, and the environment's call returns the error,
+// which the later calls don't replace.
 TEST_F(DsqlTransactionAbortTest, EnvCommit_ChecksEachConnectionAndKeepsTheError) {
     Open(second_, second_base_dbc_stand_in_);
     Abort(dbc_);
@@ -378,6 +379,24 @@ TEST_F(DsqlTransactionAbortTest, EnvCommit_ChecksEachConnectionAndKeepsTheError)
     EXPECT_EQ(nullptr, second_.err);
     EXPECT_EQ(TRANSACTION_CLOSED, second_.transaction_status);
     EXPECT_FALSE(dbc_.dsql_statement_failed_in_transaction);
+}
+
+// The 25S03 the environment's call returns is the environment's record too, so SQLGetDiagRec on the environment reads
+// it, not the base environment's record.
+TEST_F(DsqlTransactionAbortTest, EnvCommit_TheKept25S03_IsTheEnvironmentsRecord) {
+    Open(second_, second_base_dbc_stand_in_);
+    Abort(dbc_);
+    ASSERT_EQ(SQL_ERROR, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_ENV, &env_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    // The app's characters are the base driver's here (no 4-byte side).
+    EXPECT_EQ("25S03", BaseText(state));
+    EXPECT_EQ(ROLLED_BACK, BaseText(message));
+    EXPECT_EQ(static_cast<SQLSMALLINT>(ROLLED_BACK.size()), length);
 }
 
 #if UNICODE && !defined(_WIN32)

@@ -23,7 +23,6 @@
 #include <sql.h>
 #include <sqlext.h>
 
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -130,7 +129,8 @@ protected:
     }
 };
 
-// 1
+// The endpoint alone connects as admin with the wrapper's application_name, and the output connection string holds
+// no password or token.
 TEST_F(AuroraDsqlIntegrationTest, ConnectEndpoint_DefaultsToAdmin) {
     Session session(env);
     std::string out;
@@ -142,7 +142,7 @@ TEST_F(AuroraDsqlIntegrationTest, ConnectEndpoint_DefaultsToAdmin) {
     EXPECT_FALSE(Contains(out, "X-Amz-")) << "the output connection string holds a token";
 }
 
-// 2
+// A cluster ID in SERVER expands with the region; with no region anywhere the connect fails with 08001.
 TEST_F(AuroraDsqlIntegrationTest, ConnectClusterId_ExpandsWithTheRegion) {
     if (target.cluster_id.empty() || target.region.empty()) {
         GTEST_SKIP() << "TEST_DSQL_CLUSTER_ID and TEST_DSQL_REGION are not set";
@@ -155,7 +155,7 @@ TEST_F(AuroraDsqlIntegrationTest, ConnectClusterId_ExpandsWithTheRegion) {
         EXPECT_EQ("admin", session.Fetch("SELECT current_user").value_or("<failed>"));
     }
 
-    // CI exports a region, so remove every source of one the wrapper reads.
+    // The environment that runs the suite may give a region: remove every source of one the wrapper reads.
     const std::string empty_config = (std::filesystem::temp_directory_path() /
         ("odbc_it_empty_aws_config_" + std::to_string(dsql_it::ProcessId()))).string();
     std::ofstream(empty_config).close();
@@ -172,7 +172,7 @@ TEST_F(AuroraDsqlIntegrationTest, ConnectClusterId_ExpandsWithTheRegion) {
     std::remove(empty_config.c_str());
 }
 
-// 3
+// SSLmode=disable becomes verify-full, and the 01S02 reaches the application through the driver manager.
 TEST_F(AuroraDsqlIntegrationTest, SslModeDisable_Returns01S02ThroughTheDriverManager) {
     Session session(env);
     ASSERT_EQ(SQL_SUCCESS_WITH_INFO, session.Connect(target.ConnStr({{"SSLMODE", "disable"}})))
@@ -182,7 +182,9 @@ TEST_F(AuroraDsqlIntegrationTest, SslModeDisable_Returns01S02ThroughTheDriverMan
     EXPECT_EQ("1", session.Fetch("SELECT 1").value_or("<failed>"));
 }
 
-// 4: the guard for a prepared statement freed inside a transaction (the point of the distro psqlODBC 16 leg).
+// A prepared statement freed inside a transaction keeps the transaction: with UseServerSidePrepare=0, which the
+// wrapper sets, psqlODBC sends no DEALLOCATE. Matters with psqlODBC before 18.00.0003, which wraps the DEALLOCATE in a
+// SAVEPOINT that Aurora DSQL rejects, and the commit then saves nothing without an error.
 TEST_F(AuroraDsqlIntegrationTest, PreparedStatementFreedInATransaction_CommitKeepsBothRows) {
     const TempTable table;
     ASSERT_TRUE(table.Ok());
@@ -197,7 +199,7 @@ TEST_F(AuroraDsqlIntegrationTest, PreparedStatementFreedInATransaction_CommitKee
     EXPECT_EQ("2", dsql_it::ReadBack("SELECT count(*) FROM " + table.Name()).value_or("<failed>"));
 }
 
-// 5
+// The wrapper answers a query timeout, an isolation level and psqlODBC's server-side prepare attribute itself.
 TEST_F(AuroraDsqlIntegrationTest, QueryTimeoutAndIsolation_AnsweredByTheWrapper) {
     Session session(env);
     ASSERT_EQ(SQL_SUCCESS, session.Connect(target.ConnStr())) << session.Failure();
@@ -224,7 +226,7 @@ TEST_F(AuroraDsqlIntegrationTest, QueryTimeoutAndIsolation_AnsweredByTheWrapper)
     EXPECT_EQ("01S02", session.State());
 }
 
-// 6
+// Concurrent autocommit increments all commit with OCC retry; without it the conflicts reach the application as 40001.
 TEST_F(AuroraDsqlIntegrationTest, OccRetry_ConcurrentIncrementsAllCommit) {
     constexpr int THREADS = 3;
     constexpr int ITERATIONS = 10;
@@ -254,7 +256,7 @@ TEST_F(AuroraDsqlIntegrationTest, OccRetry_ConcurrentIncrementsAllCommit) {
     EXPECT_GE(failed, 1) << "no 40001 in " << THREADS * ITERATIONS << " concurrent updates";
 }
 
-// 7
+// A conflict at a transaction's commit isn't retried: the commit returns 40001 and the first commit's value stays.
 TEST_F(AuroraDsqlIntegrationTest, OccRetry_NotRetriedInATransaction) {
     const TempTable table;
     ASSERT_TRUE(table.Ok());
@@ -278,7 +280,7 @@ TEST_F(AuroraDsqlIntegrationTest, OccRetry_NotRetriedInATransaction) {
     EXPECT_EQ("100", dsql_it::ReadBack("SELECT v FROM " + table.Name() + " WHERE id = 1").value_or("<failed>"));
 }
 
-// 8: the wait between retries ends at SQLCancel. A connection whose catalog another session made stale fails its
+// The wait between retries ends at SQLCancel. A connection whose catalog another session made stale fails its
 // first UPDATE with OC001, and the retry plugin then waits; OC001 doesn't always happen, so up to 6 trials.
 TEST_F(AuroraDsqlIntegrationTest, OccRetry_CancelDuringTheWait_ReturnsHY008) {
     const TempTable table;
@@ -311,8 +313,9 @@ TEST_F(AuroraDsqlIntegrationTest, OccRetry_CancelDuringTheWait_ReturnsHY008) {
         const std::string state = ret == SQL_SUCCESS ? "" : dsql_it::DiagState(stmt, SQL_HANDLE_STMT);
         SQLFreeHandle(SQL_HANDLE_STMT, stmt);
 
-        if (seconds < 1.0) {  // no OC001: the update went through at once
-            ASSERT_TRUE(SQL_SUCCEEDED(ret)) << "SQLSTATE " << state;
+        // No OC001: the update succeeded before the cancel came at 1.5 s, however slowly. An ignored cancel also
+        // succeeds, but only after the 8 s wait and a retry, so it reaches the checks below.
+        if (SQL_SUCCEEDED(ret) && seconds < 1.5) {
             applied++;
             continue;
         }
@@ -328,7 +331,6 @@ TEST_F(AuroraDsqlIntegrationTest, OccRetry_CancelDuringTheWait_ReturnsHY008) {
               dsql_it::ReadBack("SELECT v FROM " + table.Name() + " WHERE id = 1").value_or("<failed>"));
 }
 
-// 9
 TEST_F(AuroraDsqlIntegrationTest, RejectedSettings_FailBeforeTheDriverLoads) {
     // A base driver path that doesn't exist shows the check runs before the base driver loads.
     const std::string no_driver = "/nonexistent/psqlodbc.so";
@@ -350,7 +352,7 @@ TEST_F(AuroraDsqlIntegrationTest, RejectedSettings_FailBeforeTheDriverLoads) {
     }
 }
 
-// 10 (M3): an empty user name in SQLConnect keeps the DSN's user, or the default admin when the DSN has none. Needs the
+// An empty user name in SQLConnect keeps the DSN's user, or the default admin when the DSN has none. Needs the
 // two DSNs of test/resources/odbc.ini.in: run with ODBCSYSINI=<repo>/test/resources.
 TEST_F(AuroraDsqlIntegrationTest, SqlConnect_EmptyUserName_KeepsTheDsnUser) {
     for (const char* dsn : {"inte-dsql-dsn", "inte-dsql-admin-dsn"}) {
@@ -364,7 +366,7 @@ TEST_F(AuroraDsqlIntegrationTest, SqlConnect_EmptyUserName_KeepsTheDsnUser) {
     }
 }
 
-// 11 (M5): a request for an updatable cursor reads read-only instead of failing at the first SELECT.
+// A request for an updatable cursor reads read-only instead of failing at the first SELECT.
 TEST_F(AuroraDsqlIntegrationTest, UpdatableCursorRequest_ReadsReadOnly) {
     const TempTable table;
     ASSERT_TRUE(table.Ok());
@@ -397,7 +399,7 @@ TEST_F(AuroraDsqlIntegrationTest, UpdatableCursorRequest_ReadsReadOnly) {
     EXPECT_EQ("2", dsql_it::ReadBack("SELECT count(*) FROM " + table.Name()).value_or("<failed>"));
 }
 
-// 12 (H1, slow): the connection reports itself dead after MAX_CONNECTION_LIFETIME, and only when the option is set.
+// Slow: the connection reports itself dead after MAX_CONNECTION_LIFETIME, and only when the option is set.
 TEST_F(AuroraDsqlIntegrationTest, ConnectionDead_OnlyWithMaxConnectionLifetime) {
     DSQL_REQUIRE_SLOW();
     Session limited(env);
@@ -418,7 +420,8 @@ TEST_F(AuroraDsqlIntegrationTest, ConnectionDead_OnlyWithMaxConnectionLifetime) 
     EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_CD_FALSE), dead);
 }
 
-// BEHAV-2: a COMMIT after a statement failed in the transaction saves nothing, and says so with 25S03.
+// SQLEndTran's commit after a statement failed in the transaction saves nothing, says so with 25S03, and rolls the
+// transaction back itself: the next transaction on the connection runs and commits.
 TEST_F(AuroraDsqlIntegrationTest, CommitAfterAnError_Returns25S03AndSavesNothing) {
     const TempTable table;
     ASSERT_TRUE(table.Ok());
@@ -433,12 +436,18 @@ TEST_F(AuroraDsqlIntegrationTest, CommitAfterAnError_Returns25S03AndSavesNothing
 
     EXPECT_EQ(SQL_ERROR, session.EndTran(SQL_COMMIT));
     EXPECT_EQ("25S03", session.State());
-    EXPECT_EQ(SQL_SUCCESS, session.EndTran(SQL_ROLLBACK)) << session.Failure();
 
-    EXPECT_EQ("0", dsql_it::ReadBack("SELECT count(*) FROM " + table.Name()).value_or("<failed>"));
+    // No rollback from the application: in a transaction Aurora DSQL ended, this INSERT would fail with 25P02.
+    ASSERT_TRUE(SQL_SUCCEEDED(session.Exec("INSERT INTO " + table.Name() + " VALUES (2, 2, 'b')", &state)))
+        << "SQLSTATE " << state;
+    EXPECT_EQ(SQL_SUCCESS, session.EndTran(SQL_COMMIT)) << session.Failure();
+
+    // Only the second transaction's row.
+    EXPECT_EQ("1", dsql_it::ReadBack("SELECT count(*) FROM " + table.Name()).value_or("<failed>"));
 }
 
-// P2V-5: switching to autocommit commits the open transaction first, and a failed COMMIT is the call's result.
+// Setting autocommit on commits the open transaction first; a failed commit is the call's result, and autocommit
+// stays off.
 TEST_F(AuroraDsqlIntegrationTest, AutocommitChange_ReturnsTheCommitsConflict) {
     const TempTable table;
     ASSERT_TRUE(table.Ok());

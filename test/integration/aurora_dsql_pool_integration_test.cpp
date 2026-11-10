@@ -17,7 +17,8 @@
 // build generates (<build>/dsql-pool):
 //   ODBCSYSINI=<build>/dsql-pool TEST_DSQL_ENDPOINT=... TEST_DSQL_SLOW=1 \
 //       ./integration-test --gtest_filter='AuroraDsqlPoolIntegrationTest.*'
-// Every case skips unless TEST_DSQL_ENDPOINT and TEST_DSQL_SLOW=1 are set (each waits past the 120 s lifetime).
+// Every case skips unless TEST_DSQL_ENDPOINT and TEST_DSQL_SLOW=1 are set (each waits past the 120 s lifetime), and
+// when the driver manager doesn't list the pooled driver.
 
 #include <gtest/gtest.h>
 
@@ -34,6 +35,10 @@
 
 using dsql_it::DsqlTarget;
 using dsql_it::Session;
+
+namespace {
+    constexpr const char* POOLED_DRIVER = "AWS DSQL Pooled";  // in <build>/dsql-pool/odbcinst.ini
+}  // namespace
 
 class AuroraDsqlPoolIntegrationTest : public testing::Test {
 protected:
@@ -55,12 +60,34 @@ protected:
                                                 reinterpret_cast<SQLPOINTER>(SQL_CP_ONE_PER_DRIVER), 0)));
         ASSERT_EQ(SQL_SUCCESS, SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env));
         ASSERT_EQ(SQL_SUCCESS, SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3), 0));
+        // unixODBC doesn't answer an unknown DRIVER={...} with IM002: it tries to load the name as a library path.
+        if (!DriverListed(POOLED_DRIVER)) {
+            GTEST_SKIP() << "the driver manager doesn't list " << POOLED_DRIVER
+                         << ": set ODBCSYSINI to the directory of the pooled odbcinst.ini";
+        }
     }
 
     void TearDown() override {
         if (env != SQL_NULL_HENV) {
             SQLFreeHandle(SQL_HANDLE_ENV, env);
         }
+    }
+
+    // Whether SQLDrivers lists the driver: ODBCSYSINI can name a directory without the pooled odbcinst.ini.
+    [[nodiscard]] bool DriverListed(const std::string& name) const {
+        SQLTCHAR description[dsql_it::TEXT_CHARS] = {0};
+        SQLTCHAR attributes[dsql_it::TEXT_CHARS] = {0};
+        SQLSMALLINT description_length = 0;
+        SQLSMALLINT attributes_length = 0;
+        for (SQLUSMALLINT direction = SQL_FETCH_FIRST;
+             SQL_SUCCEEDED(SQLDrivers(env, direction, description, dsql_it::TEXT_CHARS, &description_length, attributes,
+                                      dsql_it::TEXT_CHARS, &attributes_length));
+             direction = SQL_FETCH_NEXT) {
+            if (dsql_it::FromT(description, dsql_it::TEXT_CHARS) == name) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // True when the connection the pool hands out still has the marker search_path set on an earlier one.
@@ -79,12 +106,13 @@ protected:
     }
 
     [[nodiscard]] std::string PooledConnStr(bool with_lifetime) const {
-        return with_lifetime ? target.ConnStr({{"DRIVER", "{AWS DSQL Pooled}"}, {"MAX_CONNECTION_LIFETIME", "120"}})
-                             : target.ConnStr({{"DRIVER", "{AWS DSQL Pooled}"}});
+        const std::string driver = "{" + std::string(POOLED_DRIVER) + "}";
+        return with_lifetime ? target.ConnStr({{"DRIVER", driver}, {"MAX_CONNECTION_LIFETIME", "120"}})
+                             : target.ConnStr({{"DRIVER", driver}});
     }
 };
 
-// 13 (H1): with MAX_CONNECTION_LIFETIME set, the pool replaces a connection older than the limit.
+// With MAX_CONNECTION_LIFETIME set, the pool replaces a connection older than the limit.
 TEST_F(AuroraDsqlPoolIntegrationTest, SetLifetime_ThePoolReplacesTheConnection) {
     const std::string conn_str = PooledConnStr(true);
     EXPECT_FALSE(Reused(conn_str, true)) << "the first connection already had the marker";
@@ -93,7 +121,7 @@ TEST_F(AuroraDsqlPoolIntegrationTest, SetLifetime_ThePoolReplacesTheConnection) 
     EXPECT_FALSE(Reused(conn_str, false)) << "the pool reused a connection past MAX_CONNECTION_LIFETIME";
 }
 
-// 13 (H1): without the option the pool keeps the connection.
+// Without MAX_CONNECTION_LIFETIME the pool keeps the connection.
 TEST_F(AuroraDsqlPoolIntegrationTest, UnsetLifetime_ThePoolKeepsTheConnection) {
     const std::string conn_str = PooledConnStr(false);
     EXPECT_FALSE(Reused(conn_str, true)) << "the first connection already had the marker";

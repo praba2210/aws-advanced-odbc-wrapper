@@ -10,6 +10,8 @@ The wrapper delegates all database I/O to an underlying ODBC driver. The followi
 
 [psqlodbc](https://github.com/postgresql-interfaces/psqlodbc) is the tested driver for Aurora PostgreSQL. It is validated across the unit, compatibility, and integration test suites and supports all features, including IAM authentication.
 
+With pyodbc, use the Unicode wrapper with psqlODBC's Unicode driver (`psqlodbcw`). psqlODBC's ANSI driver (`psqlodbca`) has no wide-character support, which pyodbc uses by default: reading text fails with `07006`, and binding a string with `HYC00`. With the ANSI wrapper, call `setdecoding(pyodbc.SQL_CHAR, encoding='utf-8', ctype=pyodbc.SQL_CHAR)`, `setdecoding(pyodbc.SQL_WCHAR, encoding='utf-8', ctype=pyodbc.SQL_CHAR)` and `setencoding(encoding='utf-8', ctype=pyodbc.SQL_CHAR)` on the connection, and don't use `fast_executemany`.
+
 ### Aurora MySQL
 
 Both [MariaDB Connector/ODBC](https://mariadb.com/downloads/connectors/connectors-data-access/odbc-connector/) and [MySQL Connector/ODBC](https://dev.mysql.com/downloads/connector/odbc/) have been tested against Aurora MySQL. The table below summarizes feature support for each:
@@ -34,6 +36,10 @@ MariaDB Connector/ODBC is recommended when IAM authentication is required for Au
 > - **AWS Secrets Manager authentication** - use the [Secrets Manager plugin](./plugins/secrets-manager-plugin.md) instead of IAM if you prefer to keep MySQL Connector/ODBC.
 
 When choosing a driver, also confirm your `SSLMode`/TLS settings: IAM authentication requires SSL to be enabled regardless of the underlying driver.
+
+### Aurora DSQL
+
+[psqlodbc](https://github.com/postgresql-interfaces/psqlodbc) is the tested driver for Aurora DSQL. See [Support for Amazon Aurora DSQL](./SupportForAuroraDSQL.md) and the [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md).
 
 ## Using the AWS Advanced ODBC Wrapper with plain RDS databases
 
@@ -154,3 +160,5 @@ The AWS Advanced ODBC Wrapper has several built-in plugins that are available to
 | [Read/Write Splitting Plugin](./plugins/read-write-splitting-plugin.md)                             | Aurora                           | psqlodbc, MySQL Connector/ODBC | Enables switching between writer and reader instances based on the connection's read-only attribute, using the cluster topology to select reader hosts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | [Secrets Manager Authentication](./plugins/secrets-manager-plugin.md)                               | Aurora, RDS Multi-AZ DB Cluster  | psqlodbc, MySQL Connector/ODBC | Enables fetching database credentials from the AWS Secrets Manager service.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | [Simple Read/Write Splitting Plugin](./plugins/simple-read-write-splitting-plugin.md)               | Aurora, RDS  Multi-AZ DB Cluster | psqlodbc, MySQL Connector/ODBC | Enables switching between user-specified writer and reader endpoints based on the connection's read-only attribute, without relying on cluster topology.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+
+For Aurora DSQL, see [Support for Amazon Aurora DSQL](./SupportForAuroraDSQL.md).

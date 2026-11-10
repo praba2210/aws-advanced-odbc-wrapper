@@ -15,6 +15,7 @@
 #ifndef DSQL_AUTH_PLUGIN_H_
 #define DSQL_AUTH_PLUGIN_H_
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -44,11 +45,24 @@ public:
         SQLSMALLINT *  StringLengthPtr,
         SQLUSMALLINT   DriverCompletion) override;
 
-    // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes. Public for tests.
-    static void ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr);
+    // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes. root_cert is the
+    // sslrootcert value a verify-full connection gets when pqopt sets none (DefaultRootCert), or "" for no default.
+    // Public for tests.
+    static void ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
+                                        std::string_view root_cert = "system");
 
-    // A hint for a connect that failed on the server certificate while relying on sslrootcert=system, or "" when the
-    // error has nothing to do with it. Public for tests.
+    // The sslrootcert default for the base driver's libpq version: "system" for libpq 16 or later or an unknown
+    // version; before 16 that value is a file name in the working directory, so the first system CA bundle that
+    // is_trusted_file accepts, or "" when there is none (libpq then looks for ~/.postgresql/root.crt and fails closed).
+    // Public for tests.
+    static std::string DefaultRootCert(std::optional<int> libpq_version,
+                                       const std::function<bool(const char*)>& is_trusted_file = IsRootOwnedFile);
+
+    // A regular file only root can change (symbolic links are followed). Never true on Windows. Public for tests.
+    static bool IsRootOwnedFile(const char* path);
+
+    // A hint for a connect that failed on the server certificate while relying on a default sslrootcert (system or a
+    // system CA bundle) or on none, or "" when the error has nothing to do with it. Public for tests.
     static std::string_view GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
                                             const std::string& error_message);
 

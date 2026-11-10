@@ -15,13 +15,21 @@
 #include "dsql_auth_plugin.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_auth_provider.h"
@@ -30,6 +38,7 @@
 #include "../../util/rds_strings.h"
 #include "../../util/rds_utils.h"
 #include "../../util/secure_wipe.h"
+#include "dsql_plugin_helper.h"
 
 namespace {
     // psqlODBC keywords, upper-cased as in conn_attr. They aren't wrapper keys, so they reach the base driver.
@@ -44,6 +53,14 @@ namespace {
     const std::string SSLMODE_REQUIRE = "require";
     const std::string ROOT_CERT_KEYWORD = "sslrootcert";
     const std::string SYSTEM_ROOT_CERT = "system";
+    constexpr int LIBPQ_16 = 160000;  // first libpq where sslrootcert=system means the system's roots
+    // System CA bundles, each with Amazon Root CA 1, in this order.
+    constexpr std::array<const char*, 4> SYSTEM_CA_BUNDLES = {
+        "/etc/ssl/certs/ca-certificates.crt",  // Debian, Ubuntu, Alpine, Arch
+        "/etc/pki/tls/certs/ca-bundle.crt",    // RHEL, Fedora, Amazon Linux
+        "/etc/ssl/ca-bundle.pem",              // SUSE
+        "/etc/ssl/cert.pem",                   // macOS
+    };
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
@@ -186,8 +203,9 @@ namespace {
     }
 
     // pqopt is a brace-quoted libpq conninfo string. Add each option the user didn't set; keep theirs. libpq rejects
-    // sslrootcert=system with any mode weaker than verify-full, so it's only a default for verify-full.
-    std::string MergePqopt(const std::string& pqopt, const std::string& ssl_mode)
+    // sslrootcert=system with any mode weaker than verify-full, so the root certificate is only a default for
+    // verify-full, and not added when root_cert is empty.
+    std::string MergePqopt(const std::string& pqopt, const std::string& ssl_mode, std::string_view root_cert)
     {
         const std::string_view conninfo = UnwrapPqopt(pqopt);
         const std::map<std::string, std::string> options = ParseConninfo(conninfo);
@@ -197,18 +215,30 @@ namespace {
                 merged += (merged.empty() ? "" : " ") + keyword + "=" + value;
             }
         };
-        if (ssl_mode == SSLMODE_VERIFY_FULL) {
-            add_if_missing(ROOT_CERT_KEYWORD, SYSTEM_ROOT_CERT);
+        if (ssl_mode == SSLMODE_VERIFY_FULL && !root_cert.empty()) {
+            add_if_missing(ROOT_CERT_KEYWORD, std::string(root_cert));
         }
         add_if_missing("application_name", APPLICATION_NAME);
         return "{" + merged + "}";
     }
 
-    bool UsesSystemRootCert(const std::string& pqopt)
+    // What pqopt gives for sslrootcert: the default the plugin adds ("system" or a system CA bundle), a value of the
+    // user's, or none.
+    enum class RootCertSource : std::uint8_t { NONE, DEFAULT, BUNDLE, USER };
+
+    RootCertSource ClassifyRootCert(const std::string& pqopt)
     {
         const std::map<std::string, std::string> options = ParseConninfo(UnwrapPqopt(pqopt));
         const auto it = options.find(ROOT_CERT_KEYWORD);
-        return it != options.end() && it->second == SYSTEM_ROOT_CERT;
+        if (it == options.end()) {
+            return RootCertSource::NONE;
+        }
+        if (it->second == SYSTEM_ROOT_CERT) {
+            return RootCertSource::DEFAULT;
+        }
+        const bool is_bundle = std::ranges::any_of(SYSTEM_CA_BUNDLES,
+            [&it](const char* bundle) { return it->second == bundle; });
+        return is_bundle ? RootCertSource::BUNDLE : RootCertSource::USER;
     }
 
     // pqopt, or its short form D5 when only that one is set.
@@ -427,7 +457,12 @@ SQLRETURN DsqlAuthPlugin::Connect(
     }
     // Read before the defaults replace the requested mode.
     const std::string tls_warning = GetTlsOverrideWarning(dbc->conn_attr);
-    ApplyConnectionDefaults(dbc->conn_attr);
+    const std::optional<int> libpq_version =
+        DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr);
+    if (!libpq_version) {
+        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; sslrootcert=system is used.";
+    }
+    ApplyConnectionDefaults(dbc->conn_attr, DefaultRootCert(libpq_version));
     const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
     // The token was for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect (the
@@ -453,7 +488,30 @@ void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, cons
     }
 }
 
-void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr)
+std::string DsqlAuthPlugin::DefaultRootCert(const std::optional<int> libpq_version,
+                                            const std::function<bool(const char*)>& is_trusted_file)
+{
+    if (!libpq_version || *libpq_version >= LIBPQ_16) {
+        return SYSTEM_ROOT_CERT;
+    }
+    const auto* const bundle = std::ranges::find_if(SYSTEM_CA_BUNDLES, is_trusted_file);
+    return bundle == SYSTEM_CA_BUNDLES.end() ? "" : *bundle;
+}
+
+bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)
+{
+#ifdef _WIN32
+    (void)path;
+    return false;
+#else
+    struct stat info {};
+    return stat(path, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0
+        && (info.st_mode & static_cast<mode_t>(S_IWGRP | S_IWOTH)) == 0;
+#endif
+}
+
+void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
+                                              const std::string_view root_cert)
 {
     const std::string ssl_mode = ResolveSslMode(MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
         MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, "")));
@@ -474,25 +532,43 @@ void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>&
     }
 
     const std::string& pqopt_key = PqoptKey(conn_attr);
-    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode));
+    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode,
+                                                     root_cert));
 }
 
 std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
                                                  const std::string& error_message)
 {
-    // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". On Windows it means
-    // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against; there
-    // libpq can also report OpenSSL's "unregistered scheme" (DSQL user guide). A host name mismatch isn't matched: the
-    // roots worked there.
-    const bool root_cert_error = error_message.find("root certificate file \"system\"") != std::string::npos
+    // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". Before 16 the plugin
+    // adds a system CA bundle instead, or nothing when none is found, and libpq then names the root certificate file
+    // it looked for. On Windows system means OpenSSL's default paths, not the Windows certificate store, which can
+    // leave no root to verify against; there libpq can also report OpenSSL's "unregistered scheme" (DSQL user guide).
+    // A host name mismatch isn't matched: the roots worked there.
+    const bool root_cert_error = error_message.find("root certificate file") != std::string::npos
         || error_message.find("certificate verify failed") != std::string::npos
         || error_message.find("unregistered scheme") != std::string::npos;
-    if (!root_cert_error || !UsesSystemRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
+    if (!root_cert_error) {
         return "";
     }
-    return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
-           "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
-           "AmazonRootCA1.pem>} instead.";
+    switch (ClassifyRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
+    case RootCertSource::DEFAULT:
+        return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
+               "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
+               "AmazonRootCA1.pem>} instead.";
+    case RootCertSource::BUNDLE:
+        return "[DSQL] The server certificate couldn't be verified with the system CA bundle, which may lack Amazon "
+               "Root CA 1. Set pqopt={sslrootcert=<path to AmazonRootCA1.pem>} instead.";
+    case RootCertSource::NONE:
+        // verify-ca and require need no root default, so a missing one isn't what failed.
+        if (MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE, "") != SSLMODE_VERIFY_FULL) {
+            return "";
+        }
+        return "[DSQL] libpq 15 or earlier has no sslrootcert=system, and no system CA bundle was found. Set "
+               "pqopt={sslrootcert=<path to AmazonRootCA1.pem>}.";
+    case RootCertSource::USER:
+        break;
+    }
+    return "";
 }
 
 bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error)

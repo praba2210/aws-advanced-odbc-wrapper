@@ -15,12 +15,17 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -38,10 +43,12 @@
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
+#include "../../driver/plugin/dsql/dsql_plugin_helper.h"
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_auth_provider.h"
 #include "../../driver/util/logger_wrapper.h"
+#include "../../driver/util/rds_lib_loader.h"
 
 #ifndef AWS_PROFILE_TEST_RESOURCES_DIR
     #error "AWS_PROFILE_TEST_RESOURCES_DIR must be defined by the build"
@@ -1413,4 +1420,107 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvide
     ASSERT_NE(nullptr, dbc_->err);
     EXPECT_EQ("28000", dbc_->err->sqlstate);
     EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
+}
+
+// libpq before 16 reads sslrootcert=system as a file named "system" in the working directory, so the plugin adds a
+// system CA bundle there instead (SEC-2).
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq16OrUnknown_IsSystem) {
+    const auto never_trusted = [](const char*) { return false; };
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(160000, never_trusted));
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(180001, never_trusted));
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(std::nullopt, never_trusted));
+}
+
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq15_UsesTheFirstTrustedBundle) {
+    EXPECT_EQ("/etc/pki/tls/certs/ca-bundle.crt", DsqlAuthPlugin::DefaultRootCert(150004,
+        [](const char* path) { return std::string(path) == "/etc/pki/tls/certs/ca-bundle.crt"; }));
+    EXPECT_EQ("/etc/ssl/certs/ca-certificates.crt", DsqlAuthPlugin::DefaultRootCert(150004,
+        [](const char*) { return true; }));
+}
+
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq15_NoBundle_AddsNothing) {
+    EXPECT_EQ("", DsqlAuthPlugin::DefaultRootCert(90600, [](const char*) { return false; }));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_NoRootCert_PqoptHasOnlyApplicationName) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "");
+    EXPECT_EQ("verify-full", conn_attr.at("SSLMODE"));
+    EXPECT_EQ("{application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_BundleRootCert_IsAdded) {
+    const std::string bundle = "/etc/ssl/certs/ca-certificates.crt";
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, bundle);
+    EXPECT_EQ("{sslrootcert=" + bundle + " application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+
+    std::map<std::string, std::string> own_cert = {{"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(own_cert, bundle);
+    EXPECT_EQ("{sslrootcert=/etc/ssl/corp-ca.pem application_name=" + EXPECTED_APP_NAME + "}", own_cert.at("PQOPT"));
+}
+
+#ifndef _WIN32
+namespace {
+    constexpr int FAKE_LIBPQ_VERSION = 150004;
+    int FakePQlibVersion() { return FAKE_LIBPQ_VERSION; }
+
+    class FakeLibpqLoader : public RdsLibLoader {
+    public:
+        explicit FakeLibpqLoader(const bool has_function) : RdsLibLoader(""), has_function_(has_function) {}
+
+        RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
+            if (!has_function_ || function_name != "PQlibVersion") {
+                return nullptr;
+            }
+            return reinterpret_cast<RdsPlatform::FuncHandle>(&FakePQlibVersion);
+        }
+
+    private:
+        bool has_function_;
+    };
+}  // namespace
+
+TEST_F(DsqlAuthPluginTest, BaseLibpqVersion_ReadsTheBaseDriversLibpq) {
+    EXPECT_EQ(std::optional<int>(FAKE_LIBPQ_VERSION),
+              DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(true)));
+    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(false)));
+    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(nullptr));
+}
+
+TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RejectsFilesAndDirectoriesNotOwnedByRoot) {
+    if (geteuid() == 0) {
+        GTEST_SKIP() << "files made by root are root-owned";
+    }
+    const std::string path = ::testing::TempDir() + "dsql_root_owned_file_test.txt";
+    { std::ofstream file(path); file << "x"; }
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(path.c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(::testing::TempDir().c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/nonexistent/dsql-ca-bundle.crt"));
+    std::remove(path.c_str());
+}
+#endif
+
+TEST_F(DsqlAuthPluginTest, RootCertHint_OldLibpqWithoutRootCert) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "");
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr,
+        "root certificate file \"/home/u/.postgresql/root.crt\" does not exist");
+    EXPECT_NE(std::string::npos, hint.find("no system CA bundle was found"));
+    EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert="));
+    // A user's own certificate, or a mode that needs none, gets no hint.
+    std::map<std::string, std::string> own_cert = {{"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(own_cert, "");
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint(own_cert, "certificate verify failed"));
+    std::map<std::string, std::string> verify_ca = {{"SSLMODE", "verify-ca"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(verify_ca, "");
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint(verify_ca, "certificate verify failed"));
+}
+
+TEST_F(DsqlAuthPluginTest, RootCertHint_BundleRootCert) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "/etc/pki/tls/certs/ca-bundle.crt");
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, "SSL error: certificate verify failed");
+    EXPECT_NE(std::string::npos, hint.find("system CA bundle"));
+    EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert="));
 }

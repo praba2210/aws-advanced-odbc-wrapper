@@ -19,8 +19,11 @@
 
 #include <sql.h>
 
+#include <memory>
+#include <optional>
 #include <string>
 
+class RdsLibLoader;
 struct STMT;
 
 // What the Aurora DSQL OCC retry and error hint plugins read from a failed statement, and the ASCII case fold they
@@ -45,6 +48,11 @@ namespace DsqlPluginHelper {
     // follows the process locale, and ICU's default locale (as in RDS_STR_UPPER) turns i into a dotted capital I under
     // tr and az.
     std::string AsciiUpper(std::string text);
+
+    // The base driver's libpq version (PQlibVersion, e.g. 160004), or nullopt when the function can't be found. On
+    // POSIX it is a dlsym through the loaded driver, which finds the libpq the driver depends on; on Windows it is
+    // GetProcAddress on the libpq.dll already loaded in the process, as GetProcAddress doesn't search imports.
+    std::optional<int> BaseLibpqVersion(const std::shared_ptr<RdsLibLoader>& loader);
 }  // namespace DsqlPluginHelper
 
 #endif // DSQL_PLUGIN_HELPER_H_

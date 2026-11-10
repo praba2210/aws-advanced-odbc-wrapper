@@ -62,6 +62,10 @@ public:
     // succeeded), now, or when the SQLCancel calls using them return. The caller holds dbc->lock. Returns the base
     // connection it took out.
     static SQLHDBC ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC *dbc, bool free_base_dbc);
+    // Frees the base descriptors of the connection's explicit descriptors now and nulls them; the DESCs stay the app's
+    // (AllocWrappedDesc gives one a new base descriptor). The caller holds dbc->lock and has ruled out a pinned
+    // statement (BaseHandleGuard::Busy).
+    static void FreeWrappedDescs(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC *dbc);
     // Gives an explicit descriptor a base descriptor on its connection's base connection, if it has none (releasing a
     // connection's base handles drops them).
     static RdsLibResult AllocWrappedDesc(const std::shared_ptr<RdsLibLoader>& lib_loader, DESC *desc);

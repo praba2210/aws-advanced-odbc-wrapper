@@ -834,6 +834,10 @@ SQLRETURN SQL_API SQLDisconnect(
         dbc->conn_status = CONN_NOT_CONNECTED;
         return SQL_SUCCESS;
     }
+    // The app's descriptors lose their base descriptors first, as ReleaseBaseHandles does: psqlODBC before 18.00.0002
+    // frees them in its SQLDisconnect, so RDS_FreeConnect, which frees the descriptors the app left, would free them
+    // again. A DESC stays the app's until it frees it or the connection; SQLSetStmtAttr allocates a base one again.
+    OdbcHelper::FreeWrappedDescs(env->driver_lib_loader, dbc);
     const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDisconnect>(env->driver_lib_loader, RdsFuncNames::Disconnect,
         dbc->wrapped_dbc
     );

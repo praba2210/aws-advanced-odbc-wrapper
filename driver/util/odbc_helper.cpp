@@ -58,6 +58,30 @@ void OdbcHelper::FreeWrappedStmt(const std::shared_ptr<RdsLibLoader>& lib_loader
     }
 }
 
+namespace {
+// Nulls the base descriptors of the descriptors the app allocated on the connection and returns them.
+std::vector<SQLHDESC> TakeWrappedDescs(DBC* dbc) {
+    std::vector<SQLHDESC> wrapped_descs;
+    const std::list<DESC*> desc_list = dbc->desc_list;
+    for (DESC* desc : desc_list) {
+        const std::lock_guard<std::recursive_mutex> desc_lock(desc->lock);
+        if (desc->wrapped_desc) {
+            wrapped_descs.push_back(desc->wrapped_desc);
+            desc->wrapped_desc = SQL_NULL_HDESC;
+        }
+    }
+    return wrapped_descs;
+}
+}  // namespace
+
+void OdbcHelper::FreeWrappedDescs(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC* dbc) {
+    for (const SQLHDESC wrapped_desc : TakeWrappedDescs(dbc)) {
+        RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(lib_loader, RdsFuncNames::FreeHandle,
+            SQL_HANDLE_DESC, wrapped_desc
+        );
+    }
+}
+
 SQLHDBC OdbcHelper::ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC* dbc, bool free_base_dbc) {
     // Underlying statements; NULL handles crash some base drivers.
     std::vector<SQLHSTMT> wrapped_stmts;
@@ -70,15 +94,7 @@ SQLHDBC OdbcHelper::ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_
         InvalidateImplicitDescriptors(stmt);
     }
     // and underlying descriptors
-    std::vector<SQLHDESC> wrapped_descs;
-    const std::list<DESC*> desc_list = dbc->desc_list;
-    for (DESC* desc : desc_list) {
-        const std::lock_guard<std::recursive_mutex> desc_lock(desc->lock);
-        if (desc->wrapped_desc) {
-            wrapped_descs.push_back(desc->wrapped_desc);
-            desc->wrapped_desc = SQL_NULL_HDESC;
-        }
-    }
+    const std::vector<SQLHDESC> wrapped_descs = TakeWrappedDescs(dbc);
     const SQLHDBC wrapped_dbc = dbc->wrapped_dbc;
     dbc->wrapped_dbc = SQL_NULL_HDBC;
 

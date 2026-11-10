@@ -1578,6 +1578,23 @@ TEST_F(DsqlAuthPluginTest, Connect_ResolvesTheRegionOnce) {
     EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("Region")) << dbc_->err->error_msg;
 }
 
+// The environment variables the chain reads when it is built are inputs of the provider too: with another credentials
+// file the provider is built again, for the same profile and region. (A provider reads its profile's static keys from
+// the file it was built with.)
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_CredentialsFileChange_RebuildsTheProvider) {
+    const TempConfigFile first("[p]\naws_access_key_id = AKIDFIRST\naws_secret_access_key = firstSecret\n");
+    const TempConfigFile second("[p]\naws_access_key_id = AKIDSECOND\naws_secret_access_key = secondSecret\n");
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", first.Path());
+    ResetAttributes(dbc_, "p");
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDFIRST"));
+
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", second.Path());
+    ResetAttributes(dbc_, "p");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSECOND"));
+}
+
 #ifndef _WIN32
 namespace {
     // Credentials file text for profile p, with keys from a credential_process (which the provider built for it runs on

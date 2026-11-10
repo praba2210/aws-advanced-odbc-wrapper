@@ -72,6 +72,25 @@ namespace {
     // The characters libpq's isspace() skips between conninfo options.
     constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";
 
+    // An environment variable a credentials chain reads when it is built, so that a change needs a new chain.
+    struct BuildEnvVar {
+        const char* name;
+        bool key_chain;  // the AWS_PROFILE key's chain reads it too, not only the default chain
+    };
+
+    // The key's chain reads its profile's files and, for credential_source = EcsContainer, the container endpoint. The
+    // default chain also reads the EKS web identity settings and AWS_EC2_METADATA_DISABLED.
+    constexpr std::array BUILD_ENV_VARS = {
+        BuildEnvVar{.name = "AWS_CONFIG_FILE", .key_chain = true},
+        BuildEnvVar{.name = "AWS_SHARED_CREDENTIALS_FILE", .key_chain = true},
+        BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", .key_chain = true},
+        BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_FULL_URI", .key_chain = true},
+        BuildEnvVar{.name = "AWS_ROLE_ARN", .key_chain = false},
+        BuildEnvVar{.name = "AWS_WEB_IDENTITY_TOKEN_FILE", .key_chain = false},
+        BuildEnvVar{.name = "AWS_ROLE_SESSION_NAME", .key_chain = false},
+        BuildEnvVar{.name = "AWS_EC2_METADATA_DISABLED", .key_chain = false},
+    };
+
     // The error for a connect that names two different hosts in SERVER and SERVERNAME (any key case; hosts compare
     // ASCII case-insensitively), or "" when there is at most one. The token is signed for one host, and the key that
     // loses would be dropped without a word: a DSN's SERVER would beat the connection string's SERVERNAME.
@@ -468,10 +487,16 @@ DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map
                                                                   std::string region)
 {
     ProviderInputs inputs{.key_profile = GetProfileKey(conn_attr), .env_profile = std::nullopt,
-                          .region = std::move(region),
+                          .region = std::move(region), .build_env = {},
     };
     if (const char* value = std::getenv("AWS_PROFILE"); inputs.key_profile.empty() && value) {
         inputs.env_profile = value;
+    }
+    for (const auto& [name, key_chain] : BUILD_ENV_VARS) {
+        if (key_chain || inputs.key_profile.empty()) {
+            const char* value = std::getenv(name);
+            inputs.build_env.emplace(name, value ? std::optional<std::string>(value) : std::nullopt);
+        }
     }
     return inputs;
 }

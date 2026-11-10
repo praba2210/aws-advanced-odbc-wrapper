@@ -110,12 +110,13 @@ protected:
     void OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message) override;
 
 private:
-    // What decides the provider: the AWS_PROFILE key (trimmed), else the AWS_PROFILE variable as is, and the region
-    // the chain is built with.
+    // What decides the provider: the AWS_PROFILE key (trimmed), else the AWS_PROFILE variable as is, the region the
+    // chain is built with, and the environment variables that chain reads when it is built, as set (nullopt: unset).
     struct ProviderInputs {
         std::string key_profile;
         std::optional<std::string> env_profile;
         std::string region;
+        std::map<std::string, std::optional<std::string>> build_env;
         bool operator==(const ProviderInputs&) const = default;
     };
     static ProviderInputs ReadProviderInputs(const std::map<std::string, std::string>& conn_attr, std::string region);

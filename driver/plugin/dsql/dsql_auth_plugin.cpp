@@ -78,11 +78,15 @@ namespace {
         bool key_chain;  // the AWS_PROFILE key's chain reads it too, not only the default chain
     };
 
-    // The key's chain reads its profile's files and, for credential_source = EcsContainer, the container endpoint. The
-    // default chain also reads the EKS web identity settings and AWS_EC2_METADATA_DISABLED.
+    // The key's chain reads its profile's files, the region variables for a profile with role_arn (the STS provider's
+    // region: AWS_REGION, then AWS_DEFAULT_REGION, then the profile's) and, for credential_source = EcsContainer, the
+    // container endpoint. The default chain also reads the region variables for its EKS web identity provider, the
+    // other web identity settings and AWS_EC2_METADATA_DISABLED.
     constexpr std::array BUILD_ENV_VARS = {
         BuildEnvVar{.name = "AWS_CONFIG_FILE", .key_chain = true},
         BuildEnvVar{.name = "AWS_SHARED_CREDENTIALS_FILE", .key_chain = true},
+        BuildEnvVar{.name = "AWS_REGION", .key_chain = true},
+        BuildEnvVar{.name = "AWS_DEFAULT_REGION", .key_chain = true},
         BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", .key_chain = true},
         BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_FULL_URI", .key_chain = true},
         BuildEnvVar{.name = "AWS_ROLE_ARN", .key_chain = false},

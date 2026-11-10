@@ -1659,6 +1659,32 @@ TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionChange_RebuildsTheProvider
     EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
 }
 
+// The STS providers the chains build take their region from AWS_REGION, then AWS_DEFAULT_REGION, when they are built,
+// so either one changing builds the provider again, though the token's region (here SERVER's) stays. The default chain
+// here: the AWS_PROFILE variable and no key.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionVariableChange_RebuildsTheProvider) {
+    for (const char* variable : {"AWS_REGION", "AWS_DEFAULT_REGION"}) {
+        SCOPED_TRACE(variable);
+        const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+        const ScopedEnvVars env = OnlyProfileCredentials();
+        SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+        SetEnvVar("AWS_PROFILE", "p");
+        SetEnvVar(variable, "us-east-1");
+        ResetAttributes(dbc_, "");
+        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+        credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+        ResetAttributes(dbc_, "");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+        SetEnvVar(variable, "eu-west-1");
+        ResetAttributes(dbc_, "");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
+        UnsetEnvVar(variable);
+    }
+}
+
 // When the server rejects the token (keys rotated or revoked since the chain read them), the next connect builds the
 // provider again, so one that holds the old keys doesn't keep failing. psqlODBC reports Aurora DSQL's "access denied"
 // as 08001, so that message counts as well as 28000 and 28P01; another error keeps the provider.

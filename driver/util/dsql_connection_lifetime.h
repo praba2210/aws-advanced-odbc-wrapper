@@ -26,21 +26,25 @@ struct DBC;
 
 // How old an Aurora DSQL connection is, and the age at which the driver retires it (MAX_CONNECTION_LIFETIME). Aurora
 // DSQL closes connections at 60 minutes. A driver manager asks SQL_ATTR_CONNECTION_DEAD before it hands out a pooled
-// connection; from MAX_CONNECTION_LIFETIME on, the driver answers SQL_CD_TRUE, so the pool disconnects the connection
-// and opens a new one, with a new token. The 60-minute hint reads the same age.
+// connection; once a connection is MAX_CONNECTION_LIFETIME old, the driver answers SQL_CD_TRUE, so the pool
+// disconnects it and opens a new one, with a new token. Off unless MAX_CONNECTION_LIFETIME is set: an application that
+// asks on a connection it is using (nanodbc, before each commit) would skip its commits. The 60-minute hint reads the
+// same age.
 class DsqlConnectionLifetime {
 public:
     using Clock = std::function<std::chrono::steady_clock::time_point()>;
 
-    // MAX_CONNECTION_LIFETIME's default and largest value: the Aurora DSQL connectors' 55 minutes.
-    static constexpr std::chrono::seconds DEFAULT_MAX_LIFETIME{3300};
+    // MAX_CONNECTION_LIFETIME when it isn't set: off.
+    static constexpr std::chrono::seconds DEFAULT_MAX_LIFETIME{0};
+    // Its largest value: the Aurora DSQL connectors' 55 minutes.
+    static constexpr std::chrono::seconds LARGEST_MAX_LIFETIME{3300};
     // Its smallest value other than 0, which turns retirement off.
     static constexpr std::chrono::seconds MIN_MAX_LIFETIME{120};
 
     // The steady clock, unless a test passes its own.
     explicit DsqlConnectionLifetime(Clock clock = nullptr);
 
-    // MAX_CONNECTION_LIFETIME from upper-cased connection attributes: the default when it isn't set, 0 for off. On a
+    // MAX_CONNECTION_LIFETIME from upper-cased connection attributes: 0 (off) when it isn't set or is blank. On a
     // bad value, returns std::nullopt and sets error to the option, its value and what to use instead, for example
     // "MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)".
     static std::optional<std::chrono::seconds> ParseMaxLifetime(const std::map<std::string, std::string>& conn_attr,

@@ -48,9 +48,9 @@ namespace {
     }
 }  // namespace
 
-// MAX_CONNECTION_LIFETIME's default retires a pooled connection at the age from which a failure on a closed connection
-// gets the 60-minute hint.
-static_assert(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME == DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
+// MAX_CONNECTION_LIFETIME's largest value retires a pooled connection at the age from which a failure on a closed
+// connection gets the 60-minute hint.
+static_assert(DsqlConnectionLifetime::LARGEST_MAX_LIFETIME == DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
 
 DsqlErrorHintPlugin::DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin)
     : BasePlugin(dbc, std::move(next_plugin))

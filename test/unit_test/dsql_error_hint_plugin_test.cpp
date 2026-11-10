@@ -560,6 +560,20 @@ TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheLifetimeWithMaxConnectionLifeti
     dbc_->wrapped_dbc = SQL_NULL_HDBC;
 }
 
+// Without MAX_CONNECTION_LIFETIME a connection is never retired.
+TEST_F(DsqlErrorHintPluginTest, Connect_LifetimeUnset_NeverRetires) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    dbc_->wrapped_dbc = static_cast<SQLHDBC>(dbc_);
+    dbc_->conn_status = CONN_CONNECTED;
+    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}};
+
+    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    now_ += std::chrono::hours(24);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+
+    dbc_->wrapped_dbc = SQL_NULL_HDBC;
+}
+
 // The plugin that keeps the age creates it, so SQL_ATTR_CONNECTION_DEAD can read it. Other connections get none.
 TEST_F(DsqlErrorHintPluginTest, AddToChain_GivesOnlyAuroraDsqlConnectionsALifetime) {
     const std::shared_ptr<BasePlugin> head = next_;

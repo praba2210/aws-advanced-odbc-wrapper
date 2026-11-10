@@ -833,8 +833,8 @@ SQLRETURN RDS_GetConnectAttr(
         return SQL_SUCCESS;
     }
 
-    // An Aurora DSQL connection at its MAX_CONNECTION_LIFETIME reports itself dead, so a driver manager's pool
-    // replaces it. No round trip: the answer comes from the connection's age.
+    // When MAX_CONNECTION_LIFETIME is set, an Aurora DSQL connection at that age reports itself dead, so a driver
+    // manager's pool replaces it. No round trip: the answer comes from the connection's age.
     if (Attribute == SQL_ATTR_CONNECTION_DEAD && DsqlConnectionLifetime::IsRetired(dbc)) {
         if (ValuePtr != nullptr) {
             *static_cast<SQLUINTEGER*>(ValuePtr) = static_cast<SQLUINTEGER>(SQL_CD_TRUE);

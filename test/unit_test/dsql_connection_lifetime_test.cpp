@@ -52,23 +52,40 @@ namespace {
     std::string InvalidEntry(const std::string& value) {
         return "MAX_CONNECTION_LIFETIME=" + value + " (use 0 for off, or an integer from "
             + std::to_string(DsqlConnectionLifetime::MIN_MAX_LIFETIME.count()) + " to "
-            + std::to_string(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count()) + ")";
+            + std::to_string(DsqlConnectionLifetime::LARGEST_MAX_LIFETIME.count()) + ")";
     }
 }  // namespace
 
-// The Aurora DSQL connectors' 55 minutes.
-TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_UnsetIsTheDefault) {
-    EXPECT_EQ(3300, DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count());
+// Off unless set; the cap is the Aurora DSQL connectors' 55 minutes.
+TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_UnsetIsOff) {
+    EXPECT_EQ(0, DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count());
+    EXPECT_EQ(3300, DsqlConnectionLifetime::LARGEST_MAX_LIFETIME.count());
     EXPECT_EQ(120, DsqlConnectionLifetime::MIN_MAX_LIFETIME.count());
     std::string error;
     const std::optional<std::chrono::seconds> lifetime = DsqlConnectionLifetime::ParseMaxLifetime({}, error);
     ASSERT_TRUE(lifetime.has_value());
-    EXPECT_EQ(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count(), lifetime->count());
+    EXPECT_EQ(0, lifetime->count());
     EXPECT_TRUE(error.empty());
 }
 
+// A value from the DSN is read; a blank one (the setup dialog's empty field) is the same as unset.
+TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_FromDsnAndBlank) {
+    std::string error;
+    std::optional<std::chrono::seconds> lifetime =
+        DsqlConnectionLifetime::ParseMaxLifetime({{KEY_MAX_CONNECTION_LIFETIME, "600"}}, error);
+    ASSERT_TRUE(lifetime.has_value()) << error;
+    EXPECT_EQ(600, lifetime->count());
+
+    for (const std::string& blank : {std::string(), std::string("  ")}) {
+        lifetime = DsqlConnectionLifetime::ParseMaxLifetime({{KEY_MAX_CONNECTION_LIFETIME, blank}}, error);
+        ASSERT_TRUE(lifetime.has_value()) << "[" << blank << "] " << error;
+        EXPECT_EQ(0, lifetime->count());
+        EXPECT_TRUE(error.empty());
+    }
+}
+
 TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_AcceptsOffAndTheRange) {
-    const std::chrono::seconds::rep max = DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count();
+    const std::chrono::seconds::rep max = DsqlConnectionLifetime::LARGEST_MAX_LIFETIME.count();
     const std::vector<std::pair<std::string, std::chrono::seconds::rep>> cases = {
         {"0", 0}, {"120", 120}, {"1800", 1800}, {" +600 ", 600}, {std::to_string(max), max}};
     for (const auto& [value, seconds] : cases) {
@@ -82,8 +99,8 @@ TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_AcceptsOffAndTheRange) {
 
 TEST(DsqlConnectionLifetimeTest, ParseMaxLifetime_RejectsBadValuesWithWhatToUse) {
     const std::vector<std::string> values = {
-        "119", std::to_string(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count() + 1), "3600", "-1", "1.5", "55m",
-        "", "off"};
+        "119", std::to_string(DsqlConnectionLifetime::LARGEST_MAX_LIFETIME.count() + 1), "3600", "-1", "1.5", "55m",
+        "off"};
     for (const std::string& value : values) {
         std::string error;
         EXPECT_FALSE(DsqlConnectionLifetime::ParseMaxLifetime({{KEY_MAX_CONNECTION_LIFETIME, value}}, error)
@@ -118,7 +135,7 @@ TEST(DsqlConnectionLifetimeTest, Age_CountsFromTheConnectUntilCleared) {
     DsqlConnectionLifetime lifetime([&now] { return now; });
     EXPECT_FALSE(lifetime.Age().has_value());
 
-    lifetime.Start(lifetime.Now(), DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME);
+    lifetime.Start(lifetime.Now(), DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
     now += std::chrono::seconds(90);
     const std::optional<std::chrono::steady_clock::duration> age = lifetime.Age();
     ASSERT_TRUE(age.has_value());
@@ -266,7 +283,7 @@ protected:
 
     // An open connection to this server whose connect began now, with this MAX_CONNECTION_LIFETIME.
     void Connect(const std::string& server,
-                 std::chrono::seconds max_lifetime = DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME) {
+                 std::chrono::seconds max_lifetime = DsqlConnectionLifetime::LARGEST_MAX_LIFETIME) {
         dbc_.conn_attr = {{KEY_SERVER, server}};
         // Unicode builds reach the OdbcHelper through the plugin service when the call goes to the base driver.
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
@@ -279,7 +296,7 @@ protected:
 
 TEST_F(DsqlConnectionLifetimeAttrTest, IsRetired_FromTheLifetimeOn) {
     Connect(DSQL_HOST);
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME - std::chrono::milliseconds(1);
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME - std::chrono::milliseconds(1);
     EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc_));
     now_ += std::chrono::milliseconds(1);
     EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc_));
@@ -288,9 +305,21 @@ TEST_F(DsqlConnectionLifetimeAttrTest, IsRetired_FromTheLifetimeOn) {
     EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(nullptr));
 }
 
+// Unset means off: the connection is never reported dead, however old.
+TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_LifetimeUnset_AsksTheBaseDriver) {
+    Connect(DSQL_HOST, DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME);
+    now_ += std::chrono::hours(2);
+    CapturingLogSink sink;
+    SQLUINTEGER dead = SQL_CD_TRUE;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, 0, nullptr));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_CD_FALSE), dead);
+    EXPECT_EQ(1, base_get_connect_attr_calls);
+    EXPECT_EQ(0, sink.Count(RETIRED_LINE));
+}
+
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_UnderTheLifetime_AsksTheBaseDriver) {
     Connect(DSQL_HOST);
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME - std::chrono::seconds(1);
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME - std::chrono::seconds(1);
     SQLUINTEGER dead = SQL_CD_TRUE;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, 0, nullptr));
     EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_CD_FALSE), dead);
@@ -300,7 +329,7 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_UnderTheLifetime_AsksTheBa
 // No round trip, as the driver managers require: psqlODBC isn't called, even for a caller that passes no buffer.
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_AtTheLifetime_IsTrueWithoutTheBaseDriver) {
     Connect(DSQL_HOST);
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME;
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME;
     SQLUINTEGER dead = SQL_CD_FALSE;
     SQLINTEGER length = 0;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, SQL_IS_UINTEGER, &length));
@@ -324,14 +353,14 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_OverTheLifetime_IsTrueAndL
     EXPECT_EQ(0, base_get_connect_attr_calls);
     EXPECT_EQ(1, sink.Count(RETIRED_LINE));
     EXPECT_EQ(1, sink.Count("[DSQL] Retiring the connection after 3400 seconds (MAX_CONNECTION_LIFETIME="
-                           + std::to_string(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME.count())
+                           + std::to_string(DsqlConnectionLifetime::LARGEST_MAX_LIFETIME.count())
                            + "): SQL_ATTR_CONNECTION_DEAD now reports it dead, so a connection pool replaces it."));
 }
 
 // ODBC 2 applications, and unixODBC when SQLGetConnectAttr fails, ask through SQLGetConnectOption.
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_Odbc2GetConnectOption_IsTrue) {
     Connect(DSQL_HOST);
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME;
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME;
     SQLULEN dead = 0;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetConnectOption(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead));
     EXPECT_EQ(static_cast<SQLULEN>(SQL_CD_TRUE), dead);
@@ -341,13 +370,13 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_Odbc2GetConnectOption_IsTr
 // A reconnect on the same handle starts the age again, and its retirement is logged again.
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_ANewConnectStartsOver) {
     Connect(DSQL_HOST);
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME;
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME;
     CapturingLogSink sink;
     EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc_));
 
-    dbc_.dsql_lifetime->Start(now_, DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME);
+    dbc_.dsql_lifetime->Start(now_, DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
     EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc_));
-    now_ += DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME;
+    now_ += DsqlConnectionLifetime::LARGEST_MAX_LIFETIME;
     EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc_));
     EXPECT_EQ(2, sink.Count(RETIRED_LINE));
 }

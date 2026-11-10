@@ -125,19 +125,23 @@ bool DsqlConnectionValidator::IsDsqlTarget(const std::map<std::string, std::stri
 
 std::string DsqlConnectionValidator::Validate(const std::map<std::string, std::string>& conn_attr)
 {
-    // An RDS token can't work when it goes to, or is signed for, an Aurora DSQL endpoint, whatever the dialect.
+    // An RDS token can't work when it goes to, or is signed for, an Aurora DSQL endpoint, or on a connection the
+    // driver treats as Aurora DSQL by its dialect (a PrivateLink address in SERVER).
     const AuthType auth_type = ReadAuthType(conn_attr);
+    const std::string_view reason = DsqlReason(conn_attr);
     if (const std::string_view rds_token = RdsTokenAuthTypeName(auth_type); !rds_token.empty()) {
-        if (const std::string_view host_key = DsqlHostKey(conn_attr); !host_key.empty()) {
+        const std::string_view host_key = DsqlHostKey(conn_attr);
+        if (!host_key.empty() || !reason.empty()) {
+            // With an RDS token type, the reason can only be the SERVER endpoint (a host key) or the dialect.
+            const std::string why = !host_key.empty() ? std::string(host_key) + " is an Aurora DSQL endpoint"
+                                                      : std::string(reason);
             return "RDS_AUTH_TYPE=" + std::string(rds_token) + " doesn't work with Aurora DSQL: it signs an RDS "
-                   "IAM token, which Aurora DSQL rejects (" + std::string(host_key) + " is an Aurora DSQL endpoint). "
-                   "Use RDS_AUTH_TYPE=DSQL, which signs an Aurora DSQL token with the credentials of AWS_PROFILE or "
-                   "the default credential chain; for an AWS IAM Identity Center (SSO) profile, run 'aws sso login' "
-                   "first.";
+                   "IAM token, which Aurora DSQL rejects (" + why + "). Use RDS_AUTH_TYPE=DSQL, which signs an Aurora "
+                   "DSQL token with the credentials of AWS_PROFILE or the default credential chain; for an AWS IAM "
+                   "Identity Center (SSO) profile, run 'aws sso login' first.";
         }
     }
 
-    const std::string_view reason = DsqlReason(conn_attr);
     if (reason.empty()) {
         return "";
     }

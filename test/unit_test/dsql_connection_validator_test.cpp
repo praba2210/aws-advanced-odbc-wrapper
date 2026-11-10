@@ -59,11 +59,15 @@ namespace {
             + reason + ".";
     }
 
-    std::string AuthTypeError(const std::string& auth_type, const std::string& host_key) {
+    std::string AuthTypeErrorFor(const std::string& auth_type, const std::string& why) {
         return "RDS_AUTH_TYPE=" + auth_type + " doesn't work with Aurora DSQL: it signs an RDS IAM token, which Aurora "
-            "DSQL rejects (" + host_key + " is an Aurora DSQL endpoint). Use RDS_AUTH_TYPE=DSQL, which signs an Aurora "
+            "DSQL rejects (" + why + "). Use RDS_AUTH_TYPE=DSQL, which signs an Aurora "
             "DSQL token with the credentials of AWS_PROFILE or the default credential chain; for an AWS IAM Identity "
             "Center (SSO) profile, run 'aws sso login' first.";
+    }
+
+    std::string AuthTypeError(const std::string& auth_type, const std::string& host_key) {
+        return AuthTypeErrorFor(auth_type, host_key + " is an Aurora DSQL endpoint");
     }
 
     // Collects every log line while it exists. It removes itself from ng-log even when an ASSERT returns early.
@@ -199,12 +203,29 @@ TEST(DsqlConnectionValidatorTest, Validate_RejectsRdsTokensForADsqlIamHost) {
                   {KEY_AUTH_TYPE, VALUE_AUTH_ADFS}}));
 }
 
+TEST(DsqlConnectionValidatorTest, Validate_RejectsRdsTokensOnTheDsqlDialect) {
+    // The dialect alone makes it Aurora DSQL, so an RDS token can't work, whatever SERVER is (a PrivateLink address,
+    // or plain RDS PostgreSQL), and the dialect value is matched case-insensitively.
+    for (const auto& [auth_type, name] : std::map<std::string, std::string>{{"IAM", "IAM"}, {"ADFS", "ADFS"},
+             {"OKTA", "OKTA"}, {"AWS_SSO", "AWS_SSO"}, {"iam", "IAM"}, {"adfs", "ADFS"}, {"okta", "OKTA"},
+             {"aws_sso", "AWS_SSO"}}) {
+        for (const char* dialect : {"AURORA_DSQL", "aurora_dsql"}) {
+            EXPECT_EQ(AuthTypeErrorFor(name, "DATABASE_DIALECT=AURORA_DSQL"),
+                      DsqlConnectionValidator::Validate({{KEY_SERVER, PRIVATELINK_ADDRESS}, {KEY_AUTH_TYPE, auth_type},
+                          {KEY_DATABASE_DIALECT, dialect}})) << auth_type << " " << dialect;
+        }
+    }
+    EXPECT_EQ(AuthTypeErrorFor("IAM", "DATABASE_DIALECT=AURORA_DSQL"),
+              DsqlConnectionValidator::Validate({{KEY_SERVER, RDS_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM},
+                  {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}}));
+}
+
 TEST(DsqlConnectionValidatorTest, Validate_AllowsRdsTokensWithoutADsqlHost) {
-    // The DSQL dialect picked for plain RDS PostgreSQL (no topology monitor), with RDS IAM tokens, which RDS accepts.
-    EXPECT_EQ("", DsqlConnectionValidator::Validate({{KEY_SERVER, RDS_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM},
-        {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}}));
     // A cluster ID under IAM is a host name; the IAM plugin reports what's missing.
     EXPECT_EQ("", DsqlConnectionValidator::Validate({{KEY_SERVER, CLUSTER_ID}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM}}));
+    // Another dialect is not Aurora DSQL.
+    EXPECT_EQ("", DsqlConnectionValidator::Validate({{KEY_SERVER, PRIVATELINK_ADDRESS}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM},
+        {KEY_DATABASE_DIALECT, "AURORA_POSTGRESQL"}}));
 }
 
 TEST(DsqlConnectionValidatorTest, Validate_AllowsDsqlAndDatabaseAuth) {

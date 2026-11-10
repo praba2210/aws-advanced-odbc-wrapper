@@ -244,6 +244,24 @@ TEST(DsqlConnectionLifetimeTest, InitializeConnection_LifetimeOffAuroraDsql_Fail
     EXPECT_FALSE(env.driver_lib_loader);
 }
 
+// The dialect alone makes it Aurora DSQL: an RDS token type fails before the base driver loads.
+TEST(DsqlConnectionLifetimeTest, InitializeConnection_RdsTokenOnTheDsqlDialect_Fails08001BeforeTheDriverLoad) {
+    ENV env;
+    DBC dbc{};
+    dbc.env = &env;
+    dbc.conn_attr = {{KEY_SERVER, "10.0.0.5"}, {KEY_AUTH_TYPE, VALUE_AUTH_IAM},
+        {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {KEY_BASE_DRIVER, MISSING_DRIVER}};
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(&dbc, ""));
+
+    ASSERT_TRUE(dbc.err);
+    EXPECT_EQ("08001", dbc.err->sqlstate);
+    EXPECT_NE(std::string::npos, std::string(dbc.err->error_msg).find(
+        "RDS_AUTH_TYPE=IAM doesn't work with Aurora DSQL"));
+    EXPECT_NE(std::string::npos, std::string(dbc.err->error_msg).find("(DATABASE_DIALECT=AURORA_DSQL)"));
+    EXPECT_FALSE(env.driver_lib_loader);
+}
+
 namespace {
     const std::string RETIRED_LINE = "[DSQL] Retiring the connection after ";
     // No "psql" in it, so the path alone gives no dialect.

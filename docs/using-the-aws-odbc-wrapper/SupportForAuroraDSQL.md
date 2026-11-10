@@ -153,28 +153,31 @@ MAX_CONNECTION_LIFETIME=1800 works only with Aurora DSQL. Use an Aurora DSQL end
 
 Aurora DSQL closes every connection after 60 minutes, without an error code or message ([Cluster quotas and database limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). The next statement on the connection fails with SQLSTATE `08S01`, and so does every later call. The wrapper doesn't reconnect. Call `SQLDisconnect` and connect again: `SQLDriverConnect` refuses a handle that is still connected.
 
-Recycle pooled connections before they're 55 minutes old, as the Aurora DSQL connectors do. A pool in the application that limits only idle time doesn't prevent this; a driver manager's pool does, because the wrapper retires its connections, as described below.
+Recycle pooled connections before they're 55 minutes old, as the Aurora DSQL connectors do. A pool in the application that limits only idle time doesn't prevent this. For a driver manager's pool, set `MAX_CONNECTION_LIFETIME`, as described below.
 
-Once a connection is `MAX_CONNECTION_LIFETIME` seconds old, counted from the start of its connect, `SQLGetConnectAttr` with `SQL_ATTR_CONNECTION_DEAD` returns `SQL_CD_TRUE`, without asking the server. The Windows driver manager and unixODBC read this attribute before they reuse a pooled connection, and replace a connection that reports it with a new one, which gets a new token. The wrapper logs this at INFO level, once per connection:
+When `MAX_CONNECTION_LIFETIME` is set, and a connection is that many seconds old, counted from the start of its connect and including time the machine was asleep, `SQLGetConnectAttr` with `SQL_ATTR_CONNECTION_DEAD` returns `SQL_CD_TRUE`, without asking the server. The Windows driver manager and unixODBC read this attribute before they reuse a pooled connection, and replace a connection that reports it with a new one, which gets a new token. The wrapper logs this at INFO level, once per connection:
 
 ```
 [DSQL] Retiring the connection after 3300 seconds (MAX_CONNECTION_LIFETIME=3300): SQL_ATTR_CONNECTION_DEAD now reports it dead, so a connection pool replaces it.
 ```
 
-| Option                    | Description                                                                                             | Value                   | Default |
-|---------------------------|---------------------------------------------------------------------------------------------------------|-------------------------|---------|
-| `MAX_CONNECTION_LIFETIME` | The age in seconds from which `SQL_ATTR_CONNECTION_DEAD` reports a connection dead. `0` turns this off. | `0`, or `120` to `3300` | `3300`  |
+| Option                    | Description                                                                                             | Value                   | Default   |
+|---------------------------|---------------------------------------------------------------------------------------------------------|-------------------------|-----------|
+| `MAX_CONNECTION_LIFETIME` | The age in seconds from which `SQL_ATTR_CONNECTION_DEAD` reports a connection dead. `0` turns this off. | `0`, or `120` to `3300` | `0` (off) |
 
-A value outside that range fails the connect with SQLSTATE `01S00`, for example `MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)`. The wrapper reads the option on every connect. To turn retirement off, set it to `0`, also on a reused connection handle. On a connection that isn't Aurora DSQL, see [Connection Lifetime Outside Aurora DSQL](#connection-lifetime-outside-aurora-dsql).
+A value outside that range fails the connect with SQLSTATE `01S00`, for example `MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)`. The wrapper reads the option on every connect. On a connection that isn't Aurora DSQL, see [Connection Lifetime Outside Aurora DSQL](#connection-lifetime-outside-aurora-dsql).
 
-In a Windows DSN, set `MAX_CONNECTION_LIFETIME` in the DSN setup dialog, on the **Aurora DSQL** tab under **Connection Lifetime**. A blank field uses the default, and the dialog checks the value when it saves the DSN.
+In a Windows DSN, set `MAX_CONNECTION_LIFETIME` in the DSN setup dialog, on the **Aurora DSQL** tab under **Connection Lifetime**. A blank field leaves it off, and the dialog checks the value when it saves the DSN.
 
-Turn on the driver manager's pool, and keep its idle timeout at 600 seconds or less, as the Aurora DSQL connectors do:
+For a driver manager's pool, set `MAX_CONNECTION_LIFETIME=3300`, turn the pool on, and keep its idle timeout at 600 seconds or less, as the Aurora DSQL connectors do:
 
 - Windows: in ODBC Data Source Administrator, on the Connection Pooling tab, turn on pooling for the wrapper's driver and set its timeout. The application turns pooling on with `SQLSetEnvAttr` and `SQL_ATTR_CONNECTION_POOLING` before it allocates its environment.
 - unixODBC: in `odbcinst.ini`, set `CPTimeout` to more than 0 and at most 600 in the wrapper's driver section, and connect with `DRIVER={<that section's name>}` or a DSN whose `Driver` names it. Turn pooling on with `Pooling=Yes` in the `[ODBC]` section, or in the application with `SQL_ATTR_CONNECTION_POOLING` (pyodbc does this by default). `CPTimeToLive` counts how often a connection is reused, not its age.
 
-Outside a driver manager's pool nothing is forced: a statement on an older connection still runs until Aurora DSQL closes it. An application that reads `SQL_ATTR_CONNECTION_DEAD` itself gets `SQL_CD_TRUE` and should disconnect and connect again, as PHP does for its persistent ODBC links (`odbc.check_persistent`, on by default). A pool inside the application, such as SQLAlchemy's, keeps its connections open, so the driver manager never checks them: set that pool's recycle age to 55 minutes or less, for example `pool_recycle=3300`.
+> [!WARNING]\
+> Set it only for connections a driver manager's pool hands out, and not for applications built on nanodbc, which reads `SQL_ATTR_CONNECTION_DEAD` before each commit: on a connection that reports itself dead, the commit returns without committing and the connection stays in manual-commit mode, so its later changes are lost too. System.Data.Odbc (.NET) reads it after a failed call and closes the connection.
+
+Without `MAX_CONNECTION_LIFETIME`, or outside a driver manager's pool, nothing is retired: a statement on an older connection still runs until Aurora DSQL closes it. PHP persistent links (`odbc.check_persistent`, on by default) also read the attribute and reconnect. A pool inside the application, such as SQLAlchemy's, keeps its connections open, so the driver manager never checks them: set that pool's recycle age to 55 minutes or less, for example `pool_recycle=3300`.
 
 When `SQLExecDirect` or `SQLExecute` fails on a connection that is at least 55 minutes old, and psqlODBC reports the connection closed, the wrapper logs this at WARNING level, once per connection:
 

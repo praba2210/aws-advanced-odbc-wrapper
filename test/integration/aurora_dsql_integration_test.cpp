@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Integration tests against a live Aurora DSQL cluster. Every case skips unless TEST_DSQL_ENDPOINT is set; the slow
-// ones also need TEST_DSQL_SLOW=1. Each case that needs a table creates its own (drf_it_<pid>_<n>) and drops it.
+// ones also need TEST_DSQL_SLOW=1. Each case that needs a table creates its own (odbc_it_<pid>_<random>_<n>) and drops it.
 // See aurora_dsql_test_helper.h for the environment variables.
 
 #include <gtest/gtest.h>
@@ -157,7 +157,7 @@ TEST_F(AuroraDsqlIntegrationTest, ConnectClusterId_ExpandsWithTheRegion) {
 
     // CI exports a region, so remove every source of one the wrapper reads.
     const std::string empty_config = (std::filesystem::temp_directory_path() /
-        ("drf_it_empty_aws_config_" + std::to_string(dsql_it::ProcessId()))).string();
+        ("odbc_it_empty_aws_config_" + std::to_string(dsql_it::ProcessId()))).string();
     std::ofstream(empty_config).close();
     {
         const dsql_it::ScopedEnv no_region("AWS_REGION", std::nullopt);

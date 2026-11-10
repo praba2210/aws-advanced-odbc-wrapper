@@ -29,9 +29,11 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -304,25 +306,38 @@ namespace dsql_it {
 #endif
     }
 
-    // A table with a unique name (drf_it_<pid>_<n>), created in autocommit on a connection of its own and dropped on
+    // A table with a unique name (odbc_it_<pid>_<random>_<n>), created in autocommit on a connection of its own and dropped on
     // another at the end, also when the test fails.
     class TempTable {
     public:
-        TempTable() : name_("drf_it_" + std::to_string(ProcessId()) + "_" + std::to_string(++counter_)) {
+        TempTable() : name_("odbc_it_" + std::to_string(ProcessId()) + "_" + RunToken() + "_" + std::to_string(++counter_)) {
             created_ = SQL_SUCCEEDED(ExecOnFreshConnection(
                 "CREATE TABLE " + name_ + " (id INT PRIMARY KEY, v INT, s TEXT)"));
         }
         TempTable(const TempTable&) = delete;
         TempTable& operator=(const TempTable&) = delete;
         ~TempTable() {
-            // The drop is tried even when the create reported a failure: it may have committed.
-            ExecOnFreshConnection("DROP TABLE IF EXISTS " + name_);
+            // Only a table this object created: the name is unique to this process, so no other run's table is hit.
+            if (created_) {
+                ExecOnFreshConnection("DROP TABLE IF EXISTS " + name_);
+            }
         }
 
         [[nodiscard]] bool Ok() const { return created_; }
         [[nodiscard]] const std::string& Name() const { return name_; }
 
     private:
+        // 8 hex characters chosen once per process: a container's pids repeat from run to run.
+        static const std::string& RunToken() {
+            static const std::string token = [] {
+                std::random_device device;
+                char buffer[9];
+                std::snprintf(buffer, sizeof(buffer), "%08x", static_cast<unsigned int>(device()));
+                return std::string(buffer);
+            }();
+            return token;
+        }
+
         static inline std::atomic<int> counter_ = 0;
         std::string name_;
         bool created_ = false;

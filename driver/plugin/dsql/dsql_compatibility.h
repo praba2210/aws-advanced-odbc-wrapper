@@ -23,13 +23,15 @@
 #include <optional>
 #include <string>
 
+#include "../../util/dsql_connection_lifetime.h"
+
 struct DBC;
 struct STMT;
 
-// What the wrapper changes so that psqlODBC works on Aurora DSQL. Everything here applies only to connections
-// DsqlConnectionValidator::IsDsqlTarget calls Aurora DSQL.
+// What the wrapper changes so that psqlODBC works on Aurora DSQL. Everything here applies only to connects
+// RDS_InitializeConnection decided are Aurora DSQL (DBC::is_dsql).
 namespace DsqlCompatibility {
-    // True when the connection targets Aurora DSQL. False before the first connect, when conn_attr is still empty.
+    // True when this connect targets Aurora DSQL (dbc->is_dsql). False before the first connect.
     bool IsDsql(const DBC* dbc);
 
     // Sets the psqlODBC options Aurora DSQL needs in the upper-cased connection attributes. A value the user set is
@@ -37,18 +39,22 @@ namespace DsqlCompatibility {
     void ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr);
 
     // Called by DefaultPlugin::Connect before it builds the base driver's connection string: sets the forced options
-    // and drops psqlODBC attributes set before connect that would undo them. Does nothing unless the connection
-    // targets Aurora DSQL.
-    void PrepareConnect(DBC* dbc);
+    // and drops psqlODBC attributes set before connect that would undo them. Clears the connection's age and returns
+    // the moment the connect begins, for ConnectSucceeded. Does nothing and returns std::nullopt unless the connect
+    // targets Aurora DSQL; std::nullopt too without a lifetime.
+    std::optional<DsqlConnectionLifetime::Instant> PrepareConnect(DBC* dbc);
+
+    // Called by DefaultPlugin::Connect once the base driver has connected: starts the connection's age from the
+    // moment PrepareConnect returned, with its MAX_CONNECTION_LIFETIME. Does nothing without that moment.
+    void ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at);
 
     // SQLSetConnectAttr on an Aurora DSQL connection, for the attributes that would undo a forced psqlODBC option or
     // make psqlODBC send a statement Aurora DSQL rejects: the result to return without calling psqlODBC, or nullopt to
     // call it as usual.
     std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
 
-    // SQLSetStmtAttr on an Aurora DSQL connection whose first connect built the Aurora DSQL chain (dbc->dsql_lifetime
-    // is set): a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without calling psqlODBC. nullopt for anything
-    // else.
+    // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without
+    // calling psqlODBC. nullopt for anything else.
     std::optional<SQLRETURN> TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value);
 
     // SQLGetConnectAttr(SQL_ATTR_TXN_ISOLATION) on an Aurora DSQL connection whose wrapped handle is allocated: writes

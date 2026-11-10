@@ -22,7 +22,6 @@
 #include <utility>
 
 #include "../../util/dsql_connection_lifetime.h"
-#include "../../util/dsql_connection_validator.h"
 #include "../../util/logger_wrapper.h"
 #include "../../util/odbc_helper.h"
 #include "../../util/plugin_service.h"
@@ -56,10 +55,6 @@ DsqlErrorHintPlugin::DsqlErrorHintPlugin(DBC* dbc, std::shared_ptr<BasePlugin> n
     : BasePlugin(dbc, std::move(next_plugin))
 {
     this->plugin_name_ = "DSQL_ERROR_HINT";
-    // The connection's age, which SQLGetConnectAttr(SQL_ATTR_CONNECTION_DEAD) reads too. A lifetime a test set is kept.
-    if (dbc != nullptr && dbc->dsql_lifetime == nullptr) {
-        dbc->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
-    }
 }
 
 SQLRETURN DsqlErrorHintPlugin::Connect(
@@ -70,26 +65,10 @@ SQLRETURN DsqlErrorHintPlugin::Connect(
     SQLSMALLINT *  StringLengthPtr,
     SQLUSMALLINT   DriverCompletion)
 {
-    const DBC* dbc = static_cast<DBC*>(ConnectionHandle);
-    // A new connection, or none: it can get the hint once.
+    // A new connection, or none: it can get the hint once. DefaultPlugin starts its age.
     age_hint_logged_ = false;
-    if (dbc == nullptr || dbc->dsql_lifetime == nullptr) {
-        return ConnectNext(
-            ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
-    }
-    const std::shared_ptr<DsqlConnectionLifetime> lifetime = dbc->dsql_lifetime;
-    // Its age counts from before the connect, so it is never less than the server's.
-    const std::chrono::steady_clock::time_point started_at = lifetime->Now();
-    lifetime->Clear();
-    const SQLRETURN ret = ConnectNext(
+    return ConnectNext(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
-    if (SQL_SUCCEEDED(ret)) {
-        // RDS_InitializeConnection has checked the value, which is read again on every connect.
-        std::string unused_error;
-        lifetime->Start(started_at, DsqlConnectionLifetime::ParseMaxLifetime(dbc->conn_attr, unused_error)
-                                        .value_or(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME));
-    }
-    return ret;
 }
 
 SQLRETURN DsqlErrorHintPlugin::Execute(
@@ -118,7 +97,7 @@ SQLRETURN DsqlErrorHintPlugin::Execute(
 
 std::shared_ptr<BasePlugin> DsqlErrorHintPlugin::AddToChain(DBC* dbc, std::shared_ptr<BasePlugin> plugin_head)
 {
-    if (!DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr)) {
+    if (!dbc->is_dsql) {
         return plugin_head;
     }
     return std::make_shared<DsqlErrorHintPlugin>(dbc, std::move(plugin_head));

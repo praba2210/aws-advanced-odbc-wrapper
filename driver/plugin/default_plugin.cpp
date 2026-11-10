@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include "../driver.h"
@@ -88,8 +89,9 @@ SQLRETURN DefaultPlugin::Connect(
         }
     }
 
-    // Keep psqlODBC from doing what Aurora DSQL can't handle. Does nothing on other connections.
-    DsqlCompatibility::PrepareConnect(dbc);
+    // Keep psqlODBC from doing what Aurora DSQL can't handle, and clear the connection's age, which counts from here.
+    // Does nothing on other connections.
+    const std::optional<DsqlConnectionLifetime::Instant> dsql_started = DsqlCompatibility::PrepareConnect(dbc);
 
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
@@ -208,6 +210,7 @@ SQLRETURN DefaultPlugin::Connect(
     // Successful Connection, but bad environment and/or connection attribute setting
     if (SQL_SUCCEEDED(ret)) {
         dbc->conn_status = CONN_CONNECTED;
+        DsqlCompatibility::ConnectSucceeded(dbc, dsql_started);
         if (has_conn_attr_errors) {
             ret = SQL_SUCCESS_WITH_INFO;
         }

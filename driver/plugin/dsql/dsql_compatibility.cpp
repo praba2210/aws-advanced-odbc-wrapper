@@ -27,7 +27,7 @@
 
 #include "../../driver.h"
 #include "../../error.h"
-#include "../../util/dsql_connection_validator.h"
+#include "../../util/dsql_connection_lifetime.h"
 #include "../../util/logger_wrapper.h"
 
 namespace {
@@ -222,7 +222,7 @@ namespace {
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
 {
-    return dbc != nullptr && DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr);
+    return dbc != nullptr && dbc->is_dsql;
 }
 
 void DsqlCompatibility::ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr)
@@ -232,10 +232,10 @@ void DsqlCompatibility::ApplyBaseDriverOptions(std::map<std::string, std::string
     }
 }
 
-void DsqlCompatibility::PrepareConnect(DBC* dbc)
+std::optional<DsqlConnectionLifetime::Instant> DsqlCompatibility::PrepareConnect(DBC* dbc)
 {
     if (!IsDsql(dbc)) {
-        return;
+        return std::nullopt;
     }
     ApplyBaseDriverOptions(dbc->conn_attr);
 
@@ -260,6 +260,26 @@ void DsqlCompatibility::PrepareConnect(DBC* dbc)
             dbc->attr_map.erase(it);
         }
     }
+
+    // The age counts from before the base connect, so it is never less than the server's; a failed connect leaves
+    // none.
+    const std::shared_ptr<DsqlConnectionLifetime> lifetime = dbc->dsql_lifetime;
+    if (lifetime == nullptr) {
+        return std::nullopt;
+    }
+    lifetime->Clear();
+    return lifetime->Now();
+}
+
+void DsqlCompatibility::ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at)
+{
+    if (dbc == nullptr || !started_at.has_value() || dbc->dsql_lifetime == nullptr) {
+        return;
+    }
+    // RDS_InitializeConnection has checked the value, which is read again on every connect.
+    std::string unused_error;
+    dbc->dsql_lifetime->Start(started_at.value(), DsqlConnectionLifetime::ParseMaxLifetime(dbc->conn_attr, unused_error)
+                                                      .value_or(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME));
 }
 
 std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value)
@@ -296,10 +316,7 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetStmtAttr(STMT* stmt, SQLINTEGE
     if (attribute != SQL_ATTR_QUERY_TIMEOUT || timeout == 0) {
         return std::nullopt;
     }
-    // The caller holds only the statement's lock, and failover rewrites SERVER and PORT in conn_attr from another
-    // thread's statement. Only a connection whose first connect built the Aurora DSQL chain has a lifetime, set once
-    // then, and that chain never has failover; on any other connection conn_attr isn't read.
-    if (const DBC* dbc = stmt->dbc; dbc == nullptr || dbc->dsql_lifetime == nullptr || !IsDsql(dbc)) {
+    if (!IsDsql(stmt->dbc)) {
         return std::nullopt;
     }
     return QueryTimeoutChanged(stmt->err, timeout);

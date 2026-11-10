@@ -145,12 +145,54 @@ TEST(DsqlConnectionLifetimeTest, Age_CountsFromTheConnectUntilCleared) {
     EXPECT_FALSE(lifetime.Age().has_value());
 }
 
-TEST(DsqlConnectionLifetimeTest, DefaultClock_IsTheSteadyClock) {
+TEST(DsqlConnectionLifetimeTest, DefaultClocks_AreSteadyAndSystem) {
     const DsqlConnectionLifetime lifetime;
-    const std::chrono::steady_clock::time_point before = std::chrono::steady_clock::now();
-    const std::chrono::steady_clock::time_point now = lifetime.Now();
-    EXPECT_LE(before, now);
-    EXPECT_LE(now, std::chrono::steady_clock::now());
+    const std::chrono::steady_clock::time_point steady_before = std::chrono::steady_clock::now();
+    const std::chrono::system_clock::time_point system_before = std::chrono::system_clock::now();
+    const DsqlConnectionLifetime::Instant now = lifetime.Now();
+    EXPECT_LE(steady_before, now.steady);
+    EXPECT_LE(now.steady, std::chrono::steady_clock::now());
+    ASSERT_TRUE(now.system.has_value());
+    EXPECT_LE(system_before, now.system.value());
+    EXPECT_LE(now.system.value(), std::chrono::system_clock::now());
+}
+
+// The machine slept for an hour: the steady clock stopped, the system clock didn't.
+TEST(DsqlConnectionLifetimeTest, Age_IsTheLargerOfTheSteadyAndSystemAges) {
+    std::chrono::steady_clock::time_point steady{};
+    std::chrono::system_clock::time_point system{};
+    DsqlConnectionLifetime lifetime([&steady] { return steady; }, [&system] { return system; });
+    lifetime.Start(lifetime.Now(), DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    steady += std::chrono::minutes(10);
+    system += std::chrono::minutes(70);
+    const std::optional<std::chrono::steady_clock::duration> age = lifetime.Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(70, std::chrono::duration_cast<std::chrono::minutes>(age.value()).count());
+}
+
+// The system time was set back two hours: the connection doesn't get younger.
+TEST(DsqlConnectionLifetimeTest, Age_SystemTimeSetBack_CountsTheSteadyAge) {
+    std::chrono::steady_clock::time_point steady{};
+    std::chrono::system_clock::time_point system{};
+    DsqlConnectionLifetime lifetime([&steady] { return steady; }, [&system] { return system; });
+    lifetime.Start(lifetime.Now(), DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    steady += std::chrono::minutes(10);
+    system -= std::chrono::hours(2);
+    const std::optional<std::chrono::steady_clock::duration> age = lifetime.Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(10, std::chrono::duration_cast<std::chrono::minutes>(age.value()).count());
+}
+
+// A test that passes only a steady clock: no system time is read, even for a start that has one.
+TEST(DsqlConnectionLifetimeTest, SteadyClockOnly_CountsNoSystemAge) {
+    std::chrono::steady_clock::time_point steady{};
+    DsqlConnectionLifetime lifetime([&steady] { return steady; });
+    EXPECT_FALSE(lifetime.Now().system.has_value());
+    lifetime.Start({steady, std::chrono::system_clock::time_point{}}, DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    steady += std::chrono::minutes(10);
+    const std::optional<std::chrono::steady_clock::duration> age = lifetime.Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(10, std::chrono::duration_cast<std::chrono::minutes>(age.value()).count());
 }
 
 TEST(DsqlConnectionLifetimeTest, CheckSettings_RejectsALifetimeOffAuroraDsql) {
@@ -266,6 +308,8 @@ protected:
     ENV env_;
     DBC dbc_{};
     std::chrono::steady_clock::time_point now_{};
+    // Read only by a lifetime a test gives both clocks.
+    std::chrono::system_clock::time_point system_now_{};
 
     void SetUp() override {
         env_.driver_lib_loader = base_driver_;
@@ -281,10 +325,12 @@ protected:
         dbc_.dsql_lifetime = nullptr;
     }
 
-    // An open connection to this server whose connect began now, with this MAX_CONNECTION_LIFETIME.
+    // An open connection to this server whose connect began now, with this MAX_CONNECTION_LIFETIME. is_dsql as
+    // RDS_InitializeConnection decides it.
     void Connect(const std::string& server,
                  std::chrono::seconds max_lifetime = DsqlConnectionLifetime::LARGEST_MAX_LIFETIME) {
         dbc_.conn_attr = {{KEY_SERVER, server}};
+        dbc_.is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_.conn_attr);
         // Unicode builds reach the OdbcHelper through the plugin service when the call goes to the base driver.
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
         dbc_.wrapped_dbc = static_cast<SQLHDBC>(&dbc_);
@@ -357,6 +403,19 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_OverTheLifetime_IsTrueAndL
                            + "): SQL_ATTR_CONNECTION_DEAD now reports it dead, so a connection pool replaces it."));
 }
 
+// Three hours old, two and a half of them asleep: the steady clock counted 30 minutes, Aurora DSQL all three hours.
+TEST_F(DsqlConnectionLifetimeAttrTest, IsRetired_AfterASuspend_CountsTheSystemTime) {
+    Connect(DSQL_HOST);
+    dbc_.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; },
+                                                                  [this] { return system_now_; });
+    dbc_.dsql_lifetime->Start(dbc_.dsql_lifetime->Now(), DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    now_ += std::chrono::minutes(30);
+    system_now_ += std::chrono::hours(3);
+    CapturingLogSink sink;
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc_));
+    EXPECT_EQ(1, sink.Count(RETIRED_LINE + "10800 seconds"));
+}
+
 // ODBC 2 applications, and unixODBC when SQLGetConnectAttr fails, ask through SQLGetConnectOption.
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_Odbc2GetConnectOption_IsTrue) {
     Connect(DSQL_HOST);
@@ -400,7 +459,7 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_LifetimeOff_AsksTheBaseDri
     EXPECT_EQ(1, base_get_connect_attr_calls);
 }
 
-// A handle whose chain came from an Aurora DSQL connect, reconnected to another database, isn't retired.
+// A handle whose earlier connect was Aurora DSQL keeps its lifetime; reconnected to another database, it isn't retired.
 TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_OtherDatabase_AsksTheBaseDriver) {
     Connect(AURORA_HOST);
     now_ += std::chrono::hours(2);
@@ -421,7 +480,7 @@ TEST_F(DsqlConnectionLifetimeAttrTest, ConnectionDead_NoOpenConnection_AsksTheBa
     dbc_.conn_status = CONN_CONNECTED;
     dbc_.dsql_lifetime->Clear();
     RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, 0, nullptr);
-    // No lifetime: the chain has no Aurora DSQL error hint plugin.
+    // No lifetime: no connect on the handle was Aurora DSQL.
     dbc_.dsql_lifetime = nullptr;
     RDS_SQLGetConnectAttr(&dbc_, SQL_ATTR_CONNECTION_DEAD, &dead, 0, nullptr);
     EXPECT_EQ(3, base_get_connect_attr_calls);
@@ -455,6 +514,7 @@ protected:
     ENV* env_ = nullptr;
     DBC* dbc_ = nullptr;
     int base_env_stand_in_ = 0;
+    int base_dbc_stand_in_ = 0;
 
     void SetUp() override {
         env_ = new ENV();
@@ -466,10 +526,74 @@ protected:
     }
 
     void TearDown() override {
+        dbc_->wrapped_dbc = SQL_NULL_HDBC;
         delete dbc_;
         delete env_;
     }
+
+    // A connect to the server on the handle, after a disconnect: RDS_InitializeConnection, then an open connection.
+    // The chain stays from the handle's first connect.
+    void ConnectTo(const std::string& server) {
+        dbc_->conn_status = CONN_NOT_CONNECTED;
+        dbc_->conn_attr = {{KEY_BASE_DRIVER, FAKE_DRIVER_PATH}, {KEY_SERVER, server}};
+        ASSERT_EQ(SQL_SUCCESS, RDS_InitializeConnection(dbc_, ""));
+        dbc_->wrapped_dbc = static_cast<SQLHDBC>(&base_dbc_stand_in_);
+        dbc_->conn_status = CONN_CONNECTED;
+    }
+
+    // What a base connect an hour ago left, with the largest MAX_CONNECTION_LIFETIME: a retired connection.
+    void StartedAnHourAgo() {
+        dbc_->dsql_lifetime->Start(std::chrono::steady_clock::now() - std::chrono::hours(1),
+                                   DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    }
 };
+
+TEST_F(DsqlConnectionLifetimeChainTest, InitializeConnection_DecidesIsDsqlOnEachConnect) {
+    ASSERT_NO_FATAL_FAILURE(ConnectTo(DSQL_HOST));
+    EXPECT_TRUE(dbc_->is_dsql);
+    ASSERT_TRUE(dbc_->dsql_lifetime != nullptr);
+    StartedAnHourAgo();
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+    const BasePlugin* chain = dbc_->plugin_head;
+
+    ASSERT_NO_FATAL_FAILURE(ConnectTo("localhost"));
+    EXPECT_EQ(chain, dbc_->plugin_head);
+    EXPECT_FALSE(dbc_->is_dsql);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+}
+
+// The first connect's chain has no Aurora DSQL plugin, but the Aurora DSQL connect still gets an age.
+TEST_F(DsqlConnectionLifetimeChainTest, InitializeConnection_OtherThenDsql_GetsALifetime) {
+    ASSERT_NO_FATAL_FAILURE(ConnectTo("localhost"));
+    EXPECT_FALSE(dbc_->is_dsql);
+    EXPECT_TRUE(dbc_->dsql_lifetime == nullptr);
+    const BasePlugin* chain = dbc_->plugin_head;
+
+    ASSERT_NO_FATAL_FAILURE(ConnectTo(DSQL_HOST));
+    EXPECT_EQ(chain, dbc_->plugin_head);
+    EXPECT_TRUE(dbc_->is_dsql);
+    ASSERT_TRUE(dbc_->dsql_lifetime != nullptr);
+    EXPECT_FALSE(dbc_->dsql_lifetime->Age().has_value());
+}
+
+// The lifetime stays with the handle; only the connects that are Aurora DSQL are retired by it.
+TEST_F(DsqlConnectionLifetimeChainTest, InitializeConnection_DsqlThenOtherThenDsql_FollowsEachConnect) {
+    ASSERT_NO_FATAL_FAILURE(ConnectTo(DSQL_HOST));
+    EXPECT_TRUE(dbc_->is_dsql);
+    ASSERT_TRUE(dbc_->dsql_lifetime != nullptr);
+    const DsqlConnectionLifetime* lifetime = dbc_->dsql_lifetime.get();
+    StartedAnHourAgo();
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+
+    ASSERT_NO_FATAL_FAILURE(ConnectTo("localhost"));
+    EXPECT_FALSE(dbc_->is_dsql);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
+
+    ASSERT_NO_FATAL_FAILURE(ConnectTo(DSQL_HOST));
+    EXPECT_TRUE(dbc_->is_dsql);
+    EXPECT_EQ(lifetime, dbc_->dsql_lifetime.get());
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+}
 
 TEST_F(DsqlConnectionLifetimeChainTest, AuroraDsqlChain_HasALifetimeWithNoAgeBeforeTheConnect) {
     dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);

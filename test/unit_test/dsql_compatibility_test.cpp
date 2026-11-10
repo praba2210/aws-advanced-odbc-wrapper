@@ -33,7 +33,7 @@
 #include "../../driver/plugin/dsql/dsql_compatibility.h"
 #include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
-#include "../../driver/util/dsql_connection_lifetime.h"
+#include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/odbc_helper.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
@@ -41,8 +41,6 @@
 namespace {
     const std::string DSQL_HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
     const std::string AURORA_HOST = "database-test-name.cluster-XYZ.us-east-2.rds.amazonaws.com";
-    // Behind a PrivateLink endpoint without private DNS, SERVER is the endpoint's address.
-    const std::string PRIVATELINK_ADDRESS = "10.0.0.5";
     const std::string PSQLODBC_PATH = "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so";
 
     // The connection string the last SQLDriverConnect got, as ASCII.
@@ -138,20 +136,18 @@ protected:
         dbc_.plugin_service = nullptr;
     }
 
-    // The attributes RDS_InitializeConnection leaves for this server, and the plugin service it builds.
+    // The attributes RDS_InitializeConnection leaves for this server, its answer to whether the connect is Aurora DSQL,
+    // and the plugin service it builds.
     void UseServer(const std::string& server) {
         dbc_.conn_attr = {{KEY_SERVER, server}, {KEY_DRIVER, PSQLODBC_PATH}};
+        dbc_.is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_.conn_attr);
         dbc_.plugin_service = std::make_shared<PluginService>(base_driver_, &env_, dbc_.conn_attr, "");
     }
 
-    // Any non-null handles, so the wrapper treats the connection and the statement as open. On Aurora DSQL, the
-    // connection's lifetime too, which the first connect's chain build creates.
+    // Any non-null handles, so the wrapper treats the connection and the statement as open.
     void Connect() {
         dbc_.wrapped_dbc = static_cast<SQLHDBC>(&dbc_);
         OdbcHelper::SetWrappedStmt(&stmt_, static_cast<SQLHSTMT>(&stmt_));
-        if (DsqlCompatibility::IsDsql(&dbc_)) {
-            dbc_.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
-        }
     }
 };
 
@@ -198,24 +194,16 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_LogOnlyChangedValues) {
     EXPECT_EQ(0, log.Count("[DSQL] Overriding UseServerSidePrepare=0"));
 }
 
-TEST_F(DsqlCompatibilityTest, IsDsql_FollowsIsDsqlTarget) {
+// RDS_InitializeConnection's answer for the connect (DsqlConnectionValidator::IsDsqlTarget, tested there); conn_attr
+// isn't read again.
+TEST_F(DsqlCompatibilityTest, IsDsql_ReadsTheConnectsAnswer) {
     EXPECT_FALSE(DsqlCompatibility::IsDsql(nullptr));
-    EXPECT_FALSE(DsqlCompatibility::IsDsql(&dbc_));  // before the first connect: no attributes yet
-    dbc_.conn_attr = {{KEY_SERVER, AURORA_HOST}};
-    EXPECT_FALSE(DsqlCompatibility::IsDsql(&dbc_));
+    EXPECT_FALSE(DsqlCompatibility::IsDsql(&dbc_));  // before the first connect
     dbc_.conn_attr = {{KEY_SERVER, DSQL_HOST}};
-    EXPECT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
-    // An explicit non-DSQL dialect doesn't turn the options off: the server still rejects what they avoid.
-    dbc_.conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_POSTGRESQL}};
-    EXPECT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
-    dbc_.conn_attr = {{KEY_SERVER, PRIVATELINK_ADDRESS}, {KEY_AUTH_TYPE, VALUE_AUTH_DSQL}};
-    EXPECT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
-    dbc_.conn_attr = {{KEY_SERVER, PRIVATELINK_ADDRESS}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}};
-    EXPECT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
-    // DATABASE auth behind PrivateLink without a dialect: nothing says DSQL, so such connections must set
-    // DATABASE_DIALECT=AURORA_DSQL.
-    dbc_.conn_attr = {{KEY_SERVER, PRIVATELINK_ADDRESS}, {KEY_IAM_HOST, DSQL_HOST}};
     EXPECT_FALSE(DsqlCompatibility::IsDsql(&dbc_));
+    dbc_.is_dsql = true;
+    dbc_.conn_attr = {{KEY_SERVER, AURORA_HOST}};
+    EXPECT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
 }
 
 TEST_F(DsqlCompatibilityTest, PrepareConnect_Dsql_TurnsServerSidePrepareOff) {
@@ -348,7 +336,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherDatabase_KeepsPgoptAttributes)
     EXPECT_TRUE(dbc_.attr_map.contains(PGOPT_SERVER_SIDE_PREPARE));
 }
 
-// Between SQLDisconnect and the next connect conn_attr still describes the Aurora DSQL connection, so the value is
+// Between SQLDisconnect and the next connect the handle answers as its last connect, Aurora DSQL, so the value is
 // answered as on an open connection and never reaches attr_map, which the next connect would set again.
 TEST_F(DsqlCompatibilityTest, SetPgoptServerSidePrepare_DsqlHandleBetweenConnects_IsNotKept) {
     UseServer(DSQL_HOST);
@@ -470,25 +458,22 @@ TEST_F(DsqlCompatibilityTest, SetQueryTimeout_OtherDatabase_ReachesBaseDriver) {
 }
 
 // SQLSetStmtAttr holds only the statement's lock, and failover rewrites SERVER in conn_attr from another thread's
-// statement. Only an Aurora DSQL chain, which never has failover, gives the connection a lifetime; without one the
-// hook doesn't read conn_attr, even when it names an Aurora DSQL endpoint.
-TEST_F(DsqlCompatibilityTest, SetQueryTimeout_NoDsqlLifetime_ReachesBaseDriver) {
+// statement. The hook reads the connect's answer, not conn_attr, even when conn_attr now names an Aurora DSQL endpoint.
+TEST_F(DsqlCompatibilityTest, SetQueryTimeout_ConnAttrRewrittenAfterConnect_KeepsTheConnectsAnswer) {
     UseServer(AURORA_HOST);
     Connect();
-    ASSERT_TRUE(dbc_.dsql_lifetime == nullptr);
     dbc_.conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
-    ASSERT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
+    EXPECT_FALSE(DsqlCompatibility::IsDsql(&dbc_));
     EXPECT_NE(SQL_SUCCESS_WITH_INFO, RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0));
     EXPECT_TRUE(base_driver_->Requested(RdsFuncNames::SetStmtAttr));
     EXPECT_TRUE(stmt_.attr_map.contains(SQL_ATTR_QUERY_TIMEOUT));
 }
 
-// The lifetime stays with a handle whose first connect was Aurora DSQL; connected to another database, it still
-// forwards the timeout.
+// A handle whose first connect was Aurora DSQL, connected to another database, forwards the timeout.
 TEST_F(DsqlCompatibilityTest, SetQueryTimeout_DsqlHandleReusedForOtherDatabase_ReachesBaseDriver) {
     UseServer(DSQL_HOST);
     Connect();
-    ASSERT_TRUE(dbc_.dsql_lifetime != nullptr);
+    ASSERT_TRUE(DsqlCompatibility::IsDsql(&dbc_));
     UseServer(AURORA_HOST);
     RDS_SQLSetStmtAttr(&stmt_, SQL_ATTR_QUERY_TIMEOUT, AsPointer(30), 0);
     EXPECT_TRUE(base_driver_->Requested(RdsFuncNames::SetStmtAttr));

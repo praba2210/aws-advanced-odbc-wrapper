@@ -1384,6 +1384,8 @@ SQLRETURN RDS_SQLConnect(
     // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
     // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
     dbc->conn_attr.clear();
+    // No Aurora DSQL answers until RDS_InitializeConnection decides for this connect.
+    dbc->is_dsql = false;
 
 #ifdef UNICODE
     bool use_4_bytes_user_app = dbc->env->use_4_bytes_user_app.load();
@@ -1624,6 +1626,8 @@ SQLRETURN RDS_SQLDriverConnect(
     // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
     // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
     dbc->conn_attr.clear();
+    // No Aurora DSQL answers until RDS_InitializeConnection decides for this connect.
+    dbc->is_dsql = false;
 
     // Parse connection string, load input DSN followed by Base DSN
     ConnectionStringHelper::ParseConnectionString(conn_str_utf8, dbc->conn_attr);
@@ -3998,6 +4002,12 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
     // An Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint before anything reads the host.
     if (!DsqlAuthPlugin::ExpandClusterId(dbc)) {
         return SQL_ERROR;
+    }
+
+    // Decided once per connect, after the cluster ID is expanded: failover can rewrite conn_attr later.
+    dbc->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr);
+    if (dbc->is_dsql && dbc->dsql_lifetime == nullptr) {
+        dbc->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
     }
 
     const std::unordered_set<std::string> invalid_params = AttributeValidator::ValidateMap(dbc->conn_attr);

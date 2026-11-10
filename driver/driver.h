@@ -150,8 +150,12 @@ struct DBC {
     bool connect_through_unix_odbc = false;
     BasePlugin* plugin_head = nullptr;
     std::shared_ptr<PluginService> plugin_service;
-    // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD and the
-    // 60-minute hint read. The Aurora DSQL error hint plugin creates it; null on other connections.
+    // Whether this connect is Aurora DSQL, decided in RDS_InitializeConnection; every DSQL check after that reads it,
+    // not conn_attr. Atomic: SQLSetStmtAttr reads it holding only the statement's lock.
+    std::atomic<bool> is_dsql = false;
+    // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME: created by RDS_InitializeConnection for an
+    // Aurora DSQL connect, started by each successful base connect (DefaultPlugin), read by SQL_ATTR_CONNECTION_DEAD
+    // and the 60-minute hint.
     std::shared_ptr<DsqlConnectionLifetime> dsql_lifetime;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;

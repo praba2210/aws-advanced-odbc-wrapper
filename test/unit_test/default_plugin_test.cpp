@@ -13,10 +13,13 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +34,8 @@
 #include "../../driver/plugin/base_plugin.h"
 #include "../../driver/plugin/default_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_connection_lifetime.h"
+#include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
 #include "../../driver/util/rds_strings.h"
@@ -69,6 +74,10 @@ namespace {
     int connect_calls = 0;
     // The first SQLDriverConnect fails, as with a base driver built with a 4-byte SQLWCHAR that got 2-byte text.
     bool fail_first_connect = false;
+    // Every SQLDriverConnect fails.
+    bool fail_connects = false;
+    // Runs inside each SQLDriverConnect, for example to move a clock while the connect takes time.
+    std::function<void()> during_connect;
     // The base driver is psqlODBC's Unicode driver, whose SQLDriverConnectW converts through a buffer of its own.
     bool unicode_base_driver = false;
     // The base driver is psqlODBC 17.00.0005 or later, which builds only what fits the buffer length (790a1f0).
@@ -91,7 +100,10 @@ namespace {
                                 SQLSMALLINT buffer_length, SQLSMALLINT* string_length_2_ptr,
                                 SQLUSMALLINT /*driver_completion*/) {
         ++connect_calls;
-        if (fail_first_connect && connect_calls == 1) {
+        if (during_connect) {
+            during_connect();
+        }
+        if (fail_connects || (fail_first_connect && connect_calls == 1)) {
             return SQL_ERROR;
         }
         std::string text;
@@ -274,6 +286,8 @@ protected:
         base_call = {};
         connect_calls = 0;
         fail_first_connect = false;
+        fail_connects = false;
+        during_connect = nullptr;
         unicode_base_driver = false;
         cuts_to_buffer_length = false;
     }
@@ -285,6 +299,7 @@ protected:
             dbc->wrapped_dbc = SQL_NULL_HDBC;
         }
         env_.wrapped_env = SQL_NULL_HENV;
+        during_connect = nullptr;
     }
 
     // A handle with the plugin service and the chain (TokenPlugin, then DefaultPlugin) an earlier connect to the
@@ -593,4 +608,106 @@ TEST_F(DefaultPluginOutputTest, Connect_ReusedHandle_StartsFromItsArguments) {
     EXPECT_FALSE(dbc.conn_attr.contains(KEY_BASE_DRIVER));
     EXPECT_EQ("second_user", dbc.conn_attr.at(KEY_DB_USERNAME));
     EXPECT_EQ("second_password", dbc.conn_attr.at(KEY_DB_PASSWORD));
+}
+
+// DefaultPlugin, which every connect reaches, starts an Aurora DSQL connection's age on each successful base connect;
+// SQL_ATTR_CONNECTION_DEAD and the 60-minute hint read it.
+class DefaultPluginDsqlLifetimeTest : public DefaultPluginOutputTest {
+protected:
+    // The clock of the connection's lifetime.
+    std::chrono::steady_clock::time_point now_{};
+
+    // A handle as RDS_InitializeConnection leaves it for these attributes: is_dsql decided and, for Aurora DSQL, a
+    // lifetime on the test's clock.
+    DBC& NewConnection(const std::map<std::string, std::string>& conn_attr) {
+        DBC& dbc = NewHandle(conn_attr.at(KEY_SERVER));
+        dbc.conn_attr = conn_attr;
+        dbc.is_dsql = DsqlConnectionValidator::IsDsqlTarget(conn_attr);
+        if (dbc.is_dsql) {
+            dbc.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
+        }
+        return dbc;
+    }
+
+    // The chain's Connect, as RDS_SQLDriverConnect calls it.
+    static SQLRETURN Connect(DBC& dbc) {
+        return dbc.plugin_head->Connect(&dbc, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+    }
+};
+
+// The age counts from before the base connect, so it is never less than the server's; a failed connect leaves none.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_StartsTheAgeBeforeTheConnectAndClearsItOnFailure) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    during_connect = [this] { now_ += std::chrono::seconds(5); };
+
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    const std::optional<std::chrono::steady_clock::duration> age = dbc.dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(5, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+
+    fail_connects = true;
+    EXPECT_EQ(SQL_ERROR, Connect(dbc));
+    EXPECT_FALSE(dbc.dsql_lifetime->Age().has_value());
+}
+
+// Each connect starts the lifetime with the connection's MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD reads.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_StartsTheLifetimeWithMaxConnectionLifetime) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::seconds(1800) - std::chrono::milliseconds(1);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+    now_ += std::chrono::milliseconds(1);
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc));
+
+    // Read again on every connect: 0 turns retirement off.
+    dbc.conn_attr.insert_or_assign(KEY_MAX_CONNECTION_LIFETIME, "0");
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::hours(24);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+}
+
+// Without MAX_CONNECTION_LIFETIME a connection is never retired, though its age is kept for the 60-minute hint.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_LifetimeUnset_NeverRetires) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::hours(24);
+    ASSERT_TRUE(dbc.dsql_lifetime->Age().has_value());
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+}
+
+// A connect to another database creates no lifetime, and neither clears nor starts the one an earlier Aurora DSQL
+// connect on the handle left.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_OtherDatabase_LeavesTheLifetimeAlone) {
+    DBC& other = NewConnection({{KEY_SERVER, OTHER_HOST}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(other));
+    EXPECT_TRUE(other.dsql_lifetime == nullptr);
+
+    DBC& reused = NewConnection({{KEY_SERVER, OTHER_HOST}});
+    reused.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
+    reused.dsql_lifetime->Start(now_, DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    now_ += std::chrono::minutes(10);
+    during_connect = [this] { now_ += std::chrono::seconds(5); };
+    ASSERT_EQ(SQL_SUCCESS, Connect(reused));
+    const std::optional<std::chrono::steady_clock::duration> age = reused.dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(605, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+}
+
+// Each connect starts as no Aurora DSQL connect, until RDS_InitializeConnection decides: one that fails before then
+// gets no Aurora DSQL answers from the handle's last connect.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_FailingBeforeTheDecision_IsNotDsql) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    ASSERT_TRUE(dbc.is_dsql);
+    // A cluster ID with a region that can't be part of a host name: the expansion fails.
+    std::vector<SQLTCHAR> in = AppString("DRIVER={AWS Advanced ODBC Wrapper};BASE_DRIVER=" + BASE_DRIVER_PATH
+        + ";SERVER=abcdefghijklmnopqrstuvwxyz;RDS_AUTH_TYPE=DSQL;REGION=us_east_1");
+    EXPECT_EQ(SQL_ERROR, RDS_SQLDriverConnect(&dbc, nullptr, in.data(), SQL_NTS, nullptr, 0, nullptr,
+        SQL_DRIVER_NOPROMPT));
+    EXPECT_FALSE(dbc.is_dsql);
+
+    // SQLConnect without a DSN.
+    dbc.is_dsql = true;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(&dbc, nullptr, 0, nullptr, 0, nullptr, 0));
+    EXPECT_FALSE(dbc.is_dsql);
+    EXPECT_EQ(0, connect_calls);
 }

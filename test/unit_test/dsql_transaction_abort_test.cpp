@@ -153,7 +153,12 @@ namespace {
         return SQL_SUCCESS;
     }
 
-    // Answers the calls of the check before a commit, SQLEndTran, SQLParamData and SQLSetConnectAttr.
+    SQLRETURN FakeSetEnvAttr(SQLHENV /*environment*/, SQLINTEGER /*attribute*/, SQLPOINTER /*value*/,
+                             SQLINTEGER /*length*/) {
+        return SQL_SUCCESS;
+    }
+
+    // Answers the calls of the check before a commit, SQLEndTran, SQLParamData, SQLSetConnectAttr and SQLSetEnvAttr.
     class FakeBaseDriver : public RdsLibLoader {
     public:
         RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
@@ -165,6 +170,7 @@ namespace {
                 {RdsFuncNames::EndTran, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeEndTran)},
                 {RdsFuncNames::ParamData, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeParamData)},
                 {RdsFuncNames::SetConnectAttr, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeSetConnectAttr)},
+                {RdsFuncNames::SetEnvAttr, reinterpret_cast<RdsPlatform::FuncHandle>(&FakeSetEnvAttr)},
             };
             const auto it = functions.find(function_name);
             return it != functions.end() ? it->second : nullptr;
@@ -263,6 +269,15 @@ protected:
 
     SQLRETURN EndTran(SQLSMALLINT completion_type) {
         return RDS_SQLEndTran(SQL_HANDLE_DBC, &dbc_, completion_type);
+    }
+
+    // SQLGetDiagRec(SQL_HANDLE_ENV, 1)'s result.
+    SQLRETURN EnvRecord() {
+        SQLTCHAR state[MAX_SQL_STATE_LEN] = {0};
+        SQLTCHAR message[MAX_MSG_LEN] = {0};
+        SQLINTEGER native_error = 0;
+        SQLSMALLINT length = 0;
+        return RDS_SQLGetDiagRec(SQL_HANDLE_ENV, &env_, 1, state, &native_error, message, MAX_MSG_LEN, &length, false);
     }
 
     // The base SQLEndTran calls the connection got, in order.
@@ -407,6 +422,29 @@ TEST_F(DsqlTransactionAbortTest, EnvCommit_TheKept25S03_IsTheEnvironmentsRecord)
     EXPECT_EQ("25S03", AppText(state));
     EXPECT_EQ(ROLLED_BACK, AppText(message));
     EXPECT_EQ(static_cast<SQLSMALLINT>(ROLLED_BACK.size()), length);
+}
+
+// The environment's 25S03 is that call's record only: the next call on the environment clears it. A successful one
+// leaves no record (the base environment has none either).
+TEST_F(DsqlTransactionAbortTest, EnvCommit_TheNextEnvironmentCall_ClearsThe25S03) {
+    Abort(dbc_);
+    ASSERT_EQ(SQL_ERROR, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    ASSERT_EQ(SQL_SUCCESS, EnvRecord());
+    g_state.clear();
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetEnvAttr(&env_, SQL_ATTR_ODBC_VERSION, reinterpret_cast<SQLPOINTER>(SQL_OV_ODBC3),
+                                             0));
+    EXPECT_EQ(SQL_NO_DATA, EnvRecord());
+}
+
+TEST_F(DsqlTransactionAbortTest, EnvCommit_AConnectionAllocatedNext_ClearsThe25S03) {
+    Abort(dbc_);
+    ASSERT_EQ(SQL_ERROR, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    ASSERT_EQ(SQL_SUCCESS, EnvRecord());
+    g_state.clear();
+    SQLHDBC connection = SQL_NULL_HDBC;
+    ASSERT_EQ(SQL_SUCCESS, RDS_AllocDbc(&env_, &connection));
+    EXPECT_EQ(SQL_NO_DATA, EnvRecord());
+    EXPECT_EQ(SQL_SUCCESS, RDS_FreeConnect(connection));
 }
 
 // On any database: a connection's failed commit is the environment's result, although the base environment's own call

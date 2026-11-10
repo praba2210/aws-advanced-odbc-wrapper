@@ -61,12 +61,18 @@ namespace {
         return SQL_SUCCESS;
     }
 
+    // ASCII text in the base driver's characters, to its NUL.
+    std::string AsciiText(const SQLTCHAR* text) {
+        std::string ascii;
+        for (const SQLTCHAR* c = text; *c != 0; ++c) {
+            ascii.push_back(static_cast<char>(*c));
+        }
+        return ascii;
+    }
+
     SQLRETURN FakeDriverConnect(SQLHDBC, SQLHWND, SQLTCHAR* in_connection_string, SQLSMALLINT, SQLTCHAR*, SQLSMALLINT,
                                 SQLSMALLINT*, SQLUSMALLINT) {
-        captured_conn_str.clear();
-        for (const SQLTCHAR* c = in_connection_string; *c != 0; ++c) {
-            captured_conn_str.push_back(static_cast<char>(*c));
-        }
+        captured_conn_str = AsciiText(in_connection_string);
         // Most tests only need the string psqlODBC would get.
         return driver_connect_result;
     }
@@ -90,15 +96,6 @@ namespace {
 
     std::string ExecDirectCall(const std::string& text) {
         return "SQLExecDirect(" + text + ")";
-    }
-
-    // ASCII text in the base driver's characters, to its NUL.
-    std::string AsciiText(const SQLTCHAR* text) {
-        std::string ascii;
-        for (const SQLTCHAR* c = text; *c != 0; ++c) {
-            ascii.push_back(static_cast<char>(*c));
-        }
-        return ascii;
     }
 
     SQLRETURN FakeEndTran(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT completion_type) {
@@ -735,7 +732,8 @@ TEST_F(DsqlCompatibilityTest, BaseDriverOptions_BaseDriverStringHasOnlyLongKeysA
     std::map<std::string, std::string> conn_attr = {
         {"A1", "7.4-2"}, {"D9", "0"}, {"B6", "1"}, {"C8", "1"}, {"C4", "1"}, {"CX", "1c2305bab"}};
     DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
-    EXPECT_EQ("CX=1c2305bab;IGNORETIMEOUT=1;PROTOCOL=7.4-0;UPDATABLECURSORS=0;USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
+    EXPECT_EQ("CX=1c2305bab;IGNORETIMEOUT=1;PROTOCOL=7.4-0;UPDATABLECURSORS=0;"
+              "USEDECLAREFETCH=0;USESERVERSIDEPREPARE=0",
               ConnectionStringHelper::BuildMinimumConnectionString(conn_attr));
 }
 
@@ -1130,10 +1128,12 @@ TEST_F(DsqlCompatibilityTest, SetAutocommitOn_Dsql_AfterAFailedStatement_Returns
     dbc_.dsql_statement_failed_in_transaction = true;
     exec_direct_result = SQL_ERROR;
     base_sql_state = "25P02";
+    CapturingLogSink log;
     EXPECT_EQ(SQL_ERROR, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(SQL_AUTOCOMMIT_ON), 0));
     ASSERT_NE(nullptr, dbc_.err);
     EXPECT_EQ("25S03", dbc_.err->sqlstate);
     EXPECT_EQ(ROLLED_BACK, dbc_.err->error_msg);
+    EXPECT_EQ(1, log.Count("[DSQL] " + ROLLED_BACK + " (the check before the commit got 25P02)"));
     const std::vector<std::string> expected = {ExecDirectCall("SELECT 1"), EndTranCall(SQL_ROLLBACK)};
     EXPECT_EQ(expected, base_calls);
     EXPECT_FALSE(dbc_.auto_commit);
@@ -1195,9 +1195,12 @@ TEST_F(DsqlCompatibilityTest, SetAutocommitOn_OtherDatabase_DoesNotCommit) {
 }
 
 // Nothing is open to commit before a connect, nor between connects on a handle whose last connect was Aurora DSQL:
-// without a base connection the value waits in attr_map, and on one that isn't connected it is psqlODBC's.
+// without a base connection the value waits in attr_map, and on one that isn't connected it is psqlODBC's. Each part
+// has only that clause against the commit: the status says connected in the first, the base connection is there in
+// the second.
 TEST_F(DsqlCompatibilityTest, SetAutocommitOn_BeforeConnect_DoesNotCommit) {
     UseServer(DSQL_HOST);
+    dbc_.conn_status = CONN_CONNECTED;
     dbc_.auto_commit = false;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(SQL_AUTOCOMMIT_ON), 0));
     EXPECT_TRUE(base_calls.empty());
@@ -1205,6 +1208,7 @@ TEST_F(DsqlCompatibilityTest, SetAutocommitOn_BeforeConnect_DoesNotCommit) {
     EXPECT_TRUE(dbc_.auto_commit);
 
     dbc_.wrapped_dbc = static_cast<SQLHDBC>(&dbc_);
+    dbc_.conn_status = CONN_NOT_CONNECTED;
     dbc_.auto_commit = false;
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT, AsPointer(SQL_AUTOCOMMIT_ON), 0));
     EXPECT_EQ(std::vector<std::string>{SetConnectAttrCall(SQL_ATTR_AUTOCOMMIT, SQL_AUTOCOMMIT_ON)}, base_calls);

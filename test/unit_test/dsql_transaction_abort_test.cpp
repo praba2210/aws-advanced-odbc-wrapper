@@ -481,14 +481,25 @@ TEST_F(DsqlTransactionAbortTest, ParamData_ErrorWithAutocommitOff_SetsTheFlag) {
     EXPECT_TRUE(dbc_.dsql_statement_failed_in_transaction);
 }
 
-// Switching autocommit ends the transaction (psqlODBC commits it), so the note goes; setting the mode the connection
-// has changes nothing, and the note stays.
+// Switching autocommit ends the transaction, so the note goes; setting the mode the connection has changes nothing,
+// and the note stays. On an open connection the switch commits first through SQLEndTran, which ends the note (its
+// check finds the transaction still open here). Between connects (the base connection kept, not connected) nothing is
+// committed, and the setter ends the note itself, after the base call.
 TEST_F(DsqlTransactionAbortTest, SetAutocommit_ASwitchClearsTheFlag) {
-    dbc_.dsql_statement_failed_in_transaction = true;
-    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT,
-        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0));
-    EXPECT_TRUE(dbc_.dsql_statement_failed_in_transaction);
-    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT,
-        reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0));
-    EXPECT_FALSE(dbc_.dsql_statement_failed_in_transaction);
+    for (const CONN_STATUS status : {CONN_CONNECTED, CONN_NOT_CONNECTED}) {
+        SCOPED_TRACE(status == CONN_CONNECTED ? "connected" : "between connects");
+        dbc_.conn_status = status;
+        dbc_.auto_commit = false;
+        dbc_.dsql_statement_failed_in_transaction = true;
+        g_end_trans.clear();
+        EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT,
+            reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0));
+        EXPECT_TRUE(dbc_.dsql_statement_failed_in_transaction);
+        EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc_, SQL_ATTR_AUTOCOMMIT,
+            reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0));
+        EXPECT_FALSE(dbc_.dsql_statement_failed_in_transaction);
+        EXPECT_EQ(BaseEndTrans(status == CONN_CONNECTED ? std::vector<SQLSMALLINT>{SQL_COMMIT}
+                                                        : std::vector<SQLSMALLINT>{}),
+                  g_end_trans);
+    }
 }

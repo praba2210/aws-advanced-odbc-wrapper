@@ -80,9 +80,10 @@ namespace {
     // The base SQLEndTran, SQLSetConnectAttr and SQLExecDirect calls, in order, as EndTranCall, SetConnectAttrCall and
     // ExecDirectCall write them.
     std::vector<std::string> base_calls;
-    // What the base SQLEndTran and SQLExecDirect return.
+    // What the base SQLEndTran, SQLExecDirect and SQLSetConnectAttr return.
     SQLRETURN end_tran_result = SQL_SUCCESS;
     SQLRETURN exec_direct_result = SQL_SUCCESS;
+    SQLRETURN set_connect_attr_result = SQL_SUCCESS;
     // The SQLSTATE of the base driver's record 1 on any handle; none when empty.
     std::string base_sql_state;
 
@@ -106,7 +107,7 @@ namespace {
     SQLRETURN FakeSetConnectAttr(SQLHDBC /*connection*/, SQLINTEGER attribute, SQLPOINTER value,
                                  SQLINTEGER /*length*/) {
         base_calls.push_back(SetConnectAttrCall(attribute, static_cast<SQLULEN>(reinterpret_cast<uintptr_t>(value))));
-        return SQL_SUCCESS;
+        return set_connect_attr_result;
     }
 
     SQLRETURN FakeExecDirect(SQLHSTMT /*statement*/, SQLTCHAR* text, SQLINTEGER /*length*/) {
@@ -220,6 +221,7 @@ protected:
         base_calls.clear();
         end_tran_result = SQL_SUCCESS;
         exec_direct_result = SQL_SUCCESS;
+        set_connect_attr_result = SQL_SUCCESS;
         base_sql_state.clear();
     }
 
@@ -583,8 +585,9 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetUnsetSslMode_NoWarn
 TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDatabaseAuthUnsetSslMode_BaseDriverGetsExactTlsText) {
     UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}});
     env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    driver_connect_result = SQL_SUCCESS;
     DefaultPlugin plugin(&dbc_);
-    plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     const std::string padded = ";" + captured_conn_str + ";";
     EXPECT_NE(std::string::npos, padded.find(";SSLMODE=verify-full;")) << captured_conn_str;
     EXPECT_NE(std::string::npos, padded.find(";PQOPT=" + VERIFY_FULL_PQOPT + ";")) << captured_conn_str;
@@ -615,6 +618,23 @@ TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_RetryInTheSameConnect_KeepsTh
     EXPECT_EQ(SQL_SUCCESS, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_EQ(nullptr, dbc_.err);
     EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=require")) << captured_conn_str;
+}
+
+// A connection attribute set before connect that the base driver then rejects makes the connect SQL_SUCCESS_WITH_INFO
+// with no record of the wrapper's (only a log line), so the base driver's records stay readable: the SSLmode change
+// isn't reported over them.
+TEST_F(DsqlCompatibilityTest, DefaultPluginConnect_DsqlTargetDisable_AttributeErrorKeepsTheBaseDriversRecords) {
+    UseConnAttr({{KEY_SERVER, DSQL_HOST}, {KEY_AUTH_TYPE, VALUE_AUTH_DATABASE}, {"SSLMODE", "disable"}});
+    dbc_.attr_map[SQL_ATTR_ACCESS_MODE] = {AsPointer(SQL_MODE_READ_ONLY), 0};
+    env_.wrapped_env = static_cast<SQLHENV>(&env_);
+    driver_connect_result = SQL_SUCCESS;
+    set_connect_attr_result = SQL_ERROR;
+    DefaultPlugin plugin(&dbc_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(&dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(nullptr, dbc_.err);
+    EXPECT_NE(std::string::npos, captured_conn_str.find("SSLMODE=verify-full")) << captured_conn_str;
+    const std::string rejected = SetConnectAttrCall(SQL_ATTR_ACCESS_MODE, SQL_MODE_READ_ONLY);
+    EXPECT_NE(base_calls.end(), std::ranges::find(base_calls, rejected));
 }
 
 // The wrapper keeps one record per handle, and its record hides the base driver's: a connect that fails, or that the

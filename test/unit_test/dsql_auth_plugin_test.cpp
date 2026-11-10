@@ -174,7 +174,6 @@ TEST_F(DsqlAuthPluginTest, Connect_RegionFromDsqlHost) {
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
 }
 
-// The token is for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect.
 // The token is signed for the host the base driver connects to: SERVERNAME is folded into SERVER, not passed on.
 TEST_F(DsqlAuthPluginTest, Connect_ServernameOnly_SignsForTheHostItConnectsTo) {
     dbc_->conn_attr.erase(KEY_SERVER);
@@ -194,6 +193,7 @@ TEST_F(DsqlAuthPluginTest, Connect_ServernameOnly_SignsForTheHostItConnectsTo) {
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
 }
 
+// The token is for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect.
 TEST_F(DsqlAuthPluginTest, Connect_Dsql_ErasesThePasswordAfterTheConnect) {
     for (const SQLRETURN base_result : std::initializer_list<SQLRETURN>{SQL_SUCCESS, SQL_ERROR}) {
         dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
@@ -671,14 +671,26 @@ TEST_F(DsqlAuthPluginTest, ClusterId_ServernameOnly_IsExpanded) {
     EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
 }
 
-// Other auth types keep SERVERNAME as it is.
+// Other auth types keep SERVERNAME as it is, and two different hosts don't fail here: the gate is the auth type alone,
+// not whether the connect is Aurora DSQL (by its endpoint or its dialect), and no auth type is not DSQL either.
 TEST_F(DsqlAuthPluginTest, Defaults_OtherAuth_ServernameUntouched) {
-    for (const char* auth : {"IAM", "SECRETS_MANAGER", "DATABASE"}) {
-        std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, auth}, {"SERVERNAME", "h.example.com"}};
-        const auto before = conn_attr;
+    const std::string other_dsql_host = "zyxwvutsrqponmlkjihgfedcba.dsql.us-west-2.on.aws";
+    const std::vector<std::map<std::string, std::string>> cases = {
+        {{KEY_AUTH_TYPE, "IAM"}, {"SERVERNAME", "h.example.com"}},
+        {{KEY_AUTH_TYPE, "SECRETS_MANAGER"}, {"SERVERNAME", "h.example.com"}},
+        {{KEY_AUTH_TYPE, "DATABASE"}, {"SERVERNAME", "h.example.com"}},
+        {{"SERVERNAME", "h.example.com"}},
+        {{KEY_SERVER, "h.example.com"}, {"SERVERNAME", other_dsql_host}},
+        {{KEY_AUTH_TYPE, "DATABASE"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {KEY_SERVER, "10.0.0.1"},
+         {"SERVERNAME", "10.0.0.2"}},
+        {{KEY_AUTH_TYPE, "IAM"}, {KEY_SERVER, DSQL_HOST}, {"SERVERNAME", other_dsql_host}},
+    };
+    for (const std::map<std::string, std::string>& attributes : cases) {
+        std::map<std::string, std::string> conn_attr = attributes;
         std::string error;
-        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
-        EXPECT_EQ(before, conn_attr) << auth;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << error;
+        EXPECT_EQ(attributes, conn_attr);
+        EXPECT_EQ("", error);
     }
 }
 

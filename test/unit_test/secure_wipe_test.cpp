@@ -90,7 +90,7 @@ TEST(SecureWipeTest, WipeString_EmptyAndSmallStrings) {
     const char* const buffer = small.data();
     const size_t capacity = small.capacity();
     const auto* const object = reinterpret_cast<const char*>(&small);
-    ASSERT_TRUE(buffer >= object && buffer < object + sizeof(small));  // the small-string buffer
+    ASSERT_TRUE(buffer >= object && buffer < object + sizeof(std::string));  // the small-string buffer
     ASSERT_EQ('h', std::string_view(buffer, capacity)[7]);
 
     SecureWipeString(small);

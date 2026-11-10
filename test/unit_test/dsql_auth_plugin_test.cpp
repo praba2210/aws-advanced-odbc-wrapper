@@ -682,7 +682,7 @@ TEST_F(DsqlAuthPluginTest, Defaults_OtherAuth_ServernameUntouched) {
         {{"SERVERNAME", "h.example.com"}},
         {{KEY_SERVER, "h.example.com"}, {"SERVERNAME", other_dsql_host}},
         {{KEY_AUTH_TYPE, "DATABASE"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {KEY_SERVER, "10.0.0.1"},
-         {"SERVERNAME", "10.0.0.2"}},
+         {"SERVERNAME", "10.0.0.2"},},
         {{KEY_AUTH_TYPE, "IAM"}, {KEY_SERVER, DSQL_HOST}, {"SERVERNAME", other_dsql_host}},
     };
     for (const std::map<std::string, std::string>& attributes : cases) {
@@ -1599,11 +1599,11 @@ TEST_F(DsqlAuthPluginTest, Connect_ResolvesTheRegionOnce) {
     nglog::AddLogSink(&sink);
     DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    const long first_connect = sink.Count("Unable to load AWS config file while resolving region");
+    const auto first_connect = sink.Count("Unable to load AWS config file while resolving region");
     ResetAttributes(dbc_, "");
     dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
     EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    const long both_connects = sink.Count("Unable to load AWS config file while resolving region");
+    const auto both_connects = sink.Count("Unable to load AWS config file while resolving region");
     nglog::RemoveLogSink(&sink);
 
     EXPECT_EQ(1, first_connect);

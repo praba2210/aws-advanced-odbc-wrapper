@@ -460,9 +460,10 @@ TEST_F(DsqlAuthProviderTest, GetToken_SourceExpiredAfterAToken_ReturnsEmpty) {
 // check and then the token, runs it once.
 TEST_F(DsqlAuthProviderTest, CredentialProcess_RunsOncePerConnect) {
     const TempConfigFile runs("");
-    const TempConfigFile credentials("[cp]\ncredential_process = echo run >> " + runs.Path()
-        + " && echo '{\"Version\": 1, \"AccessKeyId\": \"AKIDPROCESS\", \"SecretAccessKey\": \"" + SECRET_KEY
-        + "\"}'\n");
+    const std::string keys =
+        R"('{"Version": 1, "AccessKeyId": "AKIDPROCESS", "SecretAccessKey": ")" + SECRET_KEY + R"("}')";
+    const TempConfigFile credentials(
+        "[cp]\ncredential_process = echo run >> " + runs.Path() + " && echo " + keys + "\n");
     const ScopedEnvVars env = ProfileFilesAndEnvironmentKeys();
     const ScopedEnvVars credentials_file("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
     const auto run_count = [&runs] {

@@ -370,6 +370,12 @@ namespace {
         return "SSLmode=" + mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
                "verify-ca or require.";
     }
+
+    // The INFO line for a mode name in another case, which is lowercased.
+    std::string SslModeLowercased(const std::string& requested, const std::string& mode) {
+        return "[DSQL] Lowercasing SSLmode=" + requested + " to " + mode
+            + ": psqlODBC reads the mode case-sensitively and would connect without TLS";
+    }
 }  // namespace
 
 // psqlODBC runs an unset SSLmode as disable, and Aurora DSQL refuses that before any authentication. An auth type other
@@ -479,8 +485,7 @@ TEST_F(DsqlCompatibilityTest, PrepareConnect_OtherAuth_ModeNameInAnotherCase_IsL
         EXPECT_EQ(pqopt, dbc_.conn_attr.at("PQOPT"));
         EXPECT_EQ("postgres", dbc_.conn_attr.at(KEY_DATABASE));
         EXPECT_EQ("", prepared.tls_warning);
-        EXPECT_EQ(1, log.Count("[DSQL] Lowercasing SSLmode=" + requested + " to " + expected
-                               + ": psqlODBC reads the mode case-sensitively and would connect without TLS"));
+        EXPECT_EQ(1, log.Count(SslModeLowercased(requested, expected)));
     }
     EXPECT_EQ(5, log.Count("[DSQL] Lowercasing SSLmode="));
     EXPECT_EQ(0, log.Count("Overriding SSLmode"));

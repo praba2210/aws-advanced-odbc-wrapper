@@ -20,15 +20,15 @@
 #endif
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
-#include <fstream>
+#include <filesystem>
 #include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -1514,23 +1514,28 @@ TEST_F(DsqlAuthPluginTest, Connect_AfterCredentialFailure_RebuildsTheProvider) {
     EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
 }
 
-// A connect without RDS_AUTH_TYPE=DSQL on the same handle gets no token and keeps the application's password.
+// A connect without RDS_AUTH_TYPE=DSQL on the same handle gets no token and keeps the application's password, and the
+// plugin's defaults aren't applied: the SSLmode stays as set and no pqopt is added.
 TEST_F(DsqlAuthPluginTest, Connect_NotDsqlAuthType_PassesThrough) {
     dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, "DATABASE");
     dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
     EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
         testing::_, testing::_, testing::_))
         .Times(testing::Exactly(0));
-    std::string password_seen;
+    std::map<std::string, std::string> conn_attr_seen;
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
-        .WillOnce(testing::Invoke([&password_seen](SQLHDBC handle, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
-                                                   SQLUSMALLINT) {
-            password_seen = static_cast<DBC*>(handle)->conn_attr.at(KEY_DB_PASSWORD);
+        .WillOnce(testing::Invoke([&conn_attr_seen](SQLHDBC handle, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                    SQLUSMALLINT) {
+            conn_attr_seen = static_cast<DBC*>(handle)->conn_attr;
             return SQL_SUCCESS;
         }));
 
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
-    EXPECT_EQ("app_password", password_seen);
+    EXPECT_EQ("app_password", conn_attr_seen.at(KEY_DB_PASSWORD));
+    EXPECT_EQ("disable", conn_attr_seen.at("SSLMODE"));
+    EXPECT_FALSE(conn_attr_seen.contains("PQOPT"));
+    EXPECT_FALSE(conn_attr_seen.contains("D5"));
 }
 
 TEST_F(DsqlAuthPluginTest, Connect_InjectedProvider_IsNeverReplaced) {
@@ -1722,6 +1727,8 @@ TEST_F(DsqlAuthPluginTest, Defaults_BundleRootCert_IsAdded) {
 #ifndef _WIN32
 namespace {
     constexpr int FAKE_LIBPQ_VERSION = 150004;
+    // What FakePQlibVersion returns, set by the loader that hands it out. One global for every loader: the tests run
+    // one at a time, and each reads the version right after its loader set it.
     int g_fake_libpq_version = FAKE_LIBPQ_VERSION;
     int FakePQlibVersion() { return g_fake_libpq_version; }
 
@@ -1776,16 +1783,39 @@ TEST_F(DsqlAuthPluginTest, Connect_RootCertFollowsTheBaseLibpqVersion) {
     }
 }
 
-TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RejectsFilesAndDirectoriesNotOwnedByRoot) {
+// Only a regular file that only root can change, found through symbolic links: /etc/passwd and a link to it, not the
+// /etc directory, a file the test made, a link to that one, or a path that doesn't exist.
+TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RootOwnedRegularFilesOnly) {
+    // A link in the temp directory, removed at the end of the scope.
+    struct TempLink {
+        std::filesystem::path path;
+        TempLink(const std::string& target, const std::string& name)
+            : path(std::filesystem::path(::testing::TempDir()) / name) {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+            std::filesystem::create_symlink(target, path);
+        }
+        ~TempLink() {
+            std::error_code ignored;
+            std::filesystem::remove(path, ignored);
+        }
+        TempLink(const TempLink&) = delete;
+        TempLink& operator=(const TempLink&) = delete;
+    };
+    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile("/etc/passwd"));
+    const TempLink link_to_root_file("/etc/passwd", "dsql_root_owned_file_test_link_passwd");
+    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile(link_to_root_file.path.c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/etc"));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/nonexistent/dsql-ca-bundle.crt"));
+
     if (geteuid() == 0) {
         GTEST_SKIP() << "files made by root are root-owned";
     }
-    const std::string path = ::testing::TempDir() + "dsql_root_owned_file_test.txt";
-    { std::ofstream file(path); file << "x"; }
-    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(path.c_str()));
+    const TempConfigFile own_file("x");
+    const TempLink link_to_own_file(own_file.Path(), "dsql_root_owned_file_test_link_own");
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(own_file.Path().c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(link_to_own_file.path.c_str()));
     EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(::testing::TempDir().c_str()));
-    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/nonexistent/dsql-ca-bundle.crt"));
-    std::remove(path.c_str());
 }
 #endif
 

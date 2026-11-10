@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <string>
 
 // Zeroes size bytes at data with writes the compiler can't drop as dead stores, for memory that held a password or a
 // token and is about to be freed or go out of scope.
@@ -37,6 +38,13 @@ inline void SecureWipe(void* data, size_t size) {
         bytes[i] = 0;
     }
 #endif
+}
+
+// Wipes everything a string's buffer holds, up to its capacity (an earlier, longer value too), and empties it.
+inline void SecureWipeString(std::string& text) {
+    text.resize(text.capacity());  // within the capacity: no reallocation
+    SecureWipe(text.data(), text.size());
+    text.clear();
 }
 
 // Wipes a string's or a vector's elements when it goes out of scope, on every return.

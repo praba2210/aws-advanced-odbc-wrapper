@@ -23,6 +23,7 @@
 #include "../util/map_utils.h"
 #include "../util/plugin_service.h"
 #include "../util/rds_utils.h"
+#include "../util/secure_wipe.h"
 
 namespace {
     // 28000, not 08001: the dialects count 08 as a network error, which the initial connection strategy retries until
@@ -142,6 +143,8 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
     if (token.first.empty()) {
         return FailTokenGeneration(dbc, plugin_name_);
     }
+    // The token is wiped when this call ends. conn_attr and the base driver keep their own copies.
+    const ScopedWipe wipe_token(token.first);
     const bool is_cached_token = token.second;
 
     dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, token.first);
@@ -175,6 +178,11 @@ SQLRETURN BaseTokenAuthPlugin::Connect(
         return ret;
     }
 
+    // The first token and its copy in conn_attr are wiped before the new one replaces them.
+    SecureWipeString(token.first);
+    if (const auto password = dbc->conn_attr.find(KEY_DB_PASSWORD); password != dbc->conn_attr.end()) {
+        SecureWipeString(password->second);
+    }
     token = auth_provider_->GetToken(
         iam_host, region, port, username, false, extra_url_encode, token_expiration);
     if (token.first.empty()) {

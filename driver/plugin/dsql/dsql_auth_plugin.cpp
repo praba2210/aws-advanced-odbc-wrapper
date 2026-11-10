@@ -29,6 +29,7 @@
 #include "../../util/map_utils.h"
 #include "../../util/rds_strings.h"
 #include "../../util/rds_utils.h"
+#include "../../util/secure_wipe.h"
 
 namespace {
     // psqlODBC keywords, upper-cased as in conn_attr. They aren't wrapper keys, so they reach the base driver.
@@ -429,6 +430,12 @@ SQLRETURN DsqlAuthPlugin::Connect(
     ApplyConnectionDefaults(dbc->conn_attr);
     const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
+    // The token was for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect (the
+    // output connection string was built before the chain ran). psqlODBC's own copy stays with its connection.
+    if (const auto password = dbc->conn_attr.find(KEY_DB_PASSWORD); password != dbc->conn_attr.end()) {
+        SecureWipeString(password->second);
+        dbc->conn_attr.erase(password);
+    }
     // The wrapper keeps one diagnostic record per handle, and it hides the base driver's. Report the override only
     // when the base driver has nothing to report (a short output buffer, for one, gets psqlODBC's 01004).
     if (ret != SQL_SUCCESS || tls_warning.empty()) {

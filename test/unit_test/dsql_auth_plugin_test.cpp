@@ -134,10 +134,62 @@ TEST_F(DsqlAuthPluginTest, Connect_RegionFromDsqlHost) {
         .WillOnce(testing::Return(FRESH_TOKEN));
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .Times(testing::Exactly(1))
+        .WillOnce(testing::Invoke([this](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*, SQLUSMALLINT) {
+            // The token is dropped after the connect, so it's read while the base driver connects.
+            EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+// The token is for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect.
+TEST_F(DsqlAuthPluginTest, Connect_Dsql_ErasesThePasswordAfterTheConnect) {
+    for (const SQLRETURN base_result : std::initializer_list<SQLRETURN>{SQL_SUCCESS, SQL_ERROR}) {
+        dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+        EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+            testing::_, testing::_, testing::_))
+            .WillOnce(testing::Return(FRESH_TOKEN));
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, base_result](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                          SQLUSMALLINT) {
+                EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+                return base_result;
+            }));
+
+        EXPECT_EQ(base_result, ConnectWithMockProvider());
+        EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+        EXPECT_EQ(USERNAME, dbc_->conn_attr.at(KEY_DB_USERNAME));  // only PWD goes
+        testing::Mock::VerifyAndClearExpectations(mock_auth_provider_.get());
+        testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+    }
+}
+
+// A failed token never reaches conn_attr, and an app's own PWD is dropped the same way.
+TEST_F(DsqlAuthPluginTest, Connect_Dsql_TokenFailure_ErasesTheAppPassword) {
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(std::pair<std::string, bool>("", false)));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+}
+
+// Other engines reuse PWD (failover, Limitless, a retry), so the plugin leaves it for them.
+TEST_F(DsqlAuthPluginTest, Connect_OtherAuth_KeepsThePassword) {
+    dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, VALUE_AUTH_DATABASE);
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
 
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
-    EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+    EXPECT_EQ("app_password", dbc_->conn_attr.at(KEY_DB_PASSWORD));
 }
 
 TEST_F(DsqlAuthPluginTest, Connect_RegionKeyOverridesHost) {

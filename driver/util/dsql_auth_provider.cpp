@@ -43,6 +43,7 @@
 #include "aws_sdk_helper.h"
 #include "logger_wrapper.h"
 #include "rds_strings.h"
+#include "secure_wipe.h"
 
 namespace {
     // Why these credentials can't sign a DSQL token, or "" when they can. The C++ SigV4 presigner skips signing when
@@ -179,7 +180,7 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     // The presigner reads its provider, so give it the credentials checked above and take them back after.
     const std::lock_guard sign_lock(sign_mutex_);
     signing_->Set(credentials);
-    const auto outcome = is_admin
+    auto outcome = is_admin
         ? dsql_client_->GenerateDBConnectAdminAuthToken(aws_host, aws_region, lifetime.count())
         : dsql_client_->GenerateDBConnectAuthToken(aws_host, aws_region, lifetime.count());
     signing_->Set(Aws::Auth::AWSCredentials{});
@@ -187,8 +188,14 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
     }
-    const std::string aws_token(outcome.GetResult().data(), outcome.GetResult().size());
-    const std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
+    // The SDK's result, our copy of it and the encoded one are wiped on every return; the caller gets the one it is
+    // returned. The SDK's own internal copies aren't.
+    Aws::String& sdk_token = outcome.GetResult();
+    const ScopedWipe wipe_sdk_token(sdk_token);
+    std::string aws_token(sdk_token.data(), sdk_token.size());
+    const ScopedWipe wipe_aws_token(aws_token);
+    std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
+    const ScopedWipe wipe_token(token);
     LOG(INFO) << "Generated new Aurora DSQL " << (is_admin ? "admin " : "") << "token length: " << token.length();
     return {token, false};
 }

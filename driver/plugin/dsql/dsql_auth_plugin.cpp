@@ -75,6 +75,27 @@ namespace {
         return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
     }
 
+    // The error for a connect that names two different hosts in SERVER and SERVERNAME (any key case; hosts compare
+    // ASCII case-insensitively), or "" when there is at most one. The token is signed for one host, and the key that
+    // loses would be dropped without a word: a DSN's SERVER would beat the connection string's SERVERNAME.
+    std::string ServernameConflict(const std::map<std::string, std::string>& conn_attr)
+    {
+        const std::string* first = nullptr;
+        for (const auto& [key, value] : conn_attr) {
+            const std::string upper = ToAsciiUpper(key);
+            if (upper != KEY_SERVER && upper != ALIAS_KEY_SERVER_1) {
+                continue;
+            }
+            if (first == nullptr) {
+                first = &value;
+            } else if (AsciiLower(*first) != AsciiLower(value)) {
+                return std::string("DSQL Authentication failed. ") + KEY_SERVER + " and " + ALIAS_KEY_SERVER_1
+                    + " name different hosts ('" + *first + "' and '" + value + "'): set only one of them";
+            }
+        }
+        return "";
+    }
+
     // psqlODBC reads SERVERNAME as SERVER and the later one in its connection string wins; the wrapper writes the keys
     // in sorted order, so SERVERNAME would win. The token is signed for SERVER, so a DSQL connect keeps one host: the
     // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. DSN keys keep the case typed.
@@ -605,6 +626,10 @@ bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_at
 {
     if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
         return true;
+    }
+    if (std::string conflict = ServernameConflict(conn_attr); !conflict.empty()) {
+        out_error = std::move(conflict);
+        return false;
     }
     // This runs before the plugin chain and reads SERVER.
     FoldServername(conn_attr);

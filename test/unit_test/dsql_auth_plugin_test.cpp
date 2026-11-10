@@ -657,6 +657,39 @@ TEST_F(DsqlAuthPluginTest, Defaults_OtherAuth_ServernameUntouched) {
     }
 }
 
+// Two different hosts: the token is signed for one, and the other would be dropped silently (a DSN's SERVER would
+// beat the connection string's SERVERNAME). The same host in any case folds quietly.
+TEST_F(DsqlAuthPluginTest, ClusterId_ServerAndServernameDiffer_Fails) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "a.example.com"},
+                                                    {"SERVERNAME", "b.example.com"},};
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("DSQL Authentication failed. SERVER and SERVERNAME name different hosts ('a.example.com' and "
+              "'b.example.com'): set only one of them", error);
+
+    conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "A.Example.com"}, {"Servername", "a.example.COM"}};
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("A.Example.com", conn_attr.at("SERVER"));
+    EXPECT_FALSE(conn_attr.contains("Servername"));
+}
+
+// The app gets the error before any token is signed or the base driver loads.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ServerAndServernameDiffer_Fails08001BeforeAnything) {
+    ENV env;
+    DBC dbc{};
+    dbc.env = &env;
+    dbc.conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "a.example.com"}, {"SERVERNAME", "b.example.com"},
+                     {KEY_BASE_DRIVER, "/no/such/base/driver.so"},};
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_)).Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(&dbc, ""));
+    ASSERT_TRUE(dbc.err);
+    EXPECT_EQ("08001", dbc.err->sqlstate);
+    EXPECT_NE(std::string::npos, dbc.err->error_msg.find("name different hosts"));
+    EXPECT_FALSE(env.driver_lib_loader);
+}
+
 TEST_F(DsqlAuthPluginTest, ClusterId_AuthTypeIsCaseInsensitive) {
     std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, "dsql"}, {KEY_SERVER, CLUSTER_ID},
                                                     {KEY_REGION, "eu-west-1"}};

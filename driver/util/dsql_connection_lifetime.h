@@ -87,7 +87,8 @@ public:
 private:
     // True from MAX_CONNECTION_LIFETIME on; logs the INFO line the first time.
     bool CheckRetired();
-    // The age of a connection whose connect began at started_at: the larger of its steady and system ages.
+    // The age of a connection whose connect began at started_at: the larger of its steady and system ages. Callers
+    // hold mutex_ when started_at is started_at_.
     [[nodiscard]] std::chrono::steady_clock::duration AgeSince(const Instant& started_at) const;
 
     SteadyClock steady_clock_;

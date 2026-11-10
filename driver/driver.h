@@ -167,12 +167,13 @@ struct DBC {
     BasePlugin* plugin_head = nullptr;
     std::shared_ptr<PluginService> plugin_service;
     // Whether this connect is Aurora DSQL, decided in RDS_InitializeConnection; every DSQL check after that reads it,
-    // not conn_attr. Atomic: SQLSetStmtAttr, SQLParamData and the Aurora DSQL plugins' Execute hold only the
-    // statement's lock.
+    // not conn_attr. Atomic: SQLSetStmtAttr (DsqlCompatibility::TrySetStmtAttr) and SQLParamData
+    // (DsqlCompatibility::NoteStatementResult) read it holding only the statement's lock. SQLExecute and SQLExecDirect
+    // take the connection's lock first, so DefaultPlugin::Execute and the Aurora DSQL plugins' Execute hold both.
     std::atomic<bool> is_dsql = false;
     // Aurora DSQL: a statement call failed or warned since the transaction began, so the server may have ended it.
     // SQLEndTran(SQL_COMMIT) checks before committing (DsqlCompatibility::RollBackAbortedTransaction). Atomic:
-    // SQLParamData holds only the statement's lock.
+    // SQLParamData sets it holding only the statement's lock.
     std::atomic<bool> dsql_statement_failed_in_transaction = false;
     // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME: created by RDS_InitializeConnection for an
     // Aurora DSQL connect, started by each successful base connect (DefaultPlugin), read by SQL_ATTR_CONNECTION_DEAD

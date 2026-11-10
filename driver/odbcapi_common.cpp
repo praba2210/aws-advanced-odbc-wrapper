@@ -1301,6 +1301,9 @@ SQLRETURN SQL_API SQLParamData(
 
     const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
     // Aurora DSQL: as after SQLExecute, a statement that failed in a transaction is checked for before the commit.
+    // Racy by design: auto_commit and transaction_status are read without the connection's lock (taking it after the
+    // statement's would invert SQLExecute's order). Only a call racing another thread's change of autocommit or of
+    // the transaction on this connection reads a stale value; a note set that way costs one check at the commit.
     DsqlCompatibility::NoteStatementResult(stmt->dbc, ret);
     // The last SQLParamData of an SQLExecute or SQLExecDirect ran its statement (or failed to).
     if (stmt->execute_needs_data && ret != SQL_NEED_DATA && ret != SQL_STILL_EXECUTING) {

@@ -45,6 +45,15 @@
 #include "guarded_buffer.h"
 
 namespace {
+#ifndef _WIN32
+    // unixODBC reads ODBCSYSINI once, at the process's first lookup, so it is set before any test runs:
+    // Connect_EmptyUser_KeepsTheDsnUid reads dsn-with-uid from test/unit_test/resources/odbc.ini.
+    const bool ODBCSYSINI_SET = [] {
+        setenv("ODBCSYSINI", AWS_PROFILE_TEST_RESOURCES_DIR, 1);
+        return true;
+    }();
+#endif
+
     // One call the fake base driver got: the text it reads, as UTF-8, and the length it was given.
     struct BaseCall {
         std::string function;

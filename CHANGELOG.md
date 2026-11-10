@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The `AWS_PROFILE` key restricts Aurora DSQL credentials to that profile: a profile that isn't in the AWS config or credentials file fails the connect with `28000` instead of falling back to environment, container or instance credentials, and the `AWS_PROFILE` environment variable keeps the default credential chain
 - RDS IAM authentication types with `DATABASE_DIALECT=AURORA_DSQL` fail at connect; on RDS PostgreSQL, remove `DATABASE_DIALECT`
-- On an Aurora DSQL connection with an authentication type other than `DSQL`, an `SSLmode` that psqlODBC would run as `disable` becomes `verify-full`, reported with `01S02`, and a missing `DATABASE` becomes `postgres`
+- On an Aurora DSQL connection with an authentication type other than `DSQL`, an `SSLmode` that psqlODBC would run as `disable` becomes `verify-full` (a value you set is reported with `01S02`), and a missing `DATABASE` then becomes `postgres`; a mode psqlODBC runs is left exactly as set
 - With `RDS_AUTH_TYPE=DSQL`, `SERVERNAME` is read as `SERVER`, so psqlODBC connects to the host the token was signed for, and `SERVER` and `SERVERNAME` naming different hosts fail with `08001`
 - On Aurora DSQL the wrapper sets psqlODBC's `UpdatableCursors=0`: keyset-driven and updatable cursors become static and read-only (`01S02`) instead of failing
 - On Aurora DSQL, a commit after a failed statement rolls back a transaction that Aurora DSQL ended and returns `25S03`, instead of reporting success for a commit that saved nothing; so does a change of `SQL_ATTR_AUTOCOMMIT`, which commits first and returns that commit's error with autocommit unchanged

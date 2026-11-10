@@ -33,6 +33,10 @@ For Aurora DSQL behaviors such as OCC retries, see [Support for Amazon Aurora DS
 
 `PWD` is ignored: the token replaces it. The plugin also reads psqlODBC's short forms of `SSLmode` and `pqopt`, `CA` and `D5`.
 
+### Installing psqlODBC
+
+On Debian and Ubuntu, install psqlODBC with `sudo apt install odbc-postgresql`. Its Unicode driver is `/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so` (`/usr/lib/aarch64-linux-gnu/odbc/psqlodbcw.so` on Arm), and its ANSI driver, `psqlodbca.so`, is in the same folder. For Windows, see [Windows](#windows).
+
 ### Minimal Connection String
 
 > [!NOTE]\
@@ -50,7 +54,7 @@ With libpq 15 or earlier the plugin uses the system's CA bundle instead (`/etc/s
 DRIVER={AWS Advanced ODBC Wrapper Unicode};SERVER=abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws;RDS_AUTH_TYPE=DSQL;BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;pqopt={sslrootcert=/path/to/AmazonRootCA1.pem};
 ```
 
-Both connect as `admin` to `postgres` with `SSLmode=verify-full`. The region comes from the endpoint, and the credentials from the default AWS credential chain. Use psqlODBC's ANSI driver (`psqlodbca.so`) with the ANSI wrapper. Driver paths vary by system. For Windows, see [Windows](#windows).
+Both connect as `admin` to `postgres` with `SSLmode=verify-full`. The region comes from the endpoint, and the credentials from the default AWS credential chain. Use psqlODBC's ANSI driver (`psqlodbca.so`) with the ANSI wrapper; with pyodbc, see [Aurora PostgreSQL](../using-the-aws-odbc-wrapper.md#aurora-postgresql) first. Driver paths vary by system. For Windows, see [Windows](#windows).
 
 ### Sample DSN Configuration
 
@@ -90,7 +94,7 @@ In ODBC Data Source Administrator (64-bit), add a DSN for `AWS Advanced ODBC Wra
 2. **Server**: the cluster endpoint or cluster ID.
 3. **Username**: leave it blank to connect as `admin`, or enter a custom database role. Leave **Password**, **Port** and **Database** blank.
 4. **Base Driver Location**: psqlODBC's driver DLL, `psqlodbc35w.dll` for the Unicode wrapper or `psqlodbc30a.dll` for the ANSI wrapper, in psqlODBC's `bin` folder. Or set **Base Driver Data Source Name** to a psqlODBC DSN, and set that DSN's SSL Mode to `verify-full`: psqlODBC saves `disable` by default, which the plugin replaces, with a warning, on every connect (see [TLS](#tls)).
-5. **Base Driver Connection String**: `pqopt={sslrootcert=C:/certs/AmazonRootCA1.pem}`, with forward slashes (see [Root Certificates](#root-certificates)). Separate other psqlODBC options with `;`, for example `SSLmode=verify-ca;pqopt={sslrootcert=C:/certs/AmazonRootCA1.pem}`.
+5. **Base Driver Connection String**: `pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`, with forward slashes (see [Root Certificates](#root-certificates)). Separate other psqlODBC options with `;`, for example `SSLmode=verify-ca;pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`.
 6. **AWS Profile**: optional. See [AWS Credentials](#aws-credentials).
 7. **Database Dialect**: leave it blank, or choose **Aurora DSQL**.
 8. On the **Authentication** tab, choose **Aurora DSQL** as the **Authentication Mode**. The tab then shows **AWS Region**, **Expire Time** and **IAM Host**. Set **AWS Region** when **Server** is a cluster ID and no environment variable or AWS profile gives the region (see [Region](#region)). **Expire Time** is in seconds; leave it blank for 900. Leave **IAM Host** blank unless you use [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns).
@@ -168,7 +172,7 @@ Set a root certificate file instead:
 On Linux, the system's CA bundle usually includes Amazon Root CA 1: `pqopt={sslrootcert=/etc/ssl/certs/ca-certificates.crt}` on Debian and Ubuntu, `pqopt={sslrootcert=/etc/pki/tls/certs/ca-bundle.crt}` on RHEL, Fedora and Amazon Linux. Otherwise, download [AmazonRootCA1.pem](https://www.amazontrust.com/repository/AmazonRootCA1.pem) and set `pqopt={sslrootcert=/path/to/AmazonRootCA1.pem}`.
 
 > [!WARNING]\
-> On Windows, write the path with forward slashes: `pqopt={sslrootcert=C:/certs/AmazonRootCA1.pem}`. libpq reads a backslash in `pqopt` as an escape, so `C:\certs\AmazonRootCA1.pem` would become `C:certsAmazonRootCA1.pem`. Put a path that contains spaces in single quotes: `pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`.
+> On Windows, write the path with forward slashes: `pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`. libpq reads a backslash in `pqopt` as an escape, so `C:\Program Files\certs\AmazonRootCA1.pem` would become `C:Program FilescertsAmazonRootCA1.pem`. Put a path that contains spaces in single quotes, as here. Keep the file in a folder only administrators can change, such as one under `C:\Program Files`: a folder created directly under `C:\` lets every signed-in user replace it. For a per-user DSN, a folder in your profile works too.
 
 The plugin keeps your other `pqopt` options. It also adds `application_name=aurora-dsql-odbc/<version>` unless you set `application_name`.
 
@@ -196,11 +200,18 @@ Aurora DSQL closes every connection after 60 minutes ([Cluster quotas and databa
 
 ### AWS PrivateLink Without Private DNS
 
-Without private DNS, `SERVER` is the VPC endpoint's DNS name ([Managing clusters using AWS PrivateLink](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html)). The token must still be signed for the cluster endpoint, and `verify-full` fails because the server certificate doesn't name the VPC endpoint. Set `IAM_HOST` to the cluster endpoint or cluster ID, `SSLmode` to `verify-ca` with a root certificate file, and the cluster ID in libpq's `options`:
+Without private DNS, the cluster endpoint doesn't resolve to the VPC endpoint ([Managing clusters using AWS PrivateLink](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/privatelink-managing-clusters.html)). Prefer one of these, which keep `verify-full`:
+
+- Resolve the cluster endpoint to the VPC endpoint yourself, with a Route 53 private hosted zone or a hosts-file entry, and connect to the cluster endpoint as usual.
+- Keep `SERVER` the cluster endpoint, and give the VPC endpoint's IP address in libpq's `hostaddr`, for example `pqopt={hostaddr=10.0.1.23}`. libpq then connects to that address and still checks the certificate against `SERVER`. psqlODBC passes one address, so this uses one of the endpoint's network interfaces.
+
+If you connect to the VPC endpoint's DNS name instead, `verify-full` fails because the server certificate doesn't name it. The token must still be signed for the cluster endpoint. Set `IAM_HOST` to the cluster endpoint or cluster ID, `SSLmode` to `verify-ca` with a root certificate file, and the cluster ID in libpq's `options`:
 
 ```
 SERVER=vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.us-east-1.vpce.amazonaws.com;IAM_HOST=abcdefghijklmnopqrstuvwxyz;REGION=us-east-1;RDS_AUTH_TYPE=DSQL;SSLmode=verify-ca;pqopt={sslrootcert=/path/to/AmazonRootCA1.pem options='-c amzn-cluster-id=abcdefghijklmnopqrstuvwxyz'};BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;
 ```
+
+`verify-ca` checks that the certificate chains to Amazon Root CA 1, not whose it is: any certificate issued under that root passes.
 
 ### Troubleshooting
 
@@ -288,3 +299,12 @@ Aurora DSQL rejected the token. Check that:
 `Invalid value specified for connection string attribute:` followed by `TOKEN_EXPIRATION` (SQLSTATE `01S00`)
 
 `TOKEN_EXPIRATION` must be a whole number of seconds, `0` or more. A value above 604,800 passes this check but fails when the connection opens (see [Token Expiration](#token-expiration)).
+
+#### psqlODBC's log holds the token
+
+psqlODBC before 18.00.0002 writes every libpq connection option to its log, the password included, when `Debug` or `CommLog` is on. With Aurora DSQL that is the token, valid for `TOKEN_EXPIRATION` seconds, in a file in `/tmp` (on Windows, `C:\`) that other local users can often read. Turn psqlODBC logging on only to debug a connect, keep `TOKEN_EXPIRATION` short meanwhile, and delete the logs; psqlODBC 18.00.0002 and later leave the password out.
+
+### See Also
+
+- [Support for Amazon Aurora DSQL](../SupportForAuroraDSQL.md): what the wrapper changes on Aurora DSQL connections, and the Aurora DSQL behaviors the application handles.
+- [OCC Retry Plugin](./occ-retry-plugin.md)

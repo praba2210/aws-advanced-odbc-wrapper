@@ -269,7 +269,7 @@ TEST_F(DsqlAuthPluginTest, Connect_ReadsCredentialsOnce) {
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
     DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, std::make_shared<DsqlAuthProvider>("us-west-2", source));
-    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, 0, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
     EXPECT_EQ(1, source->Reads());
 }
 

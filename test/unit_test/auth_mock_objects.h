@@ -15,9 +15,9 @@
 #ifndef AUTH_MOCK_OBJECTS_H_
 #define AUTH_MOCK_OBJECTS_H_
 
+#include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
-#include <aws/core/Aws.h>
 #include <aws/core/http/HttpClient.h>
 #include <aws/rds/RDSClient.h>
 #include <aws/secretsmanager/SecretsManagerClient.h>

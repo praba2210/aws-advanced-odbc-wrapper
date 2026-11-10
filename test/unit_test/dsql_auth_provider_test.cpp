@@ -434,7 +434,7 @@ TEST_F(DsqlAuthProviderTest, OneCredentialsReadPerConnect) {
 // The token is signed with the credentials the check read, not with a second read that may differ.
 TEST_F(DsqlAuthProviderTest, SignsWithTheCheckedCredentials) {
     const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
-        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY)});
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY),});
     DsqlAuthProvider provider(REGION, source);
     ASSERT_TRUE(provider.HasResolvedCredentials());
     const std::string token = provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first;
@@ -459,7 +459,7 @@ TEST_F(DsqlAuthProviderTest, FailedCheck_DoesNotLeaveCredentialsForTheNextToken)
 // A snapshot signs one token. A later connect that skips the check does not sign with an earlier connect's credentials.
 TEST_F(DsqlAuthProviderTest, CheckedCredentials_AreUsedByOneToken) {
     const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
-        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY)});
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), Aws::Auth::AWSCredentials("AKIDKEYB", SECRET_KEY),});
     DsqlAuthProvider provider(REGION, source);
     ASSERT_TRUE(provider.HasResolvedCredentials());
     EXPECT_TRUE(SignsWith(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first, "AKIDKEYA"));
@@ -470,7 +470,7 @@ TEST_F(DsqlAuthProviderTest, CheckedCredentials_AreUsedByOneToken) {
 TEST_F(DsqlAuthProviderTest, Snapshot_IsClearedAfterSigning) {
     const Aws::Auth::AWSCredentials expired("AKIDGONE", SECRET_KEY, "", Aws::Utils::DateTime::Now() - std::chrono::hours(1));
     const auto source = std::make_shared<CountingCredentialsProvider>(std::vector{
-        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), expired});
+        Aws::Auth::AWSCredentials("AKIDKEYA", SECRET_KEY), expired,});
     DsqlAuthProvider provider(REGION, source);
     ASSERT_FALSE(provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first.empty());
     EXPECT_EQ("", provider.GetToken(HOST, REGION, PORT, "admin", true, false, EXPIRATION).first);

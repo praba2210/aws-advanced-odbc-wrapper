@@ -14,18 +14,38 @@
 
 #include "dsql_auth_provider.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <mutex>
+#include <optional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
+#include <aws/auth/credentials.h>
+#include <aws/common/byte_buf.h>
+#include <aws/core/Globals.h>
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/auth/CrtCredentialsProvider.h>
+#include <aws/core/auth/ProfileCredentialsProvider.h>
+#include <aws/core/auth/SSOCredentialsProvider.h>
+#include <aws/core/auth/STSCredentialsProvider.h>
 #include <aws/core/client/ClientConfiguration.h>
 #include <aws/core/client/GenericClientConfiguration.h>
+#include <aws/core/client/UserAgent.h>
+#include <aws/core/config/AWSConfigFileProfileConfigLoader.h>
+#include <aws/crt/Allocator.h>
+#include <aws/crt/auth/Credentials.h>
+#include <aws/crt/io/Bootstrap.h>
+#include <aws/crt/io/TlsOptions.h>
 #include <aws/dsql/DSQLClient.h>
 
 #include "aws_sdk_helper.h"
 #include "logger_wrapper.h"
 #include "rds_strings.h"
+#include "secure_wipe.h"
 
 namespace {
     // Why these credentials can't sign a DSQL token, or "" when they can. The C++ SigV4 presigner skips signing when
@@ -44,30 +64,117 @@ namespace {
         }
         return "";
     }
+
+    // The token with each '%' written again as %25, as AuthProvider::ExtraUrlEncodeString writes it (EXTRA_URL_ENCODE),
+    // into out, which is reserved at the final size first: that function grows its copy, freeing shorter ones unwiped.
+    void ExtraUrlEncodeInto(std::string_view token, std::string& out)
+    {
+        const auto percents = static_cast<size_t>(std::ranges::count(token, '%'));
+        out.reserve(token.size() + (2 * percents));
+        for (const char c : token) {
+            if (c == '%') {
+                out += "%25";
+            } else {
+                out += c;
+            }
+        }
+    }
+
+    // The SDK's chain class has a protected constructor and AddProvider.
+    class ProfileOnlyChain final : public Aws::Auth::AWSCredentialsProviderChain {
+    public:
+        explicit ProfileOnlyChain(const std::vector<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>>& providers)
+        {
+            for (const auto& provider : providers) {
+                if (provider) {
+                    AddProvider(provider);
+                }
+            }
+        }
+    };
+
+    // The profile in the config file (with the "profile " prefix) or the credentials file, read now: the files can
+    // change after InitAPI, which the SDK's cached copy doesn't see.
+    std::optional<Aws::Config::Profile> FindProfile(const std::string& name, bool config_file)
+    {
+        Aws::Config::AWSConfigFileProfileConfigLoader loader(
+            config_file ? Aws::Auth::GetConfigProfileFilename()
+                        : Aws::Auth::ProfileCredentialsProvider::GetCredentialsProfileFilename(), config_file);
+        if (!loader.Load()) {
+            return std::nullopt;
+        }
+        const auto it = loader.GetProfiles().find(Aws::String(name.data(), name.size()));
+        return it == loader.GetProfiles().end() ? std::nullopt : std::optional(it->second);
+    }
 }  // namespace
 
-DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile) {
+// The profile as the config file and the credentials file have it, so a build reads each file once.
+struct DsqlAuthProvider::ProfileFiles {
+    std::optional<Aws::Config::Profile> config;
+    std::optional<Aws::Config::Profile> credentials;
+
+    static ProfileFiles Find(const std::string& name)
+    {
+        return {.config = FindProfile(name, true), .credentials = FindProfile(name, false)};
+    }
+    [[nodiscard]] bool HasProfile() const
+    {
+        return config.has_value() || credentials.has_value();
+    }
+};
+
+// What DSQLClient signs with: the credentials GetToken checked, set just before signing and cleared after.
+class DsqlAuthProvider::SnapshotCredentialsProvider final : public Aws::Auth::AWSCredentialsProvider {
+public:
+    Aws::Auth::AWSCredentials GetAWSCredentials() override
+    {
+        const std::lock_guard lock(mutex_);
+        return credentials_;
+    }
+    void Set(Aws::Auth::AWSCredentials credentials)
+    {
+        const std::lock_guard lock(mutex_);
+        credentials_ = std::move(credentials);
+    }
+
+private:
+    std::mutex mutex_;
+    Aws::Auth::AWSCredentials credentials_;
+};
+
+DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const std::string &profile, ProfileSource source) {
     // The base default constructor skips Init, but the base destructor always calls Shutdown.
     AwsSdkHelper::Init();
-    if (profile.empty()) {
-        credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+    if (source == ProfileSource::KEY) {
+        if (const ProfileFiles files = ProfileFiles::Find(profile); files.HasProfile()) {
+            source_ = BuildProfileOnlyChain(profile, region, files);
+        } else {
+            // Nothing to sign with, so the connect fails and names the profile, instead of signing with the
+            // environment, a container or the instance role.
+            source_ =
+                std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(Aws::Auth::AWSCredentials{});
+        }
+    } else if (profile.empty()) {
+        source_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
     } else {
-        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config;
+        Aws::Client::ClientConfiguration::CredentialProviderConfiguration credential_config{};
         credential_config.profile = profile;
-        credentials_provider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
+        source_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>(credential_config);
     }
-    // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own.
-    // Qualified: a virtual call from a constructor never reaches an override anyway.
-    if (!DsqlAuthProvider::HasResolvedCredentials()) {
-        LOG(ERROR) << "Unable to resolve AWS credentials for Aurora DSQL authentication"
-                   << (profile.empty() ? "" : " with profile '" + profile + "'");
-    }
+    // Keep the provider, not a snapshot, so expiring SSO and assume-role credentials refresh on their own. It is
+    // read once per connect, not here: the failure is reported by the connect.
     SetUpDsqlClient(region);
 }
 
 DsqlAuthProvider::DsqlAuthProvider(const std::string &region, const Aws::Auth::AWSCredentials& credentials) {
     AwsSdkHelper::Init();
-    credentials_provider_ = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials);
+    source_ = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials);
+    SetUpDsqlClient(region);
+}
+
+DsqlAuthProvider::DsqlAuthProvider(const std::string &region, std::shared_ptr<Aws::Auth::AWSCredentialsProvider> source) {
+    AwsSdkHelper::Init();
+    source_ = std::move(source);
     SetUpDsqlClient(region);
 }
 
@@ -82,7 +189,9 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
 {
     // Check before signing, so an unusable token is never sent. Credentials can disappear or expire after
     // construction, for example when an SSO session ends.
-    if (const std::string_view problem = CredentialsProblem(credentials_provider_->GetAWSCredentials()); !problem.empty()) {
+    // The credentials the connect's check read, else one read here. Either way this is the connect's only read.
+    const Aws::Auth::AWSCredentials credentials = TakeCheckedCredentials();
+    if (const std::string_view problem = CredentialsProblem(credentials); !problem.empty()) {
         LOG(ERROR) << problem;
         return {"", false};
     }
@@ -100,15 +209,32 @@ std::pair<std::string, bool> DsqlAuthProvider::GetToken(
     // without custom memory management. Not .c_str(): clang-tidy flags it as redundant even where that build needs it.
     const Aws::String aws_host(host.data(), host.size());
     const Aws::String aws_region(region.data(), region.size());
-    const auto outcome = is_admin
+    // The presigner reads its provider, so give it the credentials checked above and take them back after.
+    std::unique_lock sign_lock(sign_mutex_);
+    signing_->Set(credentials);
+    auto outcome = is_admin
         ? dsql_client_->GenerateDBConnectAdminAuthToken(aws_host, aws_region, lifetime.count())
         : dsql_client_->GenerateDBConnectAuthToken(aws_host, aws_region, lifetime.count());
+    signing_->Set(Aws::Auth::AWSCredentials{});
+    // Nothing is logged under the lock: ng-log takes its own mutex, and a log sink may take another under that one.
+    sign_lock.unlock();
     if (!outcome.IsSuccess()) {
         LOG(ERROR) << "Failed to generate an Aurora DSQL token: " << outcome.GetError().GetMessage();
         return {"", false};
     }
-    const std::string aws_token(outcome.GetResult().data(), outcome.GetResult().size());
-    const std::string token = extra_url_encode ? ExtraUrlEncodeString(aws_token) : aws_token;
+    // The SDK's result, its std::string copy and the token made from that are wiped on every return; the caller gets
+    // its own copy, in the returned pair. The SDK's internal copies aren't wiped.
+    Aws::String& sdk_token = outcome.GetResult();
+    const ScopedWipe wipe_sdk_token(sdk_token);
+    std::string aws_token(sdk_token.data(), sdk_token.size());
+    const ScopedWipe wipe_aws_token(aws_token);
+    std::string token;
+    const ScopedWipe wipe_token(token);  // reads the size when it wipes
+    if (extra_url_encode) {
+        ExtraUrlEncodeInto(aws_token, token);
+    } else {
+        token = aws_token;
+    }
     LOG(INFO) << "Generated new Aurora DSQL " << (is_admin ? "admin " : "") << "token length: " << token.length();
     return {token, false};
 }
@@ -127,11 +253,126 @@ Aws::Client::GenericClientConfiguration DsqlAuthProvider::MakeClientConfiguratio
 
 void DsqlAuthProvider::SetUpDsqlClient(const std::string &region)
 {
+    signing_ = std::make_shared<SnapshotCredentialsProvider>();
     dsql_client_ = std::make_shared<Aws::DSQL::DSQLClient>(
-        credentials_provider_, nullptr, MakeClientConfiguration(region));
+        signing_, nullptr, MakeClientConfiguration(region));
+}
+
+bool DsqlAuthProvider::ProfileExists(const std::string& profile)
+{
+    return FindProfile(profile, true) || FindProfile(profile, false);
+}
+
+std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::MakeProfileOnlyChain(
+    const std::string& profile, const std::string& region)
+{
+    return BuildProfileOnlyChain(profile, region, ProfileFiles::Find(profile));
+}
+
+std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::MakeLoginCrtProvider(
+    const std::string& profile, const std::string& region)
+{
+    // The login provider reads only the config file.
+    const ProfileFiles files{.config = FindProfile(profile, true), .credentials = std::nullopt};
+    return BuildLoginCrtProvider(profile, region, files);
+}
+
+std::shared_ptr<Aws::Auth::AWSCredentialsProviderChain> DsqlAuthProvider::BuildProfileOnlyChain(
+    const std::string& profile, const std::string& region, const ProfileFiles& files)
+{
+    Aws::Client::ClientConfiguration::CredentialProviderConfiguration config{};
+    config.profile = Aws::String(profile.data(), profile.size());
+    config.region = Aws::String(region.data(), region.size());  // STS region for web identity
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> web_identity;
+    // role_arn + web_identity_token_file without source_profile/credential_source: the CRT profile provider can't
+    // read it, and the SDK's web identity provider would read AWS_ROLE_ARN / AWS_WEB_IDENTITY_TOKEN_FILE instead.
+    for (const std::optional<Aws::Config::Profile>* file : {&files.config, &files.credentials}) {
+        const std::optional<Aws::Config::Profile>& p = *file;
+        if (p && !p->GetRoleArn().empty() && !p->GetValue("web_identity_token_file").empty()
+            && p->GetSourceProfile().empty() && p->GetValue("credential_source").empty()) {
+            config.stsCredentialsProviderConfig.roleArn = p->GetRoleArn();
+            config.stsCredentialsProviderConfig.tokenFilePath = p->GetValue("web_identity_token_file");
+            config.stsCredentialsProviderConfig.sessionName = p->GetValue("role_session_name");  // "" -> a UUID
+            if (!p->GetRegion().empty()) {
+                config.region = p->GetRegion();
+            }
+            // The SDK reads config in this constructor (CrtCredentialsProvider calls the factory there).
+            web_identity = std::make_shared<Aws::Auth::STSAssumeRoleWebIdentityCredentialsProvider>(config);
+            break;
+        }
+    }
+    // `aws login`. The SDK's LoginCredentialsProvider doesn't pass the profile on, so the CRT would read the session
+    // and endpoint settings of the profile the AWS_PROFILE variable names, or of [default]. The CRT provider is built
+    // here for this profile instead, and wrapped as the SDK wraps its own.
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> login;
+    if (std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> login_crt =
+            BuildLoginCrtProvider(profile, region, files)) {
+        // The SDK calls the factory once, in the constructor.
+        login = std::make_shared<Aws::Auth::CrtCredentialsProvider>(
+            [crt = std::move(login_crt)]() mutable { return std::move(crt); },
+            config.loginCredentialProviderConfig.retrieveCredentialsFutureTimeout,
+            Aws::Client::UserAgentFeature::CREDENTIALS_LOGIN, "LoginCredentialsProvider");
+    }
+    return std::make_shared<ProfileOnlyChain>(std::vector<std::shared_ptr<Aws::Auth::AWSCredentialsProvider>>{
+        // Access keys, role_arn with source_profile or credential_source (Ec2InstanceMetadata, EcsContainer,
+        // Environment: named in the profile, so allowed), credential_process.
+        std::make_shared<Aws::Auth::ProfileCredentialsProvider>(config),
+        web_identity,
+        std::make_shared<Aws::Auth::SSOCredentialsProvider>(config.profile),
+        login,
+    });
+}
+
+std::shared_ptr<Aws::Crt::Auth::ICredentialsProvider> DsqlAuthProvider::BuildLoginCrtProvider(
+    const std::string& profile, const std::string& region, const ProfileFiles& files)
+{
+    const Aws::Crt::Io::ClientBootstrap* bootstrap = Aws::GetDefaultClientBootstrap();
+    const Aws::Crt::Io::TlsConnectionOptions* tls = Aws::GetDefaultTlsConnectionOptions();
+    // With no profile name the CRT would pick one itself. When the default TLS context failed to build (no CA store),
+    // the default connection options are there but were never initialized, and their ctx is garbage or null: the
+    // connect fails with 28000 (no login provider) instead of crashing in the CRT.
+    if (profile.empty() || bootstrap == nullptr || !*bootstrap || tls == nullptr || !*tls) {
+        return nullptr;
+    }
+    // The CRT builds the sign-in endpoint from the region it is given, so one is always given: the profile's in the
+    // config file, which the CRT would pick, else the DSQL region.
+    const std::optional<Aws::Config::Profile>& config_profile = files.config;
+    const std::string login_region = config_profile && !config_profile->GetRegion().empty()
+        ? std::string(config_profile->GetRegion().data(), config_profile->GetRegion().size())
+        : region;
+    // The CRT copies these strings while it builds the provider. The login session comes from the profile.
+    aws_credentials_provider_login_options options{};
+    options.profile_name_override = aws_byte_cursor_from_array(profile.data(), profile.size());
+    options.login_region = aws_byte_cursor_from_array(login_region.data(), login_region.size());
+    options.bootstrap = bootstrap->GetUnderlyingHandle();
+    options.tls_ctx = tls->GetUnderlyingHandle()->ctx;
+    aws_credentials_provider* const provider = aws_credentials_provider_new_login(Aws::Crt::ApiAllocator(), &options);
+    if (provider == nullptr) {
+        return nullptr;
+    }
+    // Takes the reference and releases it when destroyed.
+    return std::make_shared<Aws::Crt::Auth::CredentialsProvider>(provider, Aws::Crt::ApiAllocator());
 }
 
 bool DsqlAuthProvider::HasResolvedCredentials() const
 {
-    return CredentialsProblem(credentials_provider_->GetAWSCredentials()).empty();
+    Aws::Auth::AWSCredentials credentials = source_->GetAWSCredentials();
+    const bool usable = CredentialsProblem(credentials).empty();
+    // Only a usable read is kept for the GetToken that follows; a failed check leaves nothing for the next token.
+    const std::lock_guard lock(pending_mutex_);
+    pending_ = usable ? std::optional(std::move(credentials)) : std::nullopt;
+    return usable;
+}
+
+Aws::Auth::AWSCredentials DsqlAuthProvider::TakeCheckedCredentials() const
+{
+    {
+        const std::lock_guard lock(pending_mutex_);
+        if (pending_) {
+            Aws::Auth::AWSCredentials credentials = std::move(*pending_);
+            pending_.reset();
+            return credentials;
+        }
+    }
+    return source_->GetAWSCredentials();
 }

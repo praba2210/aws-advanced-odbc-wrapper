@@ -62,6 +62,10 @@ public:
     // succeeded), now, or when the SQLCancel calls using them return. The caller holds dbc->lock. Returns the base
     // connection it took out.
     static SQLHDBC ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC *dbc, bool free_base_dbc);
+    // Frees the base descriptors of the connection's explicit descriptors now and nulls them; the DESCs stay the app's
+    // (AllocWrappedDesc gives one a new base descriptor). The caller holds dbc->lock and has ruled out a pinned
+    // statement (BaseHandleGuard::Busy).
+    static void FreeWrappedDescs(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC *dbc);
     // Gives an explicit descriptor a base descriptor on its connection's base connection, if it has none (releasing a
     // connection's base handles drops them).
     static RdsLibResult AllocWrappedDesc(const std::shared_ptr<RdsLibLoader>& lib_loader, DESC *desc);
@@ -103,6 +107,10 @@ public:
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc);
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc, std::string& out_message);
     virtual std::string GetStmtErrorMessage(SQLHSTMT stmt);
+    // The SQLSTATE of the base driver's first diagnostic record on a statement, or on a connection; "" when there is
+    // none.
+    virtual std::string GetStmtSqlState(SQLHSTMT stmt);
+    virtual std::string GetDbcSqlState(SQLHDBC dbc);
 
     void ConvertDriverOutputToTarget(const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;
     void ConvertDriverOutputToTarget(bool wrapper_call, const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;
@@ -139,6 +147,8 @@ public:
     static bool IsStringColAttribute(SQLUSMALLINT field_identifier);
 
 private:
+    [[nodiscard]] std::string GetSqlState(SQLSMALLINT handle_type, SQLHANDLE handle) const;
+
     std::shared_ptr<RdsLibLoader> lib_loader_;
     const ENV *env_ = nullptr;
     bool use_4_bytes_base_driver_ = false;

@@ -47,6 +47,7 @@
 #include "util/connection_string_helper.h"
 #include "util/connection_string_keys.h"
 #include "util/core_service.h"
+#include "util/driver_module.h"
 #include "util/dsql_connection_lifetime.h"
 #include "util/dsql_connection_validator.h"
 #include "util/logger_wrapper.h"
@@ -239,10 +240,14 @@ SQLRETURN RDS_AllocDbc(
 
     dbc = new DBC();
     dbc->env = env;
+    // The connection's base handles go before the base environment, also when a pinned SQLCancel frees them late.
+    dbc->base_handles.KeepAlive(env->base_env);
     *ConnectionHandlePointer = dbc;
 
     {
         const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
+        // A call on the environment: an earlier call's record (such as an environment commit's 25S03) goes.
+        ClearError(env);
         env->dbc_list.emplace_back(dbc);
     }
 
@@ -353,6 +358,8 @@ SQLRETURN RDS_SQLSetEnvAttr(
     SQLRETURN ret = SQL_SUCCESS;
 
     const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
+    // An earlier call's record (such as an environment commit's 25S03) goes, as on every call.
+    ClearError(env);
 
     // Track new value
     env->attr_map.insert_or_assign(Attribute, std::make_pair(ValuePtr, StringLength));
@@ -473,6 +480,14 @@ SQLRETURN RDS_SQLEndTran(
                 if (!HasWrappedHandle(dbc)) {
                     return SQL_INVALID_HANDLE;
                 }
+                // Aurora DSQL: a COMMIT of a transaction the server ended at a failed statement saves nothing, and
+                // psqlODBC reports it as a success.
+                if (CompletionType == SQL_COMMIT) {
+                    const std::optional<SQLRETURN> rolled_back = DsqlCompatibility::RollBackAbortedTransaction(dbc);
+                    if (rolled_back) {
+                        return *rolled_back;
+                    }
+                }
                 res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
                     HandleType, dbc->wrapped_dbc, CompletionType
                 );
@@ -480,6 +495,7 @@ SQLRETURN RDS_SQLEndTran(
                 if (SQL_SUCCEEDED(ret) && dbc) {
                     dbc->transaction_status = TRANSACTION_CLOSED;
                 }
+                dbc->dsql_statement_failed_in_transaction = false;  // either outcome ends the transaction
             }
             break;
         case SQL_HANDLE_ENV:
@@ -492,28 +508,48 @@ SQLRETURN RDS_SQLEndTran(
                 const std::lock_guard<std::recursive_mutex> lock_guard(env->lock);
                 ClearError(env);
 
+                // Each connection's transaction ends, also after one fails; the first error is the result. The
+                // Windows driver manager calls this form, as an app without one does; unixODBC and iODBC call the
+                // connection form for each connection.
                 for (DBC* dbc : env->dbc_list) {
-                    // TODO - May need enhanced error handling due to multiple DBCs
-                    //   Should error out on the first?
                     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
                     ClearError(dbc);
 
                     if (!HasWrappedHandle(dbc)) {
                         return SQL_INVALID_HANDLE;
                     }
-                    res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
-                        SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
-                    );
-                    ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
-                    if (SQL_SUCCEEDED(ret) && dbc) {
-                        dbc->transaction_status = TRANSACTION_CLOSED;
+                    std::optional<SQLRETURN> dbc_ret;
+                    if (CompletionType == SQL_COMMIT) {
+                        dbc_ret = DsqlCompatibility::RollBackAbortedTransaction(dbc);
+                    }
+                    // Aurora DSQL: a rolled-back transaction's 25S03 is the wrapper's record, so the environment
+                    // gets it too when it is the result.
+                    const bool rolled_back = dbc_ret.has_value();
+                    if (!dbc_ret) {
+                        res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader,
+                            RdsFuncNames::EndTran, SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
+                        );
+                        dbc_ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
+                        if (SQL_SUCCEEDED(*dbc_ret)) {
+                            dbc->transaction_status = TRANSACTION_CLOSED;
+                        }
+                    }
+                    dbc->dsql_statement_failed_in_transaction = false;
+                    if (!SQL_SUCCEEDED(*dbc_ret) && SQL_SUCCEEDED(ret)) {
+                        ret = *dbc_ret;
+                        if (rolled_back && dbc->err) {
+                            env->err = std::make_unique<ErrInfo>(*dbc->err);
+                        }
                     }
                 }
 
                 res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
                     HandleType, env->wrapped_env, CompletionType
                 );
-                ret = RDS_ProcessLibRes(HandleType, env, res);
+                const SQLRETURN env_ret = RDS_ProcessLibRes(HandleType, env, res);
+                if (SQL_SUCCEEDED(ret)) {
+                    ret = env_ret;
+                }
             }
             break;
         default:
@@ -656,17 +692,16 @@ SQLRETURN RDS_FreeEnv(
         RDS_FreeConnect(env->dbc_list.front());
     }
 
-    if (env->driver_lib_loader) {
-        // Clean underlying Env
-        if (env->wrapped_env) {
-            const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(env->driver_lib_loader, RdsFuncNames::FreeHandle,
-                SQL_HANDLE_ENV, env->wrapped_env
-            );
-            RDS_ProcessLibRes(SQL_HANDLE_ENV, env, res);
-            env->wrapped_env = nullptr;
-        }
-        env->driver_lib_loader = nullptr;
+    // The base environment goes with its last holder: now, or when an SQLCancel still in the base driver on one of these
+    // connections returns and their base handles are freed. Freed now, psqlODBC would destroy those handles with it.
+    if (env->driver_lib_loader && env->wrapped_env) {
+        env->base_env->lib_loader = env->driver_lib_loader;
+        env->base_env->logger = env->logger_wrapper;
+        env->base_env->handle = env->wrapped_env;
     }
+    env->wrapped_env = nullptr;
+    env->base_env = nullptr;
+    env->driver_lib_loader = nullptr;
 
     ClearError(env);
     if (env->counted_by_core_service) {
@@ -787,6 +822,10 @@ SQLRETURN RDS_SQLCancel(
             // With no call running the cancel has no effect, as ODBC 3 says; the handle itself is valid.
             return SQL_SUCCESS;
         }
+        // The base call can block while the app frees the statement, the connection and the environment, and the
+        // driver manager may unload this library meanwhile. This thread returns into it and runs the teardowns handed
+        // over.
+        DriverModule::Pin();
         res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLCancel>(env->driver_lib_loader, RdsFuncNames::Cancel,
             pinned.Handle()
         );
@@ -830,11 +869,12 @@ SQLRETURN RDS_GetConnectAttr(
 
     // Aurora DSQL has one isolation level, whatever psqlODBC would report.
     if (DsqlCompatibility::TryGetConnectAttr(dbc, Attribute, ValuePtr)) {
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;  // the wrapper answered: psqlODBC's records are older
         return SQL_SUCCESS;
     }
 
-    // An Aurora DSQL connection at its MAX_CONNECTION_LIFETIME reports itself dead, so a driver manager's pool
-    // replaces it. No round trip: the answer comes from the connection's age.
+    // When MAX_CONNECTION_LIFETIME is set, an Aurora DSQL connection at that age reports itself dead, so a driver
+    // manager's pool replaces it. No round trip: the answer comes from the connection's age.
     if (Attribute == SQL_ATTR_CONNECTION_DEAD && DsqlConnectionLifetime::IsRetired(dbc)) {
         if (ValuePtr != nullptr) {
             *static_cast<SQLUINTEGER*>(ValuePtr) = static_cast<SQLUINTEGER>(SQL_CD_TRUE);
@@ -842,6 +882,7 @@ SQLRETURN RDS_GetConnectAttr(
         if (StringLengthPtr != nullptr) {
             *StringLengthPtr = static_cast<SQLINTEGER>(sizeof(SQLUINTEGER));
         }
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;
         return SQL_SUCCESS;
     }
 
@@ -1016,6 +1057,7 @@ SQLRETURN RDS_SQLSetConnectAttr(
 #endif
         // The ANSI driver gets no wide text: iODBC converts a wide app's text to ANSI from the app's type whatever the
         // driver answers (conv_text_m2d, CD_W2A), so it takes any value.
+        dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;  // moot before connect
         return SQL_SUCCESS;
     }
 
@@ -1024,6 +1066,11 @@ SQLRETURN RDS_SQLSetConnectAttr(
 
     // Attributes that would make psqlODBC undo a forced option or send a statement Aurora DSQL rejects are answered here.
     if (const std::optional<SQLRETURN> dsql_ret = DsqlCompatibility::TrySetConnectAttr(dbc, Attribute, ValuePtr)) {
+        // The wrapper answered: its record, if any, is this call's, and psqlODBC's are older. Not for autocommit: that
+        // answer is the commit's own result, whose records (psqlODBC's included) are the ones to read.
+        if (Attribute != SQL_ATTR_AUTOCOMMIT) {
+            dbc->base_diag_stale = dbc->wrapped_dbc != nullptr;
+        }
         return *dsql_ret;
     }
 
@@ -1076,6 +1123,10 @@ SQLRETURN RDS_SQLSetConnectAttr(
         // Autocommit set on while already on changes nothing in psqlODBC, so a transaction opened with BEGIN stays open.
         if (!was_auto_commit || !dbc->auto_commit) {
             dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        }
+        // A switch ends the transaction. Only after the base call: a commit before it on Aurora DSQL reads the note.
+        if (SQL_SUCCEEDED(ret) && dbc->auto_commit != was_auto_commit) {
+            dbc->dsql_statement_failed_in_transaction = false;
         }
     }
 
@@ -1384,6 +1435,8 @@ SQLRETURN RDS_SQLConnect(
     // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
     // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
     dbc->conn_attr.clear();
+    // No Aurora DSQL answers until RDS_InitializeConnection decides for this connect.
+    dbc->is_dsql = false;
 
 #ifdef UNICODE
     bool use_4_bytes_user_app = dbc->env->use_4_bytes_user_app.load();
@@ -1426,15 +1479,17 @@ SQLRETURN RDS_SQLConnect(
         return SQL_ERROR;
     }
 
-    // Replace with input parameters
+    // Replace with input parameters. An empty user name or password isn't given: the DSN's UID and PWD stay.
     if (UserName) {
 #ifdef UNICODE
         current_utf8 = ConvertUserAppToUTF8(use_4_bytes_user_app, UserName, NameLength2);
 #else
         current_utf8 = AnsiAppText(UserName, NameLength2);
 #endif
-        dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, current_utf8);
-        conn_str_utf8 += "UID=" + current_utf8 + ";";
+        if (!current_utf8.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, current_utf8);
+            conn_str_utf8 += "UID=" + current_utf8 + ";";
+        }
     }
     if (Authentication) {
 #ifdef UNICODE
@@ -1442,8 +1497,10 @@ SQLRETURN RDS_SQLConnect(
 #else
         current_utf8 = AnsiAppText(Authentication, NameLength3);
 #endif
-        dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, current_utf8);
-        conn_str_utf8 += "PWD=" + current_utf8 + ";";
+        if (!current_utf8.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_DB_PASSWORD, current_utf8);
+            conn_str_utf8 += "PWD=" + current_utf8 + ";";
+        }
     }
 
     dbc->allow_interactive_auth = MapUtils::GetBooleanValue(dbc->conn_attr, KEY_SSO_ALLOW_INTERACTIVE, false);
@@ -1624,6 +1681,8 @@ SQLRETURN RDS_SQLDriverConnect(
     // A reused handle starts from this call's arguments: keys an earlier connect parsed, or plugins added (a token,
     // a failover host, a default user), don't carry over. SQLSetConnectAttr values are kept in attr_map.
     dbc->conn_attr.clear();
+    // No Aurora DSQL answers until RDS_InitializeConnection decides for this connect.
+    dbc->is_dsql = false;
 
     // Parse connection string, load input DSN followed by Base DSN
     ConnectionStringHelper::ParseConnectionString(conn_str_utf8, dbc->conn_attr);
@@ -3995,9 +4054,17 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         dbc->conn_attr.insert_or_assign(KEY_DRIVER, dbc->conn_attr.at(KEY_BASE_DRIVER));
     }
 
-    // An Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint before anything reads the host.
+    // Before anything reads the host, with RDS_AUTH_TYPE=DSQL: SERVERNAME is folded into SERVER (08001 when the two name
+    // different hosts), and an Aurora DSQL cluster ID in SERVER or IAM_HOST becomes the cluster endpoint.
     if (!DsqlAuthPlugin::ExpandClusterId(dbc)) {
         return SQL_ERROR;
+    }
+
+    // Decided once per connect, after the cluster ID is expanded: failover can rewrite conn_attr later.
+    dbc->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr);
+    dbc->dsql_tls_warning.clear();  // the SSLmode change of an earlier connect on the handle
+    if (dbc->is_dsql && dbc->dsql_lifetime == nullptr) {
+        dbc->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>();
     }
 
     const std::unordered_set<std::string> invalid_params = AttributeValidator::ValidateMap(dbc->conn_attr);

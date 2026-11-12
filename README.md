@@ -4,7 +4,7 @@
 
 The Amazon Web Services (AWS) Advanced ODBC Wrapper is complementary to existing ODBC drivers and aims to extend the functionality of these driver to enable applications to take full advantage of the features of clustered databases such as Amazon Aurora. In other words, the AWS Advanced ODBC Wrapper does not connect directly to any database, but enables support of AWS and Aurora functionalities on top of an underlying ODBC driver of the user's choice. This approach enables service-specific enhancements, without requiring users to change their workflow and existing ODBC driver tooling.
 
-The AWS Advanced ODBC Wrapper is targeted to work with any existing ODBC driver. Currently, the AWS Advanced ODBC Wrapper has been validated to support [psqlodbc, a PostgreSQL ODBC Driver](https://github.com/postgresql-interfaces/psqlodbc).
+The AWS Advanced ODBC Wrapper is targeted to work with any existing ODBC driver. Currently, the AWS Advanced ODBC Wrapper has been validated to support [psqlodbc, a PostgreSQL ODBC Driver](https://github.com/postgresql-interfaces/psqlodbc). It also supports [Amazon Aurora DSQL](./docs/using-the-aws-odbc-wrapper/SupportForAuroraDSQL.md) with psqlODBC.
 
 ## Benefits of the AWS Advanced ODBC Wrapper for All Aurora and RDS Database Services
 

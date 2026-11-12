@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 #include "../driver.h"
@@ -88,14 +89,15 @@ SQLRETURN DefaultPlugin::Connect(
         }
     }
 
-    // Keep psqlODBC from doing what Aurora DSQL can't handle. Does nothing on other connections.
-    DsqlCompatibility::PrepareConnect(dbc);
+    // Keep psqlODBC from doing what Aurora DSQL can't handle, and clear the connection's age, which counts from here.
+    // Does nothing on other connections.
+    const DsqlCompatibility::PreparedConnect dsql_connect = DsqlCompatibility::PrepareConnect(dbc);
 
     // DSN should be read from the original input
     // and a new connection string should be built without DSN & Driver
     // It holds the password or token in PWD, as do the converted copies below. This string, its UTF-16 copy and the
-    // wide copy of the 4-byte retry are wiped when they go; the converters' own temporary copies (the by-value
-    // argument, ICU's buffer, a vector they grow) are not.
+    // wide copy of the 4-byte retry are wiped when they go; the builder's std::ostringstream buffer and the converters'
+    // own temporary copies (the by-value argument, ICU's buffer, a vector they grow) are not.
     std::string conn_in = ConnectionStringHelper::BuildMinimumConnectionString(dbc->conn_attr);
     const ScopedWipe wipe_conn_in(conn_in);
     DLOG(INFO) << "Built minimum connection string for underlying driver: " << ConnectionStringHelper::MaskSensitiveInformation(conn_in);
@@ -203,12 +205,21 @@ SQLRETURN DefaultPlugin::Connect(
         }
     }
     dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+    dbc->dsql_statement_failed_in_transaction = false;  // a new connection has no transaction
 
     // TODO - Error Handling for ConnAttr, IsConnected
     // Successful Connection, but bad environment and/or connection attribute setting
     if (SQL_SUCCEEDED(ret)) {
         dbc->conn_status = CONN_CONNECTED;
+        DsqlCompatibility::ConnectSucceeded(dbc, dsql_connect.started_at);
         if (has_conn_attr_errors) {
+            ret = SQL_SUCCESS_WITH_INFO;
+        }
+        // Aurora DSQL with another auth type than DSQL: an SSLmode PrepareConnect replaced. The wrapper keeps one
+        // record per handle, so it is reported only when nothing else is, as DsqlAuthPlugin does.
+        if (ret == SQL_SUCCESS && !dsql_connect.tls_warning.empty()) {
+            ClearError(dbc);
+            dbc->err = std::make_unique<ErrInfo>(dsql_connect.tls_warning.c_str(), WARN_OPTION_VALUE_CHANGED);
             ret = SQL_SUCCESS_WITH_INFO;
         }
 
@@ -302,6 +313,8 @@ SQLRETURN DefaultPlugin::Execute(
         res = this->odbc_helper_->ExecDirect(&wrapped_stmt, query);
     }
     stmt->cancel.LeaveBaseDriver();
+    // Aurora DSQL: a statement that failed in a transaction is checked for before the commit.
+    DsqlCompatibility::NoteStatementResult(dbc, res.fn_result);
 
     // Supports checking for transaction changes only if it was a direct execute
     if (SQL_SUCCEEDED(res.fn_result) && !query.empty()) {
@@ -311,6 +324,7 @@ SQLRETURN DefaultPlugin::Execute(
             || SqlQueryAnalyzer::DoesSwitchAutoCommitFalseTrue(dbc, query)
         ) {
             dbc->transaction_status = TRANSACTION_CLOSED;
+            dbc->dsql_statement_failed_in_transaction = false;
         }
 
         if (SqlQueryAnalyzer::IsStatementSettingAutoCommit(query)) {

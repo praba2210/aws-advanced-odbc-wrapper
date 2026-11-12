@@ -19,6 +19,7 @@
 
 #include "../../driver.h"
 #include "../../odbcapi_rds_helper.h"
+#include "../../util/rds_lib_loader.h"
 #include "../../util/rds_strings.h"
 
 void DsqlPluginHelper::ReadFirstRecord(STMT* stmt, std::string& sql_state, std::string& message)
@@ -61,4 +62,25 @@ std::string DsqlPluginHelper::AsciiUpper(std::string text)
         }
     }
     return text;
+}
+
+std::optional<int> DsqlPluginHelper::BaseLibpqVersion([[maybe_unused]] const std::shared_ptr<RdsLibLoader>& loader)
+{
+    using PqLibVersionFn = int (*)();
+#ifdef _WIN32
+    HMODULE libpq = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"libpq.dll", &libpq)) {
+        return std::nullopt;
+    }
+    const auto function = reinterpret_cast<PqLibVersionFn>(GetProcAddress(libpq, "PQlibVersion"));
+#else
+    if (!loader) {
+        return std::nullopt;
+    }
+    const auto function = reinterpret_cast<PqLibVersionFn>(loader->GetFunction("PQlibVersion"));
+#endif
+    if (!function) {
+        return std::nullopt;
+    }
+    return function();
 }

@@ -302,11 +302,13 @@ namespace {
     };
 
     // One scripted result of the rest of the chain. code is the wrapper's error code, state the base driver's SQLSTATE.
+    // cancel: SQLCancel came before the base driver, which DefaultPlugin answers with RDS_StatementCanceled.
     struct Step {
         SQLRETURN ret;
         SQL_STATE_CODE code;
         std::string state;
         std::string message;
+        bool cancel = false;
     };
 
     Step Ok() { return {SQL_SUCCESS, ERR_GENERAL_ERROR, "", ""}; }
@@ -337,6 +339,9 @@ namespace {
             // Like psqlODBC, every execution starts with no record of its own.
             g_base_state.clear();
             g_base_message.clear();
+            if (step.cancel) {
+                return RDS_StatementCanceled(stmt);
+            }
             if (step.ret == SQL_ERROR) {
                 if (report_ == Report::BASE_RECORD) {
                     g_base_state = step.state;
@@ -389,6 +394,8 @@ protected:
         dbc_->plugin_service = plugin_service;
         dbc_->auto_commit = true;
         dbc_->transaction_status = TRANSACTION_CLOSED;
+        // RDS_InitializeConnection's answer: the plugins are only in the chain of an Aurora DSQL connect.
+        dbc_->is_dsql = true;
         stmt_ = new STMT();
         stmt_->dbc = dbc_;
         OdbcHelper::SetWrappedStmt(stmt_, static_cast<SQLHSTMT>(&base_stmt_stand_in_));
@@ -458,6 +465,9 @@ namespace {
     Step Fail(SQL_STATE_CODE code, const std::string& state, const std::string& message) {
         return {SQL_ERROR, code, state, message};
     }
+    // SQLCancel came after the retry's wait and before the base driver: the wrapper's HY008 (the step runs
+    // RDS_StatementCanceled).
+    Step CanceledBeforeTheBase() { return {SQL_ERROR, ERR_OPERATION_CANCELED, "HY008", "", true}; }
 
     // Collects log lines, so a test can count what the plugin logged.
     class OccLogSink : public nglog::LogSink {
@@ -609,6 +619,46 @@ TEST(DsqlOccRetryStatementTest, TransactionChange_None) {
          }) {
         EXPECT_EQ(Change::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement)) << statement;
     }
+}
+
+// Each ';' is followed by "/*" within five words and the comment never closes, so every start would scan to the end of
+// the text. The scan has a budget and gives up with OPENS, the direction that doesn't retry.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_ManySemicolonsWithUnclosedComments_IsLinear) {
+    constexpr int REPETITIONS = 20000;
+    // The quadratic version took about 7.8 s in Release and sanitizer builds are much slower, so 1 s still catches it.
+    constexpr auto TIME_LIMIT = std::chrono::seconds(1);
+    std::string statement = "x";
+    for (int i = 0; i < REPETITIONS; ++i) {
+        statement += "; ls /*";
+    }
+    const auto begin = std::chrono::steady_clock::now();
+    const auto change = DsqlOccRetryPlugin::GetTransactionChange(statement);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::OPENS, change);
+    EXPECT_LT(elapsed, TIME_LIMIT);
+}
+
+// Commented-out SQL before a statement: each ';' in a -- line starts a read that runs over the lines after it, which
+// adds up to many times the text. Under the scan's floor that is still read through, so no transaction is found where
+// there is none.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_CommentedOutStatementsBeforeAStatement_None) {
+    constexpr int COMMENT_LINES = 50;
+    std::string statement;
+    for (int i = 0; i < COMMENT_LINES; ++i) {
+        statement += "-- UPDATE t SET v = " + std::to_string(i) + ";\n";
+    }
+    statement += "UPDATE t SET v = 1";
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement));
+}
+
+// A long batch of ordinary statements reads each one once: no transaction.
+TEST(DsqlOccRetryTransactionChangeTest, GetTransactionChange_LongBatch_None) {
+    constexpr int STATEMENTS = 20000;
+    std::string statement;
+    for (int i = 0; i < STATEMENTS; ++i) {
+        statement += "SELECT 1;";
+    }
+    EXPECT_EQ(DsqlOccRetryPlugin::TransactionChange::NONE, DsqlOccRetryPlugin::GetTransactionChange(statement));
 }
 
 TEST(DsqlOccRetryBackoffTest, DoublesFromTheBaseUpToTheCap) {
@@ -909,7 +959,7 @@ TEST_F(DsqlOccRetryExecuteTest, ZeroMaxRetries_RunsOnce) {
     EXPECT_EQ(0, g_get_stmt_attr_calls);
 }
 
-// An SQLCancel during a retry's wait ends the call: no other attempt, and HY008 ahead of the conflict's record.
+// An SQLCancel during a retry's wait ends the call: no other attempt, and HY008 replaces the conflict's record.
 TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnotherAttempt) {
     const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
     canceled_during_wait_ = true;
@@ -918,6 +968,31 @@ TEST_F(DsqlOccRetryExecuteTest, CanceledDuringTheWait_ReturnsHY008WithoutAnother
     EXPECT_EQ((std::vector<int64_t>{100}), sleeps_ms_);
     ASSERT_NE(nullptr, stmt_->err);
     EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+    // The conflict's 40001 isn't kept behind it.
+    SQLTCHAR state[MAX_SQL_STATE_LEN * 2] = {0};
+    SQLTCHAR message[MAX_MSG_LEN] = {0};
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT length = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 1, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+    EXPECT_EQ("HY008", ToUtf8(state));
+    EXPECT_EQ(SQL_NO_DATA, RDS_SQLGetDiagRec(SQL_HANDLE_STMT, stmt_, 2, state, &native_error, message, MAX_MSG_LEN,
+                                             &length, false));
+}
+
+// A cancel after the wait and before the base driver: the first attempt ran, the retry didn't, and the message says so.
+TEST_F(DsqlOccRetryExecuteTest, CanceledAfterTheWait_SaysWhichRetryDidntRun) {
+    const auto chain =
+        std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), CanceledBeforeTheBase(), Ok()});
+    OccLogSink sink;
+    nglog::AddLogSink(&sink);
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(2U, chain->calls);
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("HY008", std::string(stmt_->err->sqlstate));
+    EXPECT_EQ("Operation canceled: SQLCancel was called before OCC retry 1 ran", std::string(stmt_->err->error_msg));
+    EXPECT_EQ(1, sink.Count("[DSQL] OCC retry 1 canceled before it ran"));
 }
 
 // The plugin's own wait is the statement's CancelState::WaitFor: a canceled call doesn't wait out the delay.
@@ -1324,6 +1399,26 @@ TEST_F(DsqlOccRetryExecuteTest, EndTran_EndsATrackedTransaction) {
     EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_DBC, dbc_, SQL_COMMIT));
     EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
     EXPECT_EQ(2U, AttemptsForAConflict());
+}
+
+// A handle whose first connect was Aurora DSQL keeps this plugin in its chain. Reconnected to another engine, the
+// plugin passes each call straight through: that engine's serialization failure isn't retried, and no transaction text
+// is followed.
+TEST_F(DsqlOccRetryExecuteTest, ReconnectedToAnotherEngine_PassesStraightThrough) {
+    ASSERT_EQ(2U, AttemptsForAConflict());
+    const size_t waits = sleeps_ms_.size();
+    // RDS_InitializeConnection's answer for the reconnect.
+    dbc_->is_dsql = false;
+
+    const auto chain = std::make_shared<ScriptedPlugin>(std::vector<Step>{Occ(OC000_MESSAGE), Ok()});
+    EXPECT_EQ(SQL_ERROR, Run(chain, UPDATE_STATEMENT));
+    EXPECT_EQ(1U, chain->calls);
+    EXPECT_EQ(waits, sleeps_ms_.size());
+    ASSERT_NE(nullptr, stmt_->err);
+    EXPECT_EQ("40001", stmt_->err->sqlstate);
+
+    EXPECT_EQ(SQL_SUCCESS, RunPrepared(std::make_shared<ScriptedPlugin>(std::vector<Step>{Ok()}), "BEGIN"));
+    EXPECT_EQ(TRANSACTION_CLOSED, dbc_->transaction_status);
 }
 
 // What the OCC retry and error hint plugins share, over the fake base driver.

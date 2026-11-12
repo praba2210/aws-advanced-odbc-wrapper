@@ -24,11 +24,22 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include "../../driver.h"
 #include "../../error.h"
-#include "../../util/dsql_connection_validator.h"
+#include "../../odbcapi.h"
+#include "../../odbcapi_rds_helper.h"
+#include "../../util/auth_provider.h"
+#include "../../util/connection_string_keys.h"
+#include "../../util/dsql_connection_lifetime.h"
 #include "../../util/logger_wrapper.h"
+#include "../../util/map_utils.h"
+#include "../../util/odbc_helper.h"
+#include "../../util/plugin_service.h"
+#include "../../util/rds_lib_loader.h"
+#include "dsql_auth_plugin.h"
+#include "dsql_plugin_helper.h"
 
 namespace {
     // A psqlODBC option the wrapper sets on every Aurora DSQL connection. key and short_key are psqlODBC's keywords,
@@ -80,6 +91,17 @@ namespace {
             .value = "0",
             .reason = "freeing a prepared statement inside a transaction can silently roll the transaction back on "
                       "Aurora DSQL",
+        },
+        // psqlODBC's keyset-driven and updatable cursors add ctid to the select list (and keyset-driven ones refetch
+        // by ctid). Aurora DSQL returns no system columns, so each such SELECT fails, and in a transaction that aborts
+        // it. Off, psqlODBC makes them static and read-only (01S02) and refuses positioned updates.
+        ForcedOption{
+            .name = "UpdatableCursors",
+            .key = "UPDATABLECURSORS",
+            .short_key = "C4",
+            .value = "0",
+            .reason = "Aurora DSQL doesn't return system columns such as ctid, which psqlODBC's keyset-driven and "
+                      "updatable cursors use",
         },
     };
 
@@ -218,11 +240,27 @@ namespace {
             }
         }
     }
+
+    const std::string TRANSACTION_ROLLED_BACK =
+        "The transaction was rolled back, not committed: a statement in it failed, and Aurora DSQL ends a transaction "
+        "at its first error (it has no savepoints). Roll back after an error, and run the whole transaction again.";
+
+    // What every statement fails with in a transaction the server has ended.
+    constexpr std::string_view IN_FAILED_TRANSACTION = "25P02";
+
+    // The end of the warning when the check can't tell: the commit goes ahead, as psqlODBC would make it.
+    constexpr std::string_view COMMITTING_UNCHECKED =
+        ": committing. If Aurora DSQL ended the transaction, the commit saves nothing.";
+
+    std::string StateForLog(const std::string& state)
+    {
+        return state.empty() ? "no SQLSTATE" : state;
+    }
 }  // namespace
 
 bool DsqlCompatibility::IsDsql(const DBC* dbc)
 {
-    return dbc != nullptr && DsqlConnectionValidator::IsDsqlTarget(dbc->conn_attr);
+    return dbc != nullptr && dbc->is_dsql;
 }
 
 void DsqlCompatibility::ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr)
@@ -232,12 +270,29 @@ void DsqlCompatibility::ApplyBaseDriverOptions(std::map<std::string, std::string
     }
 }
 
-void DsqlCompatibility::PrepareConnect(DBC* dbc)
+DsqlCompatibility::PreparedConnect DsqlCompatibility::PrepareConnect(DBC* dbc)
 {
     if (!IsDsql(dbc)) {
-        return;
+        return {};
     }
     ApplyBaseDriverOptions(dbc->conn_attr);
+    PreparedConnect prepared;
+
+    // RDS_AUTH_TYPE=DSQL applied its own, stricter defaults in DsqlAuthPlugin. With another auth type (a token in PWD,
+    // a secret) a mode psqlODBC runs works today and is left as set. One it would run as disable, which Aurora DSQL
+    // refuses, gets TLS. Either way the connect gets the database default, without which it can't work.
+    const bool other_auth =
+        AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL;
+    if (other_auth) {
+        if (DsqlAuthPlugin::SslModeRunsAsDisable(dbc->conn_attr)) {
+            dbc->dsql_tls_warning = DsqlAuthPlugin::ApplyTlsDefaults(dbc->conn_attr,
+                DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, DsqlAuthPlugin::DefaultRootCert(
+                    DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
+        }
+        DsqlAuthPlugin::ApplyDatabaseDefault(dbc->conn_attr);
+        // A retry within this connect finds the mode raised already, and reports the first try's change.
+        prepared.tls_warning = dbc->dsql_tls_warning;
+    }
 
     // A level set before connect waits in attr_map; DefaultPlugin::Connect would replay it after psqlODBC connects,
     // and psqlODBC would send SET SESSION CHARACTERISTICS.
@@ -260,6 +315,33 @@ void DsqlCompatibility::PrepareConnect(DBC* dbc)
             dbc->attr_map.erase(it);
         }
     }
+
+    // The age counts from before the base connect, so it is never less than the server's; a failed connect leaves
+    // none.
+    const std::shared_ptr<DsqlConnectionLifetime> lifetime = dbc->dsql_lifetime;
+    if (lifetime == nullptr) {
+        return prepared;
+    }
+    lifetime->Clear();
+    prepared.started_at = lifetime->Now();
+    return prepared;
+}
+
+void DsqlCompatibility::ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at)
+{
+    if (dbc == nullptr) {
+        return;
+    }
+    // This connect has reported its SSLmode change: a later base connect on the connection (a failover reconnect)
+    // reports none.
+    dbc->dsql_tls_warning.clear();
+    if (!started_at.has_value() || dbc->dsql_lifetime == nullptr) {
+        return;
+    }
+    // RDS_InitializeConnection has checked the value, which is read again on every connect.
+    std::string unused_error;
+    dbc->dsql_lifetime->Start(started_at.value(), DsqlConnectionLifetime::ParseMaxLifetime(dbc->conn_attr, unused_error)
+                                                      .value_or(DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME));
 }
 
 std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value)
@@ -285,6 +367,20 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetConnectAttr(DBC* dbc, SQLINTEG
                 return SetIsolation(dbc, value);
             }
             return std::nullopt;
+        case SQL_ATTR_AUTOCOMMIT:
+            // Switching autocommit inside a transaction commits it, and psqlODBC drops that COMMIT's result
+            // (CC_set_autocommit), while Aurora DSQL reports OCC conflicts at COMMIT. So commit through SQLEndTran
+            // first, which also rolls back a failed transaction (25S03), and on an error leave autocommit as it is.
+            // SQLEndTran takes only the connection's lock, which is recursive and held here.
+            if (const SQLULEN mode = IntegerValue(value);
+                (mode == SQL_AUTOCOMMIT_ON || mode == SQL_AUTOCOMMIT_OFF)
+                && (mode == SQL_AUTOCOMMIT_ON) != dbc->auto_commit && IsDsql(dbc) && HasWrappedHandle(dbc)
+                && dbc->conn_status == CONN_CONNECTED) {
+                if (const SQLRETURN commit = RDS_SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT); !SQL_SUCCEEDED(commit)) {
+                    return commit;
+                }
+            }
+            return std::nullopt;
         default:
             return std::nullopt;
     }
@@ -296,10 +392,7 @@ std::optional<SQLRETURN> DsqlCompatibility::TrySetStmtAttr(STMT* stmt, SQLINTEGE
     if (attribute != SQL_ATTR_QUERY_TIMEOUT || timeout == 0) {
         return std::nullopt;
     }
-    // The caller holds only the statement's lock, and failover rewrites SERVER and PORT in conn_attr from another
-    // thread's statement. Only a connection whose first connect built the Aurora DSQL chain has a lifetime, set once
-    // then, and that chain never has failover; on any other connection conn_attr isn't read.
-    if (const DBC* dbc = stmt->dbc; dbc == nullptr || dbc->dsql_lifetime == nullptr || !IsDsql(dbc)) {
+    if (!IsDsql(stmt->dbc)) {
         return std::nullopt;
     }
     return QueryTimeoutChanged(stmt->err, timeout);
@@ -326,6 +419,7 @@ bool DsqlCompatibility::TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER 
         return false;
     }
     ClearError(dbc);
+    dbc->base_diag_stale = true;  // the wrapper answers: psqlODBC's records are older (HasWrappedHandle was checked)
     // SQL_TXN_ISOLATION_OPTION is a bitmask of the supported levels; Aurora DSQL has one.
     if (value != nullptr) {
         *static_cast<SQLUINTEGER*>(value) = DSQL_ISOLATION;
@@ -334,4 +428,50 @@ bool DsqlCompatibility::TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER 
         *length = static_cast<SQLSMALLINT>(sizeof(SQLUINTEGER));
     }
     return true;
+}
+
+// SQL_SUCCESS_WITH_INFO too: psqlODBC can report failed rows of a parameter array that way.
+void DsqlCompatibility::NoteStatementResult(DBC* dbc, SQLRETURN ret)
+{
+    if ((ret == SQL_ERROR || ret == SQL_SUCCESS_WITH_INFO) && IsDsql(dbc)
+        && (!dbc->auto_commit || dbc->transaction_status == TRANSACTION_OPEN)) {
+        dbc->dsql_statement_failed_in_transaction = true;
+    }
+}
+
+std::optional<SQLRETURN> DsqlCompatibility::RollBackAbortedTransaction(DBC* dbc)
+{
+    if (!IsDsql(dbc) || !HasWrappedHandle(dbc) || !dbc->dsql_statement_failed_in_transaction.exchange(false)) {
+        return std::nullopt;
+    }
+    const std::shared_ptr<OdbcHelper> helper = dbc->plugin_service->GetOdbcHelper();
+    SQLHSTMT probe = SQL_NULL_HSTMT;
+    if (!SQL_SUCCEEDED(helper->BaseAllocStmt(&dbc->wrapped_dbc, &probe).fn_result) || probe == SQL_NULL_HSTMT) {
+        // psqlODBC reports a failed allocation on the connection.
+        LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit couldn't "
+                     << "allocate a statement (" << StateForLog(helper->GetDbcSqlState(dbc->wrapped_dbc)) << ")"
+                     << COMMITTING_UNCHECKED;
+        return std::nullopt;
+    }
+    // In a transaction Aurora DSQL has ended, every statement fails with 25P02.
+    const bool alive = SQL_SUCCEEDED(helper->ExecDirect(&probe, "SELECT 1").fn_result);
+    const std::string state = alive ? "" : helper->GetStmtSqlState(probe);
+    helper->BaseFreeStmt(&probe);
+    if (alive) {
+        return std::nullopt;
+    }
+    if (state != IN_FAILED_TRANSACTION) {
+        // Any other failure doesn't show that the transaction ended.
+        LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit got "
+                     << StateForLog(state) << ", not " << IN_FAILED_TRANSACTION << COMMITTING_UNCHECKED;
+        return std::nullopt;
+    }
+    // psqlODBC's SQLEndTran rolls back in manual-commit mode and after a BEGIN sent as SQL text, which it marks as a
+    // manual transaction.
+    RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(dbc->env->driver_lib_loader, RdsFuncNames::EndTran,
+        SQL_HANDLE_DBC, dbc->wrapped_dbc, SQL_ROLLBACK);
+    dbc->transaction_status = TRANSACTION_CLOSED;
+    LOG(WARNING) << "[DSQL] " << TRANSACTION_ROLLED_BACK << " (the check before the commit got " << state << ")";
+    dbc->err = std::make_unique<ErrInfo>(TRANSACTION_ROLLED_BACK.c_str(), ERR_TRANSACTION_IS_ROLLED_BACK);  // 25S03
+    return SQL_ERROR;
 }

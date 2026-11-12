@@ -98,6 +98,21 @@ enum CONN_STATUS : std::uint8_t { CONN_NOT_CONNECTED, CONN_CONNECTED, CONN_DOWN,
 enum TRANSACTION_STATUS : std::uint8_t { TRANSACTION_CLOSED, TRANSACTION_OPEN, TRANSACTION_ERROR };
 
 /* Structures */
+// The base driver's environment, freed by the last of its holders: the ENV, and the base handle guard of each of its
+// connections (BaseHandleGuard::KeepAlive), which lives as long as an SQLCancel pinned in the base driver. psqlODBC
+// frees every connection and statement left in an environment with it, so the base handles that such a cancel's
+// teardowns free must go first. RDS_FreeEnv hands it the handle.
+struct BaseEnv {
+    std::shared_ptr<LoggerWrapper> logger;  // logging stays up for the late teardowns and this free
+    std::shared_ptr<RdsLibLoader> lib_loader;
+    SQLHENV handle = SQL_NULL_HENV;
+
+    BaseEnv() = default;
+    BaseEnv(const BaseEnv&) = delete;
+    BaseEnv& operator=(const BaseEnv&) = delete;
+    ~BaseEnv();
+};  // BaseEnv
+
 struct ENV {
     std::recursive_mutex lock;
     std::list<DBC*> dbc_list;
@@ -110,6 +125,7 @@ struct ENV {
     bool counted_by_core_service = false;
 
     SQLHENV wrapped_env = SQL_NULL_HENV;
+    std::shared_ptr<BaseEnv> base_env = std::make_shared<BaseEnv>();
     // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can
     // be cleared without the handle's lock (a statement's or descriptor's SQLAllocHandle clears the connection's).
     std::atomic<bool> base_diag_stale = false;
@@ -150,9 +166,25 @@ struct DBC {
     bool connect_through_unix_odbc = false;
     BasePlugin* plugin_head = nullptr;
     std::shared_ptr<PluginService> plugin_service;
-    // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD and the
-    // 60-minute hint read. The Aurora DSQL error hint plugin creates it; null on other connections.
+    // Whether this connect is Aurora DSQL, decided in RDS_InitializeConnection; every DSQL check after that reads it,
+    // not conn_attr. Atomic: SQLSetStmtAttr (DsqlCompatibility::TrySetStmtAttr) and SQLParamData
+    // (DsqlCompatibility::NoteStatementResult) read it holding only the statement's lock. SQLExecute and SQLExecDirect
+    // take the connection's lock first, so DefaultPlugin::Execute and the Aurora DSQL plugins' Execute hold both.
+    std::atomic<bool> is_dsql = false;
+    // Aurora DSQL: a statement call failed or warned since the transaction began, so the server may have ended it.
+    // SQLEndTran(SQL_COMMIT) checks before committing (DsqlCompatibility::RollBackAbortedTransaction). Atomic:
+    // SQLParamData sets it holding only the statement's lock.
+    std::atomic<bool> dsql_statement_failed_in_transaction = false;
+    // The age of an Aurora DSQL connection and its MAX_CONNECTION_LIFETIME: created by RDS_InitializeConnection for an
+    // Aurora DSQL connect, started by each successful base connect (DefaultPlugin), read by SQL_ATTR_CONNECTION_DEAD
+    // and the 60-minute hint.
     std::shared_ptr<DsqlConnectionLifetime> dsql_lifetime;
+    // Aurora DSQL with an auth type other than DSQL: the 01S02 text for the SSLmode this connect replaced
+    // (DsqlCompatibility::PrepareConnect). A retry of the base connect within the connect (Secrets Manager's, after a
+    // cached secret fails) prepares the first try's output again, which replaces nothing, and reports this text.
+    // RDS_InitializeConnection clears it for each connect, and DsqlCompatibility::ConnectSucceeded once the base driver
+    // has connected, so a later reconnect (failover) reports nothing.
+    std::string dsql_tls_warning;
     std::unique_ptr<ErrInfo> err;
     char sql_error_called = 0;
     // The wrapper answered the last call itself: the base driver's diagnostics are an earlier call's. Atomic: it can

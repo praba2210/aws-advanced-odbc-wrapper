@@ -43,6 +43,10 @@ namespace {
 
     // The most words a transaction-control statement has: COMMIT TRANSACTION AND NO CHAIN.
     constexpr size_t MAX_CONTROL_WORDS = 5;
+    // How many times the text size GetTransactionChange may read across all of its starts, but never less than 1 MiB:
+    // in commented-out SQL (a -- line per statement, each with its ';') every ';' reads all the lines after it again.
+    constexpr size_t SCAN_BUDGET_FACTOR = 4;
+    constexpr size_t SCAN_BUDGET_FLOOR = size_t{1} << 20U;
 
     // What may follow the last statement of a text.
     constexpr std::string_view TRAILING_CHARACTERS = " \t\n\v\f\r;";
@@ -266,7 +270,8 @@ SQLRETURN DsqlOccRetryPlugin::Execute(
 {
     STMT* stmt = static_cast<STMT*>(StatementHandle);
     // With autocommit off nothing is retried, and the transaction state is DefaultPlugin's and SQLEndTran's to follow.
-    if (stmt == nullptr || stmt->dbc == nullptr || !stmt->dbc->auto_commit) {
+    // Likewise on a handle reconnected to another engine: its chain keeps this plugin from its Aurora DSQL connect.
+    if (stmt == nullptr || stmt->dbc == nullptr || !stmt->dbc->auto_commit || !stmt->dbc->is_dsql) {
         return ExecuteNext(StatementHandle, StatementText, TextLength);
     }
     DBC* dbc = stmt->dbc;
@@ -331,7 +336,7 @@ SQLRETURN DsqlOccRetryPlugin::RetryOccConflicts(STMT* stmt, SQLTCHAR* statement_
         LOG(INFO) << "[DSQL] OCC conflict (" << DescribeConflict(sql_state, message) << "): retry " << retry << "/"
                   << config_.max_retries << " in " << delay.count() << " ms";
         if (sleep_(stmt->cancel, delay)) {
-            // No attempt after it: HY008, ahead of the conflict's record.
+            // No attempt after it: HY008 replaces the conflict's record (the wrapper keeps one record per handle).
             LOG(INFO) << "[DSQL] OCC retry " << retry << " canceled during its wait";
             ClearError(stmt);
             stmt->err = std::make_unique<ErrInfo>("Operation canceled: SQLCancel was called while an OCC retry waited",
@@ -342,6 +347,16 @@ SQLRETURN DsqlOccRetryPlugin::RetryOccConflicts(STMT* stmt, SQLTCHAR* statement_
         const std::chrono::steady_clock::time_point attempt_started_at = clock_();
         ret = ExecuteNext(stmt, statement_text, text_length);
         last_attempt = clock_() - attempt_started_at;
+        // SQLCancel came after the wait and before the base driver (DefaultPlugin's EnterBaseDriver): the wrapper's
+        // HY008 says the statement never ran. The first attempt did; say which one didn't. stmt->err holds only the
+        // wrapper's records, so a server-side cancel (psqlODBC's 57014) or an HY008 from psqlODBC isn't taken for it.
+        if (ret == SQL_ERROR && stmt->err != nullptr && stmt->err->sqlstate == "HY008") {
+            LOG(INFO) << "[DSQL] OCC retry " << retry << " canceled before it ran";
+            stmt->err = std::make_unique<ErrInfo>(
+                "Operation canceled: SQLCancel was called before OCC retry " + std::to_string(retry) + " ran",
+                ERR_OPERATION_CANCELED);
+            return SQL_ERROR;
+        }
         if (ret != SQL_ERROR) {
             return ret;
         }
@@ -369,10 +384,17 @@ DsqlOccRetryPlugin::TransactionChange DsqlOccRetryPlugin::GetTransactionChange(c
 {
     // Every statement of a batch starts at the beginning of the text or right after a ';'. Looking after every ';',
     // even one inside a literal or a comment, sees every real statement; the extra places can only find a transaction
-    // that isn't there.
+    // that isn't there. A comment that never closes makes each read run to the end of the text, so the characters
+    // read across all starts are budgeted; past it the answer is OPENS, the direction that doesn't retry.
+    const size_t budget = std::max(SCAN_BUDGET_FACTOR * statement.size(), SCAN_BUDGET_FLOOR);
+    size_t scanned = 0;
     for (size_t start = 0; start != std::string::npos;) {
         size_t end = 0;
         if (OpensTransaction(ReadWords(statement, start, end))) {
+            return TransactionChange::OPENS;
+        }
+        scanned += end - start;
+        if (scanned > budget) {
             return TransactionChange::OPENS;
         }
         const size_t semicolon = statement.find(';', start);

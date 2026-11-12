@@ -13,10 +13,13 @@
 // limitations under the License.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +34,8 @@
 #include "../../driver/plugin/base_plugin.h"
 #include "../../driver/plugin/default_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_connection_lifetime.h"
+#include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_lib_loader.h"
 #include "../../driver/util/rds_strings.h"
@@ -69,10 +74,16 @@ namespace {
     int connect_calls = 0;
     // The first SQLDriverConnect fails, as with a base driver built with a 4-byte SQLWCHAR that got 2-byte text.
     bool fail_first_connect = false;
+    // Every SQLDriverConnect fails.
+    bool fail_connects = false;
+    // Runs inside each SQLDriverConnect, for example to move a clock while the connect takes time.
+    std::function<void()> during_connect;
     // The base driver is psqlODBC's Unicode driver, whose SQLDriverConnectW converts through a buffer of its own.
     bool unicode_base_driver = false;
     // The base driver is psqlODBC 17.00.0005 or later, which builds only what fits the buffer length (790a1f0).
     bool cuts_to_buffer_length = false;
+    // What each SQLExecDirect returns.
+    SQLRETURN exec_direct_result = SQL_SUCCESS;
     int fake_wrapped_dbc = 0;
 
     SQLRETURN FakeAllocHandle(SQLSMALLINT /*handle_type*/, SQLHANDLE /*input_handle*/, SQLHANDLE* output_handle) {
@@ -91,7 +102,10 @@ namespace {
                                 SQLSMALLINT buffer_length, SQLSMALLINT* string_length_2_ptr,
                                 SQLUSMALLINT /*driver_completion*/) {
         ++connect_calls;
-        if (fail_first_connect && connect_calls == 1) {
+        if (during_connect) {
+            during_connect();
+        }
+        if (fail_connects || (fail_first_connect && connect_calls == 1)) {
             return SQL_ERROR;
         }
         std::string text;
@@ -126,6 +140,10 @@ namespace {
         return base_call.truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
     }
 
+    SQLRETURN FakeExecDirect(SQLHSTMT /*statement_handle*/, SQLTCHAR* /*statement_text*/, SQLINTEGER /*text_length*/) {
+        return exec_direct_result;
+    }
+
 #ifdef UNICODE
     // A base driver built with a 4-byte SQLWCHAR: its SQLSTATE runs past the first MAX_SQL_STATE_LEN 2-byte
     // characters, which is how DefaultPlugin tells it to connect again with 4-byte text.
@@ -137,8 +155,8 @@ namespace {
     }
 #endif
 
-    // The base driver: answers SQLAllocHandle and SQLDriverConnect (and SQLGetDiagRecW). Nothing is at the path;
-    // RDS_InitializeConnection only compares it with BASE_DRIVER.
+    // The base driver: answers SQLAllocHandle, SQLDriverConnect and SQLExecDirect (and SQLGetDiagRecW). Nothing is at
+    // the path; RDS_InitializeConnection only compares it with BASE_DRIVER.
     class FakeBaseDriver : public RdsLibLoader {
     public:
         FakeBaseDriver() : RdsLibLoader(BASE_DRIVER_PATH) {}
@@ -149,6 +167,9 @@ namespace {
             }
             if (function_name == RdsFuncNames::DriverConnect) {
                 return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeDriverConnect);
+            }
+            if (function_name == RdsFuncNames::ExecDirect) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeExecDirect);
             }
 #ifdef UNICODE
             if (function_name == RdsFuncNames::GetDiagRec) {
@@ -274,8 +295,11 @@ protected:
         base_call = {};
         connect_calls = 0;
         fail_first_connect = false;
+        fail_connects = false;
+        during_connect = nullptr;
         unicode_base_driver = false;
         cuts_to_buffer_length = false;
+        exec_direct_result = SQL_SUCCESS;
     }
 
     void TearDown() override {
@@ -285,6 +309,7 @@ protected:
             dbc->wrapped_dbc = SQL_NULL_HDBC;
         }
         env_.wrapped_env = SQL_NULL_HENV;
+        during_connect = nullptr;
     }
 
     // A handle with the plugin service and the chain (TokenPlugin, then DefaultPlugin) an earlier connect to the
@@ -593,4 +618,189 @@ TEST_F(DefaultPluginOutputTest, Connect_ReusedHandle_StartsFromItsArguments) {
     EXPECT_FALSE(dbc.conn_attr.contains(KEY_BASE_DRIVER));
     EXPECT_EQ("second_user", dbc.conn_attr.at(KEY_DB_USERNAME));
     EXPECT_EQ("second_password", dbc.conn_attr.at(KEY_DB_PASSWORD));
+}
+
+// DefaultPlugin, which every connect reaches, starts an Aurora DSQL connection's age on each successful base connect;
+// SQL_ATTR_CONNECTION_DEAD and the 60-minute hint read it.
+class DefaultPluginDsqlLifetimeTest : public DefaultPluginOutputTest {
+protected:
+    // The clock of the connection's lifetime.
+    std::chrono::steady_clock::time_point now_{};
+
+    // A handle as RDS_InitializeConnection leaves it for these attributes: is_dsql decided and, for Aurora DSQL, a
+    // lifetime on the test's clock.
+    DBC& NewConnection(const std::map<std::string, std::string>& conn_attr) {
+        DBC& dbc = NewHandle(conn_attr.at(KEY_SERVER));
+        dbc.conn_attr = conn_attr;
+        dbc.is_dsql = DsqlConnectionValidator::IsDsqlTarget(conn_attr);
+        if (dbc.is_dsql) {
+            dbc.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
+        }
+        return dbc;
+    }
+
+    // The chain's Connect, as RDS_SQLDriverConnect calls it.
+    static SQLRETURN Connect(DBC& dbc) {
+        return dbc.plugin_head->Connect(&dbc, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+    }
+};
+
+// The age counts from before the base connect, so it is never less than the server's; a failed connect leaves none.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_StartsTheAgeBeforeTheConnectAndClearsItOnFailure) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    during_connect = [this] { now_ += std::chrono::seconds(5); };
+
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    const std::optional<std::chrono::steady_clock::duration> age = dbc.dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(5, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+
+    fail_connects = true;
+    EXPECT_EQ(SQL_ERROR, Connect(dbc));
+    EXPECT_FALSE(dbc.dsql_lifetime->Age().has_value());
+}
+
+// Each connect starts the lifetime with the connection's MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD reads.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_StartsTheLifetimeWithMaxConnectionLifetime) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::seconds(1800) - std::chrono::milliseconds(1);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+    now_ += std::chrono::milliseconds(1);
+    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(&dbc));
+
+    // Read again on every connect: 0 turns retirement off.
+    dbc.conn_attr.insert_or_assign(KEY_MAX_CONNECTION_LIFETIME, "0");
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::hours(24);
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+}
+
+// Without MAX_CONNECTION_LIFETIME a connection is never retired, though its age is kept for the 60-minute hint.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_LifetimeUnset_NeverRetires) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(dbc));
+    now_ += std::chrono::hours(24);
+    ASSERT_TRUE(dbc.dsql_lifetime->Age().has_value());
+    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(&dbc));
+}
+
+// A connect to another database creates no lifetime, and neither clears nor starts the one an earlier Aurora DSQL
+// connect on the handle left.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_OtherDatabase_LeavesTheLifetimeAlone) {
+    DBC& other = NewConnection({{KEY_SERVER, OTHER_HOST}});
+    ASSERT_EQ(SQL_SUCCESS, Connect(other));
+    EXPECT_TRUE(other.dsql_lifetime == nullptr);
+
+    DBC& reused = NewConnection({{KEY_SERVER, OTHER_HOST}});
+    reused.dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
+    reused.dsql_lifetime->Start(now_, DsqlConnectionLifetime::LARGEST_MAX_LIFETIME);
+    now_ += std::chrono::minutes(10);
+    during_connect = [this] { now_ += std::chrono::seconds(5); };
+    ASSERT_EQ(SQL_SUCCESS, Connect(reused));
+    const std::optional<std::chrono::steady_clock::duration> age = reused.dsql_lifetime->Age();
+    ASSERT_TRUE(age.has_value());
+    EXPECT_EQ(605, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+}
+
+// Each connect starts as no Aurora DSQL connect, until RDS_InitializeConnection decides: one that fails before then
+// gets no Aurora DSQL answers from the handle's last connect.
+TEST_F(DefaultPluginDsqlLifetimeTest, Connect_FailingBeforeTheDecision_IsNotDsql) {
+    DBC& dbc = NewConnection({{KEY_SERVER, DSQL_HOST}});
+    ASSERT_TRUE(dbc.is_dsql);
+    // A cluster ID with a region that can't be part of a host name: the expansion fails.
+    std::vector<SQLTCHAR> in = AppString("DRIVER={AWS Advanced ODBC Wrapper};BASE_DRIVER=" + BASE_DRIVER_PATH
+        + ";SERVER=abcdefghijklmnopqrstuvwxyz;RDS_AUTH_TYPE=DSQL;REGION=us_east_1");
+    EXPECT_EQ(SQL_ERROR, RDS_SQLDriverConnect(&dbc, nullptr, in.data(), SQL_NTS, nullptr, 0, nullptr,
+        SQL_DRIVER_NOPROMPT));
+    EXPECT_FALSE(dbc.is_dsql);
+
+    // SQLConnect without a DSN.
+    dbc.is_dsql = true;
+    EXPECT_EQ(SQL_ERROR, RDS_SQLConnect(&dbc, nullptr, 0, nullptr, 0, nullptr, 0));
+    EXPECT_FALSE(dbc.is_dsql);
+    EXPECT_EQ(0, connect_calls);
+}
+
+// DefaultPlugin notes an Aurora DSQL statement that failed (or warned) in a transaction, which SQLEndTran(SQL_COMMIT)
+// checks for (DsqlCompatibility::RollBackAbortedTransaction).
+class DefaultPluginDsqlTransactionTest : public DefaultPluginOutputTest {
+protected:
+    std::vector<std::unique_ptr<STMT>> stmts_;
+
+    // A handle connected to the server as RDS_InitializeConnection and a connect leave it, with this autocommit mode.
+    DBC& Connected(const std::string& server, bool auto_commit) {
+        DBC& dbc = NewHandle(server);
+        dbc.is_dsql = DsqlConnectionValidator::IsDsqlTarget({{KEY_SERVER, server}});
+        dbc.wrapped_dbc = static_cast<SQLHDBC>(&fake_wrapped_dbc);
+        dbc.conn_status = CONN_CONNECTED;
+        dbc.auto_commit = auto_commit;
+        dbc.transaction_status = auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        return dbc;
+    }
+
+    // The chain's Execute for a new statement, as RDS_SQLExecDirect calls it.
+    SQLRETURN ExecDirect(DBC& dbc, const std::string& text) {
+        stmts_.push_back(std::make_unique<STMT>());
+        STMT* stmt = stmts_.back().get();
+        stmt->dbc = &dbc;
+        std::vector<SQLTCHAR> statement = AppString(text);
+        return dbc.plugin_head->Execute(stmt, statement.data(), SQL_NTS);
+    }
+};
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorWithAutocommitOff_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// psqlODBC can report the failed rows of a parameter array with SQL_SUCCESS_WITH_INFO.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_WarningWithAutocommitOff_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    exec_direct_result = SQL_SUCCESS_WITH_INFO;
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A transaction opened with BEGIN in autocommit mode.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorAfterTextBegin_SetsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, true);
+    dbc.transaction_status = TRANSACTION_OPEN;
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_TRUE(dbc.dsql_statement_failed_in_transaction);
+}
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_ErrorInAutocommit_LeavesItClear) {
+    DBC& dbc = Connected(DSQL_HOST, true);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_OtherDatabase_LeavesItClear) {
+    DBC& dbc = Connected(OTHER_HOST, false);
+    exec_direct_result = SQL_ERROR;
+    EXPECT_EQ(SQL_ERROR, ExecDirect(dbc, "INSERT INTO t VALUES (1)"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A ROLLBACK or COMMIT sent as SQL text ended the transaction.
+TEST_F(DefaultPluginDsqlTransactionTest, Execute_TextRollback_ClearsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    dbc.dsql_statement_failed_in_transaction = true;
+    EXPECT_EQ(SQL_SUCCESS, ExecDirect(dbc, "ROLLBACK"));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
+}
+
+// A new connection has no transaction.
+TEST_F(DefaultPluginDsqlTransactionTest, Connect_ClearsTheFlag) {
+    DBC& dbc = Connected(DSQL_HOST, false);
+    dbc.dsql_statement_failed_in_transaction = true;
+    dbc.conn_status = CONN_NOT_CONNECTED;
+    dbc.conn_attr = {{KEY_SERVER, DSQL_HOST}};
+    ASSERT_EQ(SQL_SUCCESS, dbc.plugin_head->Connect(&dbc, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_FALSE(dbc.dsql_statement_failed_in_transaction);
 }

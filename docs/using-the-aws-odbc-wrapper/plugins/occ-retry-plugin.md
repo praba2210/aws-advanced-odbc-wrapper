@@ -25,7 +25,7 @@ The wrapper checks all five options on every connect, also when `ENABLE_OCC_RETR
 
 `OCC_MAX_DELAY_MS` must be at least `OCC_BASE_DELAY_MS`, also when you don't set it: `OCC_BASE_DELAY_MS=10000` alone fails with `OCC_MAX_DELAY_MS=5000 (the default; set it to an integer from OCC_BASE_DELAY_MS, 10000, to 60000)`.
 
-The wrapper reads the options when a connection handle connects for the first time. To change them, use a new connection handle.
+The wrapper reads the options when a connection handle connects for the first time. To change them, use a new connection handle. A handle that connects again, to a database that isn't Aurora DSQL, retries nothing there.
 
 > [!NOTE]\
 > In the Windows DSN setup dialog, these options are on the **Aurora DSQL** tab, under **OCC Retry**. **Enable OCC Retry** turns retries on and makes the other four fields editable; a blank field uses the default. The dialog checks the values when it saves the DSN. Don't also set these options in **Base Driver Connection String**: a connection through the DSN may then use either value.
@@ -39,6 +39,7 @@ The wrapper reads the options when a connection handle connects for the first ti
   ```
 
 - psqlODBC as the underlying driver.
+- For `RDS_AUTH_TYPE=DSQL` and its options, see the [Aurora DSQL Authentication Plugin](./aurora-dsql-authentication-plugin.md).
 
 ### When a Statement Is Retried
 
@@ -66,7 +67,7 @@ Each retry waits (see [Backoff](#backoff)), clears the statement's diagnostics, 
 
 Before retry *n*, the plugin waits `min(OCC_BASE_DELAY_MS × 2^(n-1), OCC_MAX_DELAY_MS)` milliseconds, plus a random extra of up to `OCC_JITTER_FACTOR` times that. There's no wait after the last attempt. With the defaults the waits are 100-124 ms, 200-249 ms and 400-499 ms, under 0.9 seconds in all.
 
-The plugin waits inside the ODBC call and holds the connection and the statement meanwhile: other threads that use the connection wait, and an `SQLCancel` from another thread waits until the call returns. It can't stop the statement, which has finished, and a driver manager may then treat it as `SQLFreeStmt(SQL_CLOSE)` (unixODBC does): the application's next call on that statement can fail with `HY010`, or its result set is closed, even when the statement succeeded. So that one call doesn't hold the connection and the statement for long, the plugin makes a retry only when its wait and an attempt as long as the previous one would end within 5 minutes (300000 ms) of the call's start; otherwise it returns the last conflict. A retry that runs longer than the attempt before it can still take the call past 5 minutes. 5 minutes is the same as Aurora DSQL's transaction limit. The defaults' 3 retries fit when attempts take up to about a minute. With quick attempts, `OCC_MAX_RETRIES=100` and the other options at their defaults, the plugin stops after 52 to 64 retries. Keep `OCC_MAX_RETRIES` small.
+The plugin waits inside the ODBC call and holds the connection and the statement meanwhile: other threads that use the connection wait. An `SQLCancel` from another thread ends the wait at once: the call returns `SQL_ERROR` with SQLSTATE `HY008` (`Operation canceled: SQLCancel was called while an OCC retry waited`) and makes no further attempt. The attempt before the wait failed with an OCC conflict, so it changed nothing. A cancel during an attempt goes to psqlODBC, and Aurora DSQL lets the statement finish. A cancel that comes after the wait, before the retry reaches psqlODBC, returns `HY008` with `Operation canceled: SQLCancel was called before OCC retry <n> ran`. When a cancel ends a retry's wait or comes before the retry runs, the call returns `HY008`; the conflict's `40001` isn't kept. So that one call doesn't hold the connection and the statement for long, the plugin makes a retry only when its wait and an attempt as long as the previous one would end within 5 minutes (300000 ms) of the call's start; otherwise it returns the last conflict. A retry that runs longer than the attempt before it can still take the call past 5 minutes. 5 minutes is the same as Aurora DSQL's transaction limit. The defaults' 3 retries fit when attempts take up to about a minute. With quick attempts, `OCC_MAX_RETRIES=100` and the other options at their defaults, the plugin stops after 52 to 64 retries. Keep `OCC_MAX_RETRIES` small.
 
 ### How the Plugin Tracks Transactions
 
@@ -153,7 +154,7 @@ The sample uses the ANSI ODBC functions, so on Windows build it without `UNICODE
 > [!WARNING]\
 > Don't put autocommit statements in your own retry loop while the plugin is on. The attempts multiply: up to your loop's attempts × (1 + `OCC_MAX_RETRIES`). Use your loop for transactions only, or set `ENABLE_OCC_RETRY=0`.
 
-End a transaction with `SQLEndTran` before you set autocommit on. If a transaction is open when autocommit is set on, psqlODBC commits it but doesn't report the result, so the application isn't told when that commit fails with an OCC conflict.
+End a transaction with `SQLEndTran` before you set autocommit on. Setting `SQL_ATTR_AUTOCOMMIT` while a transaction is open commits it first. When that commit fails, for example with an OCC conflict (`40001`), `SQLSetConnectAttr` returns its error and autocommit stays as it was.
 
 A retried `INSERT` that takes a value from a sequence takes a new value, because sequence values aren't rolled back, so retries can leave larger gaps.
 
@@ -161,12 +162,14 @@ A retried `INSERT` that takes a value from a sequence takes a new value, because
 
 The plugin writes these lines to the wrapper's log (see [Logging](../using-the-aws-odbc-wrapper.md#logging)):
 
-| Level   | When                                            | Line                                                                                                                                                                              |
-|---------|-------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| INFO    | Before each retry                               | `[DSQL] OCC conflict (<code>, SQLSTATE <state>): retry <n>/<N> in <ms> ms`                                                                                                        |
-| WARNING | When the retries run out                        | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) persisted after <N> retries; returning the error`                                                                                 |
-| WARNING | When a retry would take the call past 5 minutes | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) persisted after <n> retries; a wait of <ms> ms and an attempt of <ms> ms would take the call past 300000 ms; returning the error` |
-| WARNING | The same, before the first retry                | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) not retried; a wait of <ms> ms and an attempt of <ms> ms would take the call past 300000 ms; returning the error`                 |
+| Level   | When                                                            | Line                                                                                                                                                                              |
+|---------|-----------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| INFO    | Before each retry                                               | `[DSQL] OCC conflict (<code>, SQLSTATE <state>): retry <n>/<N> in <ms> ms`                                                                                                        |
+| WARNING | When the retries run out                                        | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) persisted after <N> retries; returning the error`                                                                                 |
+| WARNING | When a retry would take the call past 5 minutes                 | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) persisted after <n> retries; a wait of <ms> ms and an attempt of <ms> ms would take the call past 300000 ms; returning the error` |
+| WARNING | The same, before the first retry                                | `[DSQL] OCC conflict (<code>, SQLSTATE <state>) not retried; a wait of <ms> ms and an attempt of <ms> ms would take the call past 300000 ms; returning the error`                 |
+| INFO    | When an `SQLCancel` ends a retry's wait                         | `[DSQL] OCC retry <n> canceled during its wait`                                                                                                                                   |
+| INFO    | When an `SQLCancel` comes after the wait, before the retry runs | `[DSQL] OCC retry <n> canceled before it ran`                                                                                                                                     |
 
 `<code>` is `OC000` or `OC001` when the SQLSTATE or the message names it; otherwise the parentheses hold only `SQLSTATE <state>`. `<N> retries` and `<n> retries` read `1 retry` for one. In the two time-limit lines, `an attempt of <ms> ms` gives the last attempt's length. For example: `[DSQL] OCC conflict (OC000, SQLSTATE 40001): retry 1/3 in 117 ms`. Apart from the `not retried` line, nothing is logged for a conflict that isn't retried, or with `OCC_MAX_RETRIES=0`.
 

@@ -26,21 +26,39 @@ struct DBC;
 
 // How old an Aurora DSQL connection is, and the age at which the driver retires it (MAX_CONNECTION_LIFETIME). Aurora
 // DSQL closes connections at 60 minutes. A driver manager asks SQL_ATTR_CONNECTION_DEAD before it hands out a pooled
-// connection; from MAX_CONNECTION_LIFETIME on, the driver answers SQL_CD_TRUE, so the pool disconnects the connection
-// and opens a new one, with a new token. The 60-minute hint reads the same age.
+// connection; once a connection is MAX_CONNECTION_LIFETIME old, the driver answers SQL_CD_TRUE, so the pool
+// disconnects it and opens a new one, with a new token. Off unless MAX_CONNECTION_LIFETIME is set: an application that
+// asks on a connection it is using (nanodbc, before each commit) would skip its commits. The 60-minute hint reads the
+// same age.
 class DsqlConnectionLifetime {
 public:
-    using Clock = std::function<std::chrono::steady_clock::time_point()>;
+    using SteadyClock = std::function<std::chrono::steady_clock::time_point()>;
+    using SystemClock = std::function<std::chrono::system_clock::time_point()>;
 
-    // MAX_CONNECTION_LIFETIME's default and largest value: the Aurora DSQL connectors' 55 minutes.
-    static constexpr std::chrono::seconds DEFAULT_MAX_LIFETIME{3300};
+    // A moment on both clocks. The steady clock stops while the machine sleeps, Aurora DSQL's 60 minutes don't; the
+    // system clock counts the sleep but jumps when the time is set. The age is the larger of the two, so either can
+    // only make a connection older (retired early: safe), never younger.
+    struct Instant {
+        // Implicit, so a test can pass a steady time point; it then has no system time.
+        // NOLINTNEXTLINE(google-explicit-constructor,misc-explicit-constructor)
+        Instant(std::chrono::steady_clock::time_point steady_time,
+                std::optional<std::chrono::system_clock::time_point> system_time = std::nullopt)
+            : steady(steady_time), system(system_time) {}
+        std::chrono::steady_clock::time_point steady;
+        std::optional<std::chrono::system_clock::time_point> system;
+    };
+
+    // MAX_CONNECTION_LIFETIME when it isn't set: off.
+    static constexpr std::chrono::seconds DEFAULT_MAX_LIFETIME{0};
+    // Its largest value: the Aurora DSQL connectors' 55 minutes.
+    static constexpr std::chrono::seconds LARGEST_MAX_LIFETIME{3300};
     // Its smallest value other than 0, which turns retirement off.
     static constexpr std::chrono::seconds MIN_MAX_LIFETIME{120};
 
-    // The steady clock, unless a test passes its own.
-    explicit DsqlConnectionLifetime(Clock clock = nullptr);
+    // Both real clocks, unless a test passes its own. A test that passes only a steady clock counts no system time.
+    explicit DsqlConnectionLifetime(SteadyClock steady_clock = nullptr, SystemClock system_clock = nullptr);
 
-    // MAX_CONNECTION_LIFETIME from upper-cased connection attributes: the default when it isn't set, 0 for off. On a
+    // MAX_CONNECTION_LIFETIME from upper-cased connection attributes: 0 (off) when it isn't set or is blank. On a
     // bad value, returns std::nullopt and sets error to the option, its value and what to use instead, for example
     // "MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)".
     static std::optional<std::chrono::seconds> ParseMaxLifetime(const std::map<std::string, std::string>& conn_attr,
@@ -50,27 +68,33 @@ public:
     static bool IsSet(const std::map<std::string, std::string>& conn_attr);
 
     // For SQLGetConnectAttr(SQL_ATTR_CONNECTION_DEAD), without a round trip: true when dbc is an open Aurora DSQL
-    // connection at least MAX_CONNECTION_LIFETIME old. Logs one INFO line per connection, the first time.
+    // connection (dbc->is_dsql) at least MAX_CONNECTION_LIFETIME old. Logs one INFO line per connection, the first
+    // time.
     static bool IsRetired(const DBC* dbc);
 
-    [[nodiscard]] std::chrono::steady_clock::time_point Now() const;
+    [[nodiscard]] Instant Now() const;
 
     // A connect that began at started_at succeeded. A max_lifetime of 0 never retires the connection.
-    void Start(std::chrono::steady_clock::time_point started_at, std::chrono::seconds max_lifetime);
+    void Start(Instant started_at, std::chrono::seconds max_lifetime);
 
     // No connection: a connect began, or failed.
     void Clear();
 
-    // How long ago the current connection's connect began, or std::nullopt without one.
+    // How long ago the current connection's connect began, the larger of its steady and system ages, or std::nullopt
+    // without one.
     [[nodiscard]] std::optional<std::chrono::steady_clock::duration> Age() const;
 
 private:
-    // True from MAX_CONNECTION_LIFETIME on, on an Aurora DSQL connection; logs the INFO line the first time.
-    bool CheckRetired(const std::map<std::string, std::string>& conn_attr);
+    // True from MAX_CONNECTION_LIFETIME on; logs the INFO line the first time.
+    bool CheckRetired();
+    // The age of a connection whose connect began at started_at: the larger of its steady and system ages. Callers
+    // hold mutex_ when started_at is started_at_.
+    [[nodiscard]] std::chrono::steady_clock::duration AgeSince(const Instant& started_at) const;
 
-    Clock clock_;
+    SteadyClock steady_clock_;
+    SystemClock system_clock_;  // null: no system age
     mutable std::mutex mutex_;
-    std::optional<std::chrono::steady_clock::time_point> started_at_;
+    std::optional<Instant> started_at_;
     std::chrono::seconds max_lifetime_ = DEFAULT_MAX_LIFETIME;
     bool retirement_logged_ = false;
 };

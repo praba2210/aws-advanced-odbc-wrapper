@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Aurora DSQL support: the [Aurora DSQL Authentication Plugin](https://github.com/aws/aws-advanced-odbc-wrapper/blob/main/docs/using-the-aws-odbc-wrapper/plugins/aurora-dsql-authentication-plugin.md) (`RDS_AUTH_TYPE=DSQL`: a token per connection, `verify-full` TLS, cluster IDs), the Aurora DSQL dialect, and the psqlODBC settings, answered ODBC calls and connect-time checks described in [Support for Amazon Aurora DSQL](https://github.com/aws/aws-advanced-odbc-wrapper/blob/main/docs/using-the-aws-odbc-wrapper/SupportForAuroraDSQL.md)
+- [OCC Retry Plugin](https://github.com/aws/aws-advanced-odbc-wrapper/blob/main/docs/using-the-aws-odbc-wrapper/plugins/occ-retry-plugin.md) (`ENABLE_OCC_RETRY`): retries an autocommit statement that fails with an Aurora DSQL OCC conflict; an `SQLCancel` from another thread ends its wait
+- `MAX_CONNECTION_LIFETIME`, off unless set: once an Aurora DSQL connection is that old, `SQL_ATTR_CONNECTION_DEAD` reports it dead, so a driver manager's pool replaces it; set it to `3300` for a driver manager's pool, and not for applications built on nanodbc
+- The Windows DSN setup dialog: the Aurora DSQL authentication mode and dialect, and an Aurora DSQL tab
+
+### Changed
+
+- The `AWS_PROFILE` key restricts Aurora DSQL credentials to that profile: a profile that isn't in the AWS config or credentials file fails the connect with `28000` instead of falling back to environment, container or instance credentials, and the `AWS_PROFILE` environment variable keeps the default credential chain
+- RDS IAM authentication types with `DATABASE_DIALECT=AURORA_DSQL` fail at connect; on RDS PostgreSQL, remove `DATABASE_DIALECT`
+- On an Aurora DSQL connection with an authentication type other than `DSQL`, an `SSLmode` that psqlODBC would run as `disable` becomes `verify-full` (a value you set is reported with `01S02`), or, for a full mode name in another case such as `Require`, that mode in lowercase; a mode psqlODBC runs is left exactly as set; either way, a missing `DATABASE` becomes `postgres`
+- With `RDS_AUTH_TYPE=DSQL`, `SERVERNAME` is read as `SERVER`, so psqlODBC connects to the host the token was signed for, and `SERVER` and `SERVERNAME` naming different hosts fail with `08001`
+- On Aurora DSQL the wrapper sets psqlODBC's `UpdatableCursors=0`: keyset-driven and updatable cursors become static and read-only (`01S02`) instead of failing
+- On Aurora DSQL, `SQLEndTran` with `SQL_COMMIT` after a failed statement rolls back a transaction that Aurora DSQL ended and returns `25S03`, instead of reporting success for a commit that saved nothing; so does a change of `SQL_ATTR_AUTOCOMMIT`, which commits first and returns that commit's error with autocommit unchanged
+- After a connect with the base dialect, which the wrapper uses when neither `DATABASE_DIALECT` nor the underlying driver's name gives the database, the wrapper no longer runs a topology query
+
 ### Fixed
 
 - Debug builds no longer log the generated IAM authentication token [(PR #167)](https://github.com/aws/aws-advanced-odbc-wrapper/pull/167)
@@ -14,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery of the `odbcinst`/`iodbcinst` library on macOS and Linux, which ignored the configured `ODBC_ROOT`
 - The ANSI static library is now compiled with `SQL_NOUNICODEMAP`, matching the ANSI shared library
 - `SQLCancel` and `SQLCancelHandle` called from another thread no longer wait for the statement's running `SQLExecDirect` or `SQLExecute` to finish. A call canceled before its statement reaches the underlying driver returns `HY008` without running it, and during the underlying driver's execute the cancel goes to the underlying driver at once. Waits inside failover's reconnect and a Blue/Green switchover aren't interrupted: the call returns its own result
+- Freeing a statement, disconnecting, or freeing a connection or environment while another thread's `SQLCancel` is still in the underlying driver no longer crashes: the wrapper frees the underlying driver's handles when the cancel returns, and after an `SQLCancel` reaches the underlying driver, the wrapper stays loaded until the process exits
+- `SQLDisconnect` frees the descriptors the application allocated on the connection before the underlying driver disconnects: psqlODBC before 18.00.0002 freed them itself, and the wrapper's later free crashed
+- `SQLConnect` with an empty user name or password keeps the DSN's `UID` and `PWD`, as psqlODBC does; with `RDS_AUTH_TYPE=DSQL` and no `UID` in the DSN either, it connects as `admin`
+- The Windows DSN setup dialog labels the token expiration in seconds, the unit the wrapper reads
 
 ## [1.3.1] - 2026-09-08
 

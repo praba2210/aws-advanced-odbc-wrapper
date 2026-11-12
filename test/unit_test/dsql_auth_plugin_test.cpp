@@ -15,13 +15,20 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -33,12 +40,18 @@
 #include "scoped_ctype_locale.h"
 #include "scoped_env_vars.h"
 
+#include "../../driver/dialect/dialect_aurora_dsql.h"
 #include "../../driver/driver.h"
 #include "../../driver/odbcapi_rds_helper.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
+#include "../../driver/plugin/dsql/dsql_compatibility.h"
+#include "../../driver/plugin/dsql/dsql_plugin_helper.h"
 #include "../../driver/util/aws_sdk_helper.h"
+#include "../../driver/util/connection_string_helper.h"
 #include "../../driver/util/connection_string_keys.h"
+#include "../../driver/util/dsql_auth_provider.h"
 #include "../../driver/util/logger_wrapper.h"
+#include "../../driver/util/rds_lib_loader.h"
 
 #ifndef AWS_PROFILE_TEST_RESOURCES_DIR
     #error "AWS_PROFILE_TEST_RESOURCES_DIR must be defined by the build"
@@ -49,6 +62,11 @@ namespace {
     const std::string PORT = "5432";
     const std::string USERNAME = "admin";
     const std::pair<std::string, bool> FRESH_TOKEN("dsql_token", false);
+
+    // Whether a presigned token was signed with the access key.
+    bool SignedWith(const std::string& token, const std::string& access_key) {
+        return token.find("X-Amz-Credential=" + access_key + "%2F") != std::string::npos;
+    }
 
     using test_env::SetEnvVar;
     using test_env::UnsetEnvVar;
@@ -87,6 +105,7 @@ protected:
         dbc_->conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
         dbc_->conn_attr.insert_or_assign(KEY_PORT, PORT);
         dbc_->conn_attr.insert_or_assign(KEY_DB_USERNAME, USERNAME);
+        dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, VALUE_AUTH_DSQL);
     }
     void TearDown() override {
         delete dbc_;
@@ -121,6 +140,22 @@ protected:
         testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
         return ret;
     }
+
+    // Connects through the plugin, whose base plugin is expected once and returns base_result, and returns the token
+    // the base plugin got.
+    std::string ConnectAndCaptureToken(DsqlAuthPlugin& plugin, const SQLRETURN base_result = SQL_SUCCESS) {
+        std::string token;
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, &token, base_result](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT,
+                                                                  SQLSMALLINT*, SQLUSMALLINT) {
+                token = dbc_->conn_attr.at(KEY_DB_PASSWORD);
+                return base_result;
+            }));
+        EXPECT_EQ(base_result, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT))
+            << (dbc_->err ? dbc_->err->error_msg : "");
+        testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+        return token;
+    }
 };
 
 TEST_F(DsqlAuthPluginTest, Connect_RegionFromDsqlHost) {
@@ -130,10 +165,81 @@ TEST_F(DsqlAuthPluginTest, Connect_RegionFromDsqlHost) {
         .WillOnce(testing::Return(FRESH_TOKEN));
     EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .Times(testing::Exactly(1))
+        .WillOnce(testing::Invoke([this](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*, SQLUSMALLINT) {
+            // The token is dropped after the connect, so it's read while the base driver connects.
+            EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+// The token is signed for the host the base driver connects to: SERVERNAME is folded into SERVER, not passed on.
+TEST_F(DsqlAuthPluginTest, Connect_ServernameOnly_SignsForTheHostItConnectsTo) {
+    dbc_->conn_attr.erase(KEY_SERVER);
+    dbc_->conn_attr.insert_or_assign("SERVERNAME", DSQL_HOST);
+    EXPECT_CALL(*mock_auth_provider_, GetToken(DSQL_HOST, "us-west-2", PORT, USERNAME,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(1))
+        .WillOnce(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(1))
+        .WillOnce(testing::Invoke([this](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*, SQLUSMALLINT) {
+            EXPECT_EQ(DSQL_HOST, dbc_->conn_attr.at(KEY_SERVER));
+            EXPECT_FALSE(dbc_->conn_attr.contains("SERVERNAME"));
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+}
+
+// The token is for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect.
+TEST_F(DsqlAuthPluginTest, Connect_Dsql_ErasesThePasswordAfterTheConnect) {
+    for (const SQLRETURN base_result : std::initializer_list<SQLRETURN>{SQL_SUCCESS, SQL_ERROR}) {
+        dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+        EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+            testing::_, testing::_, testing::_))
+            .WillOnce(testing::Return(FRESH_TOKEN));
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, base_result](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                          SQLUSMALLINT) {
+                EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+                return base_result;
+            }));
+
+        EXPECT_EQ(base_result, ConnectWithMockProvider());
+        EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+        EXPECT_EQ(USERNAME, dbc_->conn_attr.at(KEY_DB_USERNAME));  // only PWD goes
+        testing::Mock::VerifyAndClearExpectations(mock_auth_provider_.get());
+        testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+    }
+}
+
+// A failed token never reaches conn_attr, and an app's own PWD is dropped the same way.
+TEST_F(DsqlAuthPluginTest, Connect_Dsql_TokenFailure_ErasesTheAppPassword) {
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(std::pair<std::string, bool>("", false)));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
+    EXPECT_FALSE(dbc_->conn_attr.contains(KEY_DB_PASSWORD));
+}
+
+// Other engines reuse PWD (failover, Limitless, a retry), so the plugin leaves it for them.
+TEST_F(DsqlAuthPluginTest, Connect_OtherAuth_KeepsThePassword) {
+    dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, VALUE_AUTH_DATABASE);
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
         .WillOnce(testing::Return(SQL_SUCCESS));
 
     EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
-    EXPECT_EQ(FRESH_TOKEN.first, dbc_->conn_attr.at(KEY_DB_PASSWORD));
+    EXPECT_EQ("app_password", dbc_->conn_attr.at(KEY_DB_PASSWORD));
 }
 
 TEST_F(DsqlAuthPluginTest, Connect_RegionKeyOverridesHost) {
@@ -261,6 +367,17 @@ TEST_F(DsqlAuthPluginTest, Connect_UnresolvedCredentials_FailsBeforeSigning) {
               "or instance role)", dbc_->err->error_msg);
 }
 
+// The plugin checks the credentials and then asks for the token; the real provider reads its source once for both.
+TEST_F(DsqlAuthPluginTest, Connect_ReadsCredentialsOnce) {
+    const auto source = std::make_shared<CountingCredentialsProvider>(
+        std::vector{Aws::Auth::AWSCredentials("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")});
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, std::make_shared<DsqlAuthProvider>("us-west-2", source));
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(1, source->Reads());
+}
+
 namespace {
     const std::string EXPECTED_APP_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
 }  // namespace
@@ -272,6 +389,32 @@ TEST_F(DsqlAuthPluginTest, Defaults_EmptyAttributes) {
     EXPECT_EQ("admin", conn_attr.at(KEY_DB_USERNAME));
     EXPECT_EQ("postgres", conn_attr.at(KEY_DATABASE));
     EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+// psqlODBC reads Servername as SERVER (the later one in the string wins, and the wrapper writes SERVER first), so a
+// SERVERNAME would send the token to a host it wasn't signed for. A DSQL connect folds it into SERVER.
+TEST_F(DsqlAuthPluginTest, Defaults_ServernameOnly_BecomesServer) {
+    std::map<std::string, std::string> conn_attr = {{"SERVERNAME", "abc.dsql.us-east-1.on.aws"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("abc.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_ServerAndServername_ServernameErased) {
+    std::map<std::string, std::string> conn_attr = {{"SERVER", "a.dsql.us-east-1.on.aws"},
+                                                    {"SERVERNAME", "b.example.com"},};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("a.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+// The parsers upper-case every key (a DSN's Servername is even read as SERVER), so only a direct caller passes the key
+// in another case. It matches all the same, defensively.
+TEST_F(DsqlAuthPluginTest, Defaults_ServernameKeyInAnyCase) {
+    std::map<std::string, std::string> conn_attr = {{"Servername", "a.dsql.us-east-1.on.aws"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+    EXPECT_EQ("a.dsql.us-east-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("Servername"));
 }
 
 // DSQL rejects plaintext, and Go, .NET, PHP, Ruby and Rust always verify the server. A mode that may not encrypt,
@@ -516,6 +659,72 @@ TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
     EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
     EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
     EXPECT_EQ("", error);
+}
+
+// The cluster-ID expansion runs before the plugin chain and reads SERVER, so it folds the alias too.
+TEST_F(DsqlAuthPluginTest, ClusterId_ServernameOnly_IsExpanded) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVERNAME", CLUSTER_ID},
+                                                    {KEY_REGION, "eu-west-1"},};
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_FALSE(conn_attr.contains("SERVERNAME"));
+}
+
+// Other auth types keep SERVERNAME as it is, and two different hosts don't fail here: the gate is the auth type alone,
+// not whether the connect is Aurora DSQL (by its endpoint or its dialect), and no auth type is not DSQL either.
+TEST_F(DsqlAuthPluginTest, Defaults_OtherAuth_ServernameUntouched) {
+    const std::string other_dsql_host = "zyxwvutsrqponmlkjihgfedcba.dsql.us-west-2.on.aws";
+    const std::vector<std::map<std::string, std::string>> cases = {
+        {{KEY_AUTH_TYPE, "IAM"}, {"SERVERNAME", "h.example.com"}},
+        {{KEY_AUTH_TYPE, "SECRETS_MANAGER"}, {"SERVERNAME", "h.example.com"}},
+        {{KEY_AUTH_TYPE, "DATABASE"}, {"SERVERNAME", "h.example.com"}},
+        {{"SERVERNAME", "h.example.com"}},
+        {{KEY_SERVER, "h.example.com"}, {"SERVERNAME", other_dsql_host}},
+        {{KEY_AUTH_TYPE, "DATABASE"}, {KEY_DATABASE_DIALECT, VALUE_DB_DIALECT_AURORA_DSQL}, {KEY_SERVER, "10.0.0.1"},
+         {"SERVERNAME", "10.0.0.2"},},
+        {{KEY_AUTH_TYPE, "IAM"}, {KEY_SERVER, DSQL_HOST}, {"SERVERNAME", other_dsql_host}},
+    };
+    for (const std::map<std::string, std::string>& attributes : cases) {
+        std::map<std::string, std::string> conn_attr = attributes;
+        std::string error;
+        EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << error;
+        EXPECT_EQ(attributes, conn_attr);
+        EXPECT_EQ("", error);
+    }
+}
+
+// Two different hosts: the token is signed for one, and the other would be dropped silently (a DSN's SERVER would
+// beat the connection string's SERVERNAME). The same host in any case folds quietly.
+TEST_F(DsqlAuthPluginTest, ClusterId_ServerAndServernameDiffer_Fails) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "a.example.com"},
+                                                    {"SERVERNAME", "b.example.com"},};
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("DSQL Authentication failed. SERVER and SERVERNAME name different hosts ('a.example.com' and "
+              "'b.example.com'): set only one of them", error);
+
+    conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "A.Example.com"}, {"Servername", "a.example.COM"}};
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("A.Example.com", conn_attr.at("SERVER"));
+    EXPECT_FALSE(conn_attr.contains("Servername"));
+}
+
+// The app gets the error before any token is signed or the base driver loads.
+TEST_F(DsqlAuthPluginTest, InitializeConnection_ServerAndServernameDiffer_Fails08001BeforeAnything) {
+    ENV env;
+    DBC dbc{};
+    dbc.env = &env;
+    dbc.conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "a.example.com"}, {"SERVERNAME", "b.example.com"},
+                     {KEY_BASE_DRIVER, "/no/such/base/driver.so"},};
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_)).Times(testing::Exactly(0));
+
+    EXPECT_EQ(SQL_ERROR, RDS_InitializeConnection(&dbc, ""));
+    ASSERT_TRUE(dbc.err);
+    EXPECT_EQ("08001", dbc.err->sqlstate);
+    EXPECT_NE(std::string::npos, dbc.err->error_msg.find("name different hosts"));
+    EXPECT_FALSE(env.driver_lib_loader);
 }
 
 TEST_F(DsqlAuthPluginTest, ClusterId_AuthTypeIsCaseInsensitive) {
@@ -970,7 +1179,7 @@ TEST_F(DsqlAuthPluginTest, Connect_KeptOrDefaultSslMode_NoWarning) {
 }
 
 // The wrapper keeps one record per handle, and its record hides the base driver's. When psqlODBC has its own
-// warnings (a short output buffer gets 01004), they stay; the override is only logged.
+// warnings, they stay; the override is only logged.
 TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_KeepsBaseDriverWarnings) {
     dbc_->conn_attr.insert_or_assign("SSLMODE", "prefer");
     EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
@@ -991,6 +1200,21 @@ TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
         .WillOnce(testing::Return(SQL_ERROR));
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     EXPECT_EQ(nullptr, dbc_->err);
+}
+
+// DsqlCompatibility::PrepareConnect calls ApplyTlsDefaults(OTHER_AUTH) only for a mode psqlODBC would run as disable.
+// Given one psqlODBC runs, in any form or under either keyword, the function itself leaves it and pqopt exactly as set
+// and returns no text.
+TEST_F(DsqlAuthPluginTest, TlsDefaults_OtherAuth_KeepsAModePsqlodbcRuns) {
+    for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+             {"SSLMODE", "allow"}, {"SSLMODE", "prefer"}, {"SSLMODE", "require"}, {"SSLMODE", "r"},
+             {"SSLMODE", "verify-ca"}, {"SSLMODE", "verify-full"}, {"CA", "vf"},}) {
+        std::map<std::string, std::string> conn_attr = {{key, mode}, {"PQOPT", "{application_name=billing}"}};
+        const std::map<std::string, std::string> before = conn_attr;
+        EXPECT_EQ("", DsqlAuthPlugin::ApplyTlsDefaults(conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, "system"))
+            << key << "=" << mode;
+        EXPECT_EQ(before, conn_attr) << key << "=" << mode;
+    }
 }
 
 // Only the three long names are kept; psqlODBC's short forms (d, a, p, r, vc, vf) are replaced too.
@@ -1153,6 +1377,43 @@ TEST_F(DsqlAuthPluginTest, Connect_PaddedProfile_SignsWithThatProfile) {
     }
 }
 
+// Without the AWS_PROFILE key, the AWS_PROFILE variable doesn't restrict the signer: the SDK's default chain signs, as
+// documented, and the environment's keys come before the variable's profile.
+TEST_F(DsqlAuthPluginTest, Connect_EnvProfileWithoutTheKey_KeepsTheDefaultChain) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    const ScopedEnvVars env_keys({
+        {"AWS_ACCESS_KEY_ID", "AKIDENVEXAMPLE"},
+        {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
+    });
+    SetEnvVar("AWS_PROFILE", "dsql_static");  // AKIDEXAMPLE in the credentials fixture
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    const std::string token = ConnectAndCaptureToken(plugin);
+    EXPECT_TRUE(SignedWith(token, "AKIDENVEXAMPLE"));
+    EXPECT_FALSE(SignedWith(token, "AKIDEXAMPLE"));
+}
+
+// With the AWS_PROFILE key only that profile signs: one that is in neither file fails the connect and is named,
+// though the environment has keys.
+TEST_F(DsqlAuthPluginTest, Connect_MissingProfileKey_FailsWithItsName) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    const ScopedEnvVars env_keys({
+        {"AWS_ACCESS_KEY_ID", "AKIDENVEXAMPLE"},
+        {"AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYENVEXAMPLE"},
+    });
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "no_such_profile");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+    EXPECT_EQ("Unable to resolve AWS credentials for DSQL authentication: the 'AWS_PROFILE' profile 'no_such_profile' "
+              "isn't in the AWS config or credentials file (~/.aws/config, ~/.aws/credentials, or the files "
+              "AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE name). Check the name, or remove AWS_PROFILE to use the "
+              "default credential chain.", dbc_->err->error_msg);
+}
+
 // A blank AWS_PROFILE variable counts as unset, so the provider is given [default] explicitly: the SDK would read
 // the variable as is and look for a profile named " \t".
 TEST_F(DsqlAuthPluginTest, Connect_BlankEnvProfile_SignsWithTheDefaultProfile) {
@@ -1191,3 +1452,505 @@ TEST_F(DsqlAuthPluginTest, ClusterId_EmptyEnvProfile_UsesDefaultProfileRegion) {
     EXPECT_EQ(CLUSTER_ID + ".dsql.eu-north-1.on.aws", conn_attr.at(KEY_SERVER));
 }
 #endif
+
+namespace {
+    // A connect on a reused handle starts from a fresh conn_attr.
+    void ResetAttributes(DBC* dbc, const std::string& profile_key, const std::string& auth_type = VALUE_AUTH_DSQL) {
+        dbc->conn_attr.clear();
+        dbc->conn_attr.insert_or_assign(KEY_SERVER, DSQL_HOST);
+        dbc->conn_attr.insert_or_assign(KEY_PORT, PORT);
+        dbc->conn_attr.insert_or_assign(KEY_DB_USERNAME, USERNAME);
+        dbc->conn_attr.insert_or_assign(KEY_AUTH_TYPE, auth_type);
+        if (!profile_key.empty()) {
+            dbc->conn_attr.insert_or_assign(KEY_AWS_PROFILE, profile_key);
+        }
+    }
+}  // namespace
+
+// A handle keeps its first connect's plugin chain, so the plugin builds the provider again for another profile.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_ProfileKeyChange_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dsql_static");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+
+    ResetAttributes(dbc_, "no_such_profile");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
+}
+
+// The profile variable decides the provider when there is no key.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_EnvProfileChange_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_PROFILE", "dsql_static");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    testing::Mock::VerifyAndClearExpectations(mock_base_plugin_.get());
+
+    SetEnvVar("AWS_PROFILE", "no_such_profile");
+    ResetAttributes(dbc_, "");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+}
+
+// A profile that was missing when the chain was built stays missing for that chain: the connect after the user
+// created it gets a new one.
+TEST_F(DsqlAuthPluginTest, Connect_AfterCredentialFailure_RebuildsTheProvider) {
+    const TempConfigFile credentials("[other]\naws_access_key_id = AKIDOTHER\naws_secret_access_key = otherSecret\n");
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "p");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Return(SQL_SUCCESS));
+
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+
+    credentials.Write("[p]\naws_access_key_id = AKIDEXAMPLE\n"
+                      "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n");
+    ResetAttributes(dbc_, "p");
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+}
+
+// A connect without RDS_AUTH_TYPE=DSQL on the same handle gets no token and keeps the application's password, and the
+// plugin's defaults aren't applied: the SSLmode stays as set and no pqopt is added.
+TEST_F(DsqlAuthPluginTest, Connect_NotDsqlAuthType_PassesThrough) {
+    dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, "DATABASE");
+    dbc_->conn_attr.insert_or_assign(KEY_DB_PASSWORD, "app_password");
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    std::map<std::string, std::string> conn_attr_seen;
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillOnce(testing::Invoke([&conn_attr_seen](SQLHDBC handle, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                    SQLUSMALLINT) {
+            conn_attr_seen = static_cast<DBC*>(handle)->conn_attr;
+            return SQL_SUCCESS;
+        }));
+
+    EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider());
+    EXPECT_EQ("app_password", conn_attr_seen.at(KEY_DB_PASSWORD));
+    EXPECT_EQ("disable", conn_attr_seen.at("SSLMODE"));
+    EXPECT_FALSE(conn_attr_seen.contains("PQOPT"));
+    EXPECT_FALSE(conn_attr_seen.contains("D5"));
+}
+
+TEST_F(DsqlAuthPluginTest, Connect_InjectedProvider_IsNeverReplaced) {
+    EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_,
+        testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(2))
+        .WillRepeatedly(testing::Return(FRESH_TOKEN));
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "first");
+
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, mock_auth_provider_);
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ResetAttributes(dbc_, "second");
+    EXPECT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+}
+
+// DSQL with profile a, then a connect that isn't DSQL, then DSQL with profile b: the last one signs with b.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_DsqlOtherDsql_RebuildsTheProvider) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    dbc_->conn_attr.insert_or_assign(KEY_AWS_PROFILE, "dsql_static");
+    // Only the first two connects reach the base driver; the third fails on its credentials.
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(2))
+        .WillRepeatedly(testing::Return(SQL_SUCCESS));
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+
+    // The pass-through names another profile; it must not count as a build for it.
+    ResetAttributes(dbc_, "no_such_profile", "DATABASE");
+    ASSERT_EQ(SQL_SUCCESS, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+
+    ResetAttributes(dbc_, "no_such_profile");
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ("28000", dbc_->err->sqlstate);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("'no_such_profile'")) << dbc_->err->error_msg;
+}
+
+// One region per connect: the provider is built for it and the token signed for it. With no other source it comes
+// from the profile, so a missing config file is logged once a connect, not at each step.
+TEST_F(DsqlAuthPluginTest, Connect_ResolvesTheRegionOnce) {
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    UseConfigFile("no_such_config_file");
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+        .Times(testing::Exactly(0));
+    CapturingLogSink sink;
+    nglog::AddLogSink(&sink);
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const auto first_connect = sink.Count("Unable to load AWS config file while resolving region");
+    ResetAttributes(dbc_, "");
+    dbc_->conn_attr.insert_or_assign(KEY_SERVER, "db.internal.example.com");
+    EXPECT_EQ(SQL_ERROR, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    const auto both_connects = sink.Count("Unable to load AWS config file while resolving region");
+    nglog::RemoveLogSink(&sink);
+
+    EXPECT_EQ(1, first_connect);
+    EXPECT_EQ(2, both_connects);
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_NE(std::string::npos, dbc_->err->error_msg.find("Region")) << dbc_->err->error_msg;
+}
+
+// The environment variables the chain reads when it is built are inputs of the provider too: with another credentials
+// file the provider is built again, for the same profile and region. (A provider reads its profile's static keys from
+// the file it was built with.)
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_CredentialsFileChange_RebuildsTheProvider) {
+    const TempConfigFile first("[p]\naws_access_key_id = AKIDFIRST\naws_secret_access_key = firstSecret\n");
+    const TempConfigFile second("[p]\naws_access_key_id = AKIDSECOND\naws_secret_access_key = secondSecret\n");
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", first.Path());
+    ResetAttributes(dbc_, "p");
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDFIRST"));
+
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", second.Path());
+    ResetAttributes(dbc_, "p");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSECOND"));
+}
+
+#ifndef _WIN32
+namespace {
+    // Credentials file text for profile p, with keys from a credential_process (which the provider built for it runs on
+    // every read) or static ones (which it reads from the file every time). A provider keeps the kind it was built
+    // for, so after the file changes from one to the other, the key that signs shows whether it was built again.
+    std::string ProcessProfile(const std::string& access_key) {
+        return "[p]\ncredential_process = echo '{\"Version\": 1, \"AccessKeyId\": \"" + access_key
+            + "\", \"SecretAccessKey\": \"processSecret\"}'\n";
+    }
+}  // namespace
+
+// The region is an input of the provider (the key's chain uses it for STS and the sign-in endpoint): another region
+// builds it again, the same one keeps it.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionChange_RebuildsTheProvider) {
+    const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+    const ScopedEnvVars env = OnlyProfileCredentials();
+    SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+    ResetAttributes(dbc_, "p");
+    DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+    credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+    ResetAttributes(dbc_, "p");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+    ResetAttributes(dbc_, "p");
+    dbc_->conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
+}
+
+// The STS providers the chains build take their region from AWS_REGION, then AWS_DEFAULT_REGION, when they are built,
+// so either one changing builds the provider again, though the token's region (here SERVER's) stays. The default chain
+// here: the AWS_PROFILE variable and no key.
+TEST_F(DsqlAuthPluginTest, Connect_ReusedPlugin_RegionVariableChange_RebuildsTheProvider) {
+    for (const char* variable : {"AWS_REGION", "AWS_DEFAULT_REGION"}) {
+        SCOPED_TRACE(variable);
+        const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+        const ScopedEnvVars env = OnlyProfileCredentials();
+        SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+        SetEnvVar("AWS_PROFILE", "p");
+        SetEnvVar(variable, "us-east-1");
+        ResetAttributes(dbc_, "");
+        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_);
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+        credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+        ResetAttributes(dbc_, "");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDPROCESS"));
+
+        SetEnvVar(variable, "eu-west-1");
+        ResetAttributes(dbc_, "");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), "AKIDSTATIC"));
+        UnsetEnvVar(variable);
+    }
+}
+
+// When the server rejects the token (keys rotated or revoked since the chain read them), the next connect builds the
+// provider again, so one that holds the old keys doesn't keep failing. psqlODBC reports Aurora DSQL's "access denied"
+// as 08001, so that message counts as well as 28000 and 28P01; another error keeps the provider.
+TEST_F(DsqlAuthPluginTest, Connect_AfterTheServerRejectsTheToken_RebuildsTheProvider) {
+    struct BaseError {
+        std::string sql_state;
+        std::string message;
+        bool rebuilt;
+    };
+    for (const BaseError& error : std::vector<BaseError>{
+             {.sql_state = "28P01", .message = "FATAL:  password authentication failed", .rebuilt = true},
+             {.sql_state = "28000", .message = "", .rebuilt = true},
+             {.sql_state = "08001", .message = "FATAL:  unable to accept connection, access denied", .rebuilt = true},
+             {.sql_state = "08001", .message = "could not connect to server: Connection refused", .rebuilt = false},}) {
+        SCOPED_TRACE(error.sql_state + " " + error.message);
+        const TempConfigFile credentials(ProcessProfile("AKIDPROCESS"));
+        const ScopedEnvVars env = OnlyProfileCredentials();
+        SetEnvVar("AWS_SHARED_CREDENTIALS_FILE", credentials.Path());
+        ResetAttributes(dbc_, "p");
+        EXPECT_CALL(*mock_odbc_helper_, GetSqlStateAndLogMessage(testing::An<DBC*>(), testing::_))
+            .WillOnce(testing::DoAll(testing::SetArgReferee<1>(error.message), testing::Return(error.sql_state)));
+        DsqlAuthPlugin plugin(dbc_, mock_base_plugin_, nullptr, std::make_shared<DialectAuroraDsql>(),
+                              mock_odbc_helper_);
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin, SQL_ERROR), "AKIDPROCESS"));
+
+        credentials.Write("[p]\naws_access_key_id = AKIDSTATIC\naws_secret_access_key = staticSecret\n");
+        ResetAttributes(dbc_, "p");
+        EXPECT_TRUE(SignedWith(ConnectAndCaptureToken(plugin), error.rebuilt ? "AKIDSTATIC" : "AKIDPROCESS"));
+        testing::Mock::VerifyAndClearExpectations(mock_odbc_helper_.get());
+    }
+}
+#endif
+
+// libpq before 16 reads sslrootcert=system as a file named "system" in the working directory, so the plugin adds a
+// system CA bundle there instead (SEC-2). An unknown version keeps system, and the log says that is only the default:
+// the user's own sslrootcert, or a mode below verify-full, gets none.
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq16OrUnknown_IsSystem) {
+    CapturingLogSink sink;
+    nglog::AddLogSink(&sink);
+    const auto never_trusted = [](const char*) { return false; };
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(160000, never_trusted));
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(180001, never_trusted));
+    EXPECT_EQ("system", DsqlAuthPlugin::DefaultRootCert(std::nullopt, never_trusted));
+    nglog::RemoveLogSink(&sink);
+    EXPECT_EQ(1, sink.Count("[DSQL] The base driver's libpq version is unknown; the sslrootcert default is system."));
+    EXPECT_EQ(1, sink.Count("libpq version"));
+}
+
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq15_UsesTheFirstTrustedBundle) {
+    EXPECT_EQ("/etc/pki/tls/certs/ca-bundle.crt", DsqlAuthPlugin::DefaultRootCert(150004,
+        [](const char* path) { return std::string(path) == "/etc/pki/tls/certs/ca-bundle.crt"; }));
+    EXPECT_EQ("/etc/ssl/certs/ca-certificates.crt", DsqlAuthPlugin::DefaultRootCert(150004,
+        [](const char*) { return true; }));
+}
+
+TEST_F(DsqlAuthPluginTest, DefaultRootCert_Libpq15_NoBundle_AddsNothing) {
+    EXPECT_EQ("", DsqlAuthPlugin::DefaultRootCert(90600, [](const char*) { return false; }));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_NoRootCert_PqoptHasOnlyApplicationName) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "");
+    EXPECT_EQ("verify-full", conn_attr.at("SSLMODE"));
+    EXPECT_EQ("{application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+}
+
+TEST_F(DsqlAuthPluginTest, Defaults_BundleRootCert_IsAdded) {
+    const std::string bundle = "/etc/ssl/certs/ca-certificates.crt";
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, bundle);
+    EXPECT_EQ("{sslrootcert=" + bundle + " application_name=" + EXPECTED_APP_NAME + "}", conn_attr.at("PQOPT"));
+
+    std::map<std::string, std::string> own_cert = {{"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(own_cert, bundle);
+    EXPECT_EQ("{sslrootcert=/etc/ssl/corp-ca.pem application_name=" + EXPECTED_APP_NAME + "}", own_cert.at("PQOPT"));
+}
+
+#ifndef _WIN32
+namespace {
+    constexpr int FAKE_LIBPQ_VERSION = 150004;
+    // What FakePQlibVersion returns, set by the loader that hands it out. One global for every loader: the tests run
+    // one at a time, and each reads the version right after its loader set it.
+    int g_fake_libpq_version = FAKE_LIBPQ_VERSION;
+    int FakePQlibVersion() { return g_fake_libpq_version; }
+
+    // A loader whose PQlibVersion returns the given version, or that has none.
+    class FakeLibpqLoader : public RdsLibLoader {
+    public:
+        explicit FakeLibpqLoader(const std::optional<int> version) : RdsLibLoader(""), version_(version) {}
+
+        RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
+            if (!version_ || function_name != "PQlibVersion") {
+                return nullptr;
+            }
+            g_fake_libpq_version = *version_;
+            return reinterpret_cast<RdsPlatform::FuncHandle>(&FakePQlibVersion);
+        }
+
+    private:
+        std::optional<int> version_;
+    };
+}  // namespace
+
+TEST_F(DsqlAuthPluginTest, BaseLibpqVersion_ReadsTheBaseDriversLibpq) {
+    EXPECT_EQ(std::optional<int>(FAKE_LIBPQ_VERSION),
+              DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(FAKE_LIBPQ_VERSION)));
+    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(std::make_shared<FakeLibpqLoader>(std::nullopt)));
+    EXPECT_EQ(std::nullopt, DsqlPluginHelper::BaseLibpqVersion(nullptr));
+}
+
+// Connect picks the root certificate from the base driver's libpq version. The tests above run without an ENV, which
+// reads as an unknown version, so only this one fails if Connect stops passing the choice on.
+TEST_F(DsqlAuthPluginTest, Connect_RootCertFollowsTheBaseLibpqVersion) {
+    for (const auto& [version, expect_system] : std::map<int, bool>{{150004, false}, {160004, true}}) {
+        ENV env;
+        env.driver_lib_loader = std::make_shared<FakeLibpqLoader>(version);
+        dbc_->env = &env;
+        dbc_->conn_attr.erase("PQOPT");
+        EXPECT_CALL(*mock_auth_provider_, GetToken(testing::_, testing::_, testing::_, testing::_, testing::_,
+                                                   testing::_, testing::_))
+            .WillOnce(testing::Return(FRESH_TOKEN));
+        std::string pqopt;
+        EXPECT_CALL(*mock_base_plugin_, Connect(testing::_, testing::_, testing::_, testing::_, testing::_, testing::_))
+            .WillOnce(testing::Invoke([this, &pqopt](SQLHDBC, SQLHWND, SQLTCHAR*, SQLSMALLINT, SQLSMALLINT*,
+                                                     SQLUSMALLINT) {
+                pqopt = dbc_->conn_attr.at("PQOPT");
+                return SQL_SUCCESS;
+            }));
+
+        EXPECT_EQ(SQL_SUCCESS, ConnectWithMockProvider()) << version;
+        // Before libpq 16 this holds with a bundle or without one: "system" is never added.
+        EXPECT_EQ(expect_system, pqopt.find("sslrootcert=system") != std::string::npos) << version << " " << pqopt;
+        dbc_->env = nullptr;
+    }
+}
+
+namespace {
+    // A symbolic link to target in the temp directory, under a name no other one has (the process ID and a counter),
+    // removed at the end of the scope.
+    class TempLink {
+    public:
+        explicit TempLink(const std::string& target)
+            : path_(std::filesystem::path(::testing::TempDir())
+                    / ("dsql_test_link_" + std::to_string(getpid()) + "_" + std::to_string(next_id_++))) {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);  // left by an earlier process with the same ID
+            std::filesystem::create_symlink(target, path_);
+        }
+        ~TempLink() {
+            std::error_code ignored;
+            std::filesystem::remove(path_, ignored);
+        }
+        TempLink(const TempLink&) = delete;
+        TempLink& operator=(const TempLink&) = delete;
+
+        [[nodiscard]] const char* Path() const {
+            return path_.c_str();
+        }
+
+    private:
+        static inline unsigned next_id_ = 0;
+        std::filesystem::path path_;
+    };
+}  // namespace
+
+// Only a regular file that only root can change, found through symbolic links: /etc/passwd and a link to it, not the
+// /etc directory, a file the test made, a link to that one, or a path that doesn't exist.
+TEST_F(DsqlAuthPluginTest, IsRootOwnedFile_RootOwnedRegularFilesOnly) {
+    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile("/etc/passwd"));
+    const TempLink link_to_root_file("/etc/passwd");
+    EXPECT_TRUE(DsqlAuthPlugin::IsRootOwnedFile(link_to_root_file.Path()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/etc"));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile("/nonexistent/dsql-ca-bundle.crt"));
+
+    if (geteuid() == 0) {
+        GTEST_SKIP() << "files made by root are root-owned";
+    }
+    const TempConfigFile own_file("x");
+    const TempLink link_to_own_file(own_file.Path());
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(own_file.Path().c_str()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(link_to_own_file.Path()));
+    EXPECT_FALSE(DsqlAuthPlugin::IsRootOwnedFile(::testing::TempDir().c_str()));
+}
+#endif
+
+TEST_F(DsqlAuthPluginTest, RootCertHint_OldLibpqWithoutRootCert) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "");
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr,
+        "root certificate file \"/home/u/.postgresql/root.crt\" does not exist");
+    EXPECT_NE(std::string::npos, hint.find("no system CA bundle was found"));
+    EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert="));
+    // A user's own certificate, or a mode that needs none, gets no hint.
+    std::map<std::string, std::string> own_cert = {{"PQOPT", "{sslrootcert=/etc/ssl/corp-ca.pem}"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(own_cert, "");
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint(own_cert, "certificate verify failed"));
+    std::map<std::string, std::string> verify_ca = {{"SSLMODE", "verify-ca"}};
+    DsqlAuthPlugin::ApplyConnectionDefaults(verify_ca, "");
+    EXPECT_EQ("", DsqlAuthPlugin::GetRootCertHint(verify_ca, "certificate verify failed"));
+}
+
+TEST_F(DsqlAuthPluginTest, RootCertHint_BundleRootCert) {
+    std::map<std::string, std::string> conn_attr;
+    DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr, "/etc/pki/tls/certs/ca-bundle.crt");
+    const std::string_view hint = DsqlAuthPlugin::GetRootCertHint(conn_attr, "SSL error: certificate verify failed");
+    EXPECT_NE(std::string::npos, hint.find("system CA bundle"));
+    EXPECT_NE(std::string::npos, hint.find("pqopt={sslrootcert="));
+}
+
+namespace {
+    // psqlODBC's connection string for these attributes, through the connect's steps: the DSQL plugin's defaults
+    // (DsqlAuthPlugin::Connect), the forced psqlODBC options and the builder (DefaultPlugin::Connect).
+    std::string BaseDriverString(std::map<std::string, std::string> conn_attr) {
+        DsqlAuthPlugin::ApplyConnectionDefaults(conn_attr);
+        DsqlCompatibility::ApplyBaseDriverOptions(conn_attr);
+        return ConnectionStringHelper::BuildMinimumConnectionString(conn_attr);
+    }
+
+    std::map<std::string, std::string> Parsed(const std::string& conn_str) {
+        std::map<std::string, std::string> conn_attr;
+        ConnectionStringHelper::ParseConnectionString(conn_str, conn_attr);  // bool after #177: ignored
+        return conn_attr;
+    }
+
+    // The value of key in a string the builder wrote (these tests' values hold no ';'), or "<missing>".
+    std::string ValueOf(const std::string& conn_str, const std::string& key) {
+        const std::string padded = ";" + conn_str + ";";
+        const size_t start = padded.find(";" + key + "=");
+        if (start == std::string::npos) {
+            return "<missing>";
+        }
+        const size_t value_start = start + key.size() + 2;
+        return padded.substr(value_start, padded.find(';', value_start) - value_start);
+    }
+}  // namespace
+
+// psqlODBC reads SSLmode's first letter, so a braced mode would be disable: libpq would connect without TLS, and could
+// hand the token to whoever answers as the server. psqlODBC always gets a bare mode that encrypts.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_BracedSslModeArrivesBare) {
+    for (const std::string mode : {"verify-full", "verify-ca", "require", "disable"}) {
+        const std::string sent = ValueOf(BaseDriverString(Parsed("SSLmode={" + mode + "}")), "SSLMODE");
+        EXPECT_TRUE(sent == "verify-full" || sent == "verify-ca" || sent == "require") << mode << " -> " << sent;
+    }
+}
+
+// psqlODBC reads these values as written: braced, IgnoreTimeout={1} would read as 0.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_BracedForcedOptionsArriveBare) {
+    for (const char* conn_str : {"IgnoreTimeout={0};UseServerSidePrepare={1};UseDeclareFetch={1};Protocol={7.4-2}",
+                                 "IgnoreTimeout={1};UseServerSidePrepare={0};UseDeclareFetch={0};Protocol={7.4-0}",}) {
+        const std::string out = BaseDriverString(Parsed(conn_str));
+        EXPECT_EQ("1", ValueOf(out, "IGNORETIMEOUT")) << conn_str;
+        EXPECT_EQ("0", ValueOf(out, "USESERVERSIDEPREPARE")) << conn_str;
+        EXPECT_EQ("0", ValueOf(out, "USEDECLAREFETCH")) << conn_str;
+        EXPECT_EQ("7.4-0", ValueOf(out, "PROTOCOL")) << conn_str;
+    }
+}
+
+// psqlODBC removes one pair of braces from pqopt, and URL-decodes it otherwise ('+' would become a space). Typed in
+// braces, from a DSN (stored as it is, with or without braces) or not set, it arrives in exactly one pair.
+TEST_F(DsqlAuthPluginTest, BaseDriverString_PqoptArrivesInOnePairOfBraces) {
+    const std::string expected = "{sslrootcert=/tmp/a+b.pem application_name=" + EXPECTED_APP_NAME + "}";
+    for (const auto& conn_attr : {Parsed("pqopt={sslrootcert=/tmp/a+b.pem}"),
+                                  std::map<std::string, std::string>{{"PQOPT", "sslrootcert=/tmp/a+b.pem"}},
+                                  std::map<std::string, std::string>{{"PQOPT", "{sslrootcert=/tmp/a+b.pem}"}},}) {
+        EXPECT_EQ(expected, ValueOf(BaseDriverString(conn_attr), "PQOPT"));
+    }
+    EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}",
+              ValueOf(BaseDriverString({}), "PQOPT"));
+}

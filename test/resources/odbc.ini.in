@@ -31,3 +31,16 @@ BASE_DRIVER     = @BASE_DRIVER_PATH@
 Driver          = @BASE_DRIVER_PATH@
 DATABASE        = @TEST_DATABASE@
 SERVER          = @TEST_SERVER@
+
+[inte-dsql-dsn]
+Driver          = @TEST_DRIVER_PATH@
+SERVER          = @TEST_DSQL_ENDPOINT@
+RDS_AUTH_TYPE   = DSQL
+BASE_DRIVER     = @BASE_DRIVER_PATH@
+
+[inte-dsql-admin-dsn]
+Driver          = @TEST_DRIVER_PATH@
+SERVER          = @TEST_DSQL_ENDPOINT@
+RDS_AUTH_TYPE   = DSQL
+BASE_DRIVER     = @BASE_DRIVER_PATH@
+UID             = admin

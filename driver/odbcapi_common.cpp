@@ -18,6 +18,7 @@
 #include "error.h"
 #include "odbcapi_rds_helper.h"
 #include "plugin/base_plugin.h"
+#include "plugin/dsql/dsql_compatibility.h"
 #include "util/plugin_service.h"
 #include "util/rds_lib_loader.h"
 
@@ -833,6 +834,10 @@ SQLRETURN SQL_API SQLDisconnect(
         dbc->conn_status = CONN_NOT_CONNECTED;
         return SQL_SUCCESS;
     }
+    // The app's descriptors lose their base descriptors first, as ReleaseBaseHandles does: psqlODBC before 18.00.0002
+    // frees them in its SQLDisconnect, so RDS_FreeConnect, which frees the descriptors the app left, would free them
+    // again. A DESC stays the app's until it frees it or the connection; SQLSetStmtAttr allocates a base one again.
+    OdbcHelper::FreeWrappedDescs(env->driver_lib_loader, dbc);
     const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLDisconnect>(env->driver_lib_loader, RdsFuncNames::Disconnect,
         dbc->wrapped_dbc
     );
@@ -1295,6 +1300,11 @@ SQLRETURN SQL_API SQLParamData(
 #endif
 
     const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    // Aurora DSQL: as after SQLExecute, a statement that failed in a transaction is checked for before the commit.
+    // Racy by design: auto_commit and transaction_status are read without the connection's lock (taking it after the
+    // statement's would invert SQLExecute's order). Only a call racing another thread's change of autocommit or of
+    // the transaction on this connection reads a stale value; a note set that way costs one check at the commit.
+    DsqlCompatibility::NoteStatementResult(stmt->dbc, ret);
     // The last SQLParamData of an SQLExecute or SQLExecDirect ran its statement (or failed to).
     if (stmt->execute_needs_data && ret != SQL_NEED_DATA && ret != SQL_STILL_EXECUTING) {
         stmt->execute_needs_data = false;

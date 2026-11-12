@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -54,4 +55,47 @@ TEST(SecureWipeTest, ScopedWipeWipesOnScopeExit) {
     ASSERT_EQ(text.size(), resized.size());
     EXPECT_EQ(std::vector<uint32_t>(resized.size(), 0), resized);
     EXPECT_TRUE(empty.empty());
+}
+
+// SecureWipeString zeroes everything the string's buffer holds up to its capacity, an earlier and longer value too, and
+// leaves the string empty with its buffer in place.
+TEST(SecureWipeTest, WipeString_ZeroesTheWholeBuffer) {
+    constexpr size_t LONG_VALUE = 64;
+    constexpr size_t SHORT_VALUE = 10;
+    constexpr size_t SMALL_STRING_MAX = 15;
+    std::string text(LONG_VALUE, 'A');
+    text.assign(SHORT_VALUE, 'B');  // the bytes past the new end still hold the earlier value
+    const void* const buffer = text.data();
+    const size_t capacity = text.capacity();
+    ASSERT_GT(capacity, SMALL_STRING_MAX);  // on the heap, not in the small-string buffer
+    ASSERT_EQ('A', std::string_view(text.data(), capacity)[LONG_VALUE - 1]);
+
+    SecureWipeString(text);
+
+    EXPECT_TRUE(text.empty());
+    EXPECT_TRUE(buffer == text.data());
+    EXPECT_EQ(capacity, text.capacity());
+    EXPECT_EQ(std::vector<char>(capacity, '\0'), std::vector<char>(text.data(), text.data() + capacity));
+}
+
+// A value in the small-string buffer, inside the string object, is wiped there up to the capacity, an earlier and
+// longer value too.
+TEST(SecureWipeTest, WipeString_EmptyAndSmallStrings) {
+    std::string empty;
+    SecureWipeString(empty);
+    EXPECT_TRUE(empty.empty());
+
+    std::string small = "abcdefgh";
+    small.assign("abc");  // the bytes past the new end still hold the earlier value
+    const char* const buffer = small.data();
+    const size_t capacity = small.capacity();
+    const auto* const object = reinterpret_cast<const char*>(&small);
+    ASSERT_TRUE(buffer >= object && buffer < object + sizeof(std::string));  // the small-string buffer
+    ASSERT_EQ('h', std::string_view(buffer, capacity)[7]);
+
+    SecureWipeString(small);
+
+    EXPECT_TRUE(small.empty());
+    EXPECT_TRUE(buffer == small.data());
+    EXPECT_EQ(std::vector<char>(capacity, '\0'), std::vector<char>(small.data(), small.data() + capacity));
 }

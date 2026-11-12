@@ -18,7 +18,6 @@
 #include <chrono>
 #include <clocale>
 #include <cstddef>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -33,6 +32,7 @@
 #include "../../driver/plugin/dsql/dsql_error_hint_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_connection_lifetime.h"
+#include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/logger_wrapper.h"
 #include "../../driver/util/plugin_service.h"
 #include "../../driver/util/rds_strings.h"
@@ -40,7 +40,6 @@
 namespace {
     const std::string DSQL_HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-west-2.on.aws";
     const std::string AURORA_HOST = "database-1.cluster-abcdefghijkl.us-west-2.rds.amazonaws.com";
-    const std::string CLUSTER_ID = "abcdefghijklmnopqrstuvwxyz";
     const std::string AGE_HINT = "This may be Aurora DSQL's 60-minute connection limit";
     // libpq's text once the server has closed the connection; psqlODBC reports it as 08S01.
     const std::string CONNECTION_CLOSED = "server closed the connection unexpectedly";
@@ -76,9 +75,6 @@ namespace {
         SQLRETURN Connect(SQLHDBC /*ConnectionHandle*/, SQLHWND /*WindowHandle*/, SQLTCHAR* /*OutConnectionString*/,
                           SQLSMALLINT /*BufferLength*/, SQLSMALLINT* /*StringLengthPtr*/,
                           SQLUSMALLINT /*DriverCompletion*/) override {
-            if (during_connect) {
-                during_connect();
-            }
             return connect_ret;
         }
 
@@ -92,8 +88,6 @@ namespace {
         }
 
         SQLRETURN connect_ret = SQL_SUCCESS;
-        // Runs inside Connect, for example to move the clock while the connect takes time.
-        std::function<void()> during_connect;
         SQLRETURN execute_ret = SQL_SUCCESS;
         std::optional<SQL_STATE_CODE> execute_err;
         std::string execute_message;
@@ -156,13 +150,18 @@ protected:
     DBC* dbc_ = nullptr;
     STMT* stmt_ = nullptr;
     std::shared_ptr<FakeNextPlugin> next_;
-    // The clock of the connection's lifetime, which the plugin keeps.
+    // The clock of the connection's lifetime, which the plugin reads.
     std::chrono::steady_clock::time_point now_{};
+    // Read only by a lifetime a test gives both clocks.
+    std::chrono::system_clock::time_point system_now_{};
 
+    // An Aurora DSQL connect, as RDS_InitializeConnection leaves it: is_dsql decided and a lifetime.
     void SetUp() override {
         env_ = new ENV();
         dbc_ = new DBC();
         dbc_->env = env_;
+        dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}};
+        dbc_->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_->conn_attr);
         dbc_->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; });
         // Unicode builds of RDS_SQLGetDiagRec reach the OdbcHelper through the plugin service. This one has none.
         dbc_->plugin_service = std::make_shared<PluginService>();
@@ -175,6 +174,27 @@ protected:
         delete stmt_;
         delete dbc_;
         delete env_;
+    }
+
+    // The plugin's Connect, with what DefaultPlugin does to the age below it: cleared before the base connect, and
+    // started from then once it succeeds.
+    SQLRETURN ConnectPlugin(const std::shared_ptr<TestHintPlugin>& plugin,
+                            std::chrono::seconds max_lifetime = DsqlConnectionLifetime::LARGEST_MAX_LIFETIME) {
+        dbc_->dsql_lifetime->Clear();
+        const DsqlConnectionLifetime::Instant started_at = dbc_->dsql_lifetime->Now();
+        const SQLRETURN ret = plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
+        if (SQL_SUCCEEDED(ret)) {
+            dbc_->dsql_lifetime->Start(started_at, max_lifetime);
+        }
+        return ret;
+    }
+
+    // A reconnect on the handle to another engine: RDS_InitializeConnection decides it isn't Aurora DSQL, the chain
+    // stays from the first connect, and DefaultPlugin leaves the age alone.
+    SQLRETURN ReconnectToAnotherEngine(const std::shared_ptr<TestHintPlugin>& plugin) {
+        dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
+        dbc_->is_dsql = DsqlConnectionValidator::IsDsqlTarget(dbc_->conn_attr);
+        return plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT);
     }
 };
 
@@ -196,7 +216,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterTheLimit_LogsTheHintO
     next_->execute_message = CONNECTION_CLOSED;
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
@@ -204,7 +224,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterTheLimit_LogsTheHintO
     EXPECT_EQ(1, sink.Count("failed after 61 minutes"));
 
     // A new connection can get its own hint.
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(58);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -236,7 +256,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ChecksTheConnectionOnlyAfterReadingTheRe
     next_->execute_ret = SQL_ERROR;
     plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
 
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -250,7 +270,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostEarly_LogsNothingAndLeaves
     next_->execute_message = CONNECTION_CLOSED;
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(10);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -267,7 +287,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_FailureOnALiveConnection_LogsNothing) {
     plugin->dead = false;
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -280,7 +300,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_MessageLimitError_LogsNothing) {
     plugin->diag = std::make_pair(std::string("08P01"), std::string("FATAL: invalid message length"));
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -298,9 +318,9 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostWithoutASuccessfulConnect_
     CapturingLogSink sink;
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     next_->connect_ret = SQL_ERROR;
-    EXPECT_EQ(SQL_ERROR, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    EXPECT_EQ(SQL_ERROR, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -315,7 +335,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_WrapperDiagnostic_LogsNothing) {
     plugin->dead = false;
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -332,24 +352,27 @@ TEST_F(DsqlErrorHintPluginTest, Execute_UnknownConnectionState_LogsNothing) {
     plugin->dead.reset();
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
     EXPECT_EQ(0, sink.Count(AGE_HINT));
 }
 
-TEST_F(DsqlErrorHintPluginTest, AddToChain_WrapsOnlyAuroraDsqlConnections) {
+// RDS_InitializeConnection decides for the connect (is_dsql) before the chain is built; conn_attr isn't read again.
+// The lifetime is RDS_InitializeConnection's too: the plugin creates none.
+TEST_F(DsqlErrorHintPluginTest, AddToChain_OnlyAuroraDsql) {
     const std::shared_ptr<BasePlugin> head = next_;
-    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
+    dbc_->dsql_lifetime = nullptr;
+    dbc_->is_dsql = false;
+    ASSERT_EQ(DSQL_HOST, dbc_->conn_attr.at(KEY_SERVER));
     EXPECT_TRUE(DsqlErrorHintPlugin::AddToChain(dbc_, head) == head);
 
-    dbc_->conn_attr = {{KEY_SERVER, CLUSTER_ID}, {KEY_AUTH_TYPE, VALUE_AUTH_DSQL}};
-    EXPECT_TRUE(std::dynamic_pointer_cast<DsqlErrorHintPlugin>(DsqlErrorHintPlugin::AddToChain(dbc_, head)) != nullptr);
-
-    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}};
+    dbc_->is_dsql = true;
+    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
     const std::shared_ptr<BasePlugin> wrapped = DsqlErrorHintPlugin::AddToChain(dbc_, head);
     EXPECT_TRUE(std::dynamic_pointer_cast<DsqlErrorHintPlugin>(wrapped) != nullptr);
+    EXPECT_TRUE(dbc_->dsql_lifetime == nullptr);
     // It delegates to the previous head.
     next_->execute_ret = SQL_SUCCESS_WITH_INFO;
     EXPECT_EQ(SQL_SUCCESS_WITH_INFO, wrapped->Execute(stmt_, nullptr, SQL_NTS));
@@ -374,7 +397,7 @@ TEST_F(DsqlErrorHintPluginTest, Execute_LeavesTheRecordForSqlError) {
     next_->execute_err = ERR_COMMUNICATION_LINK_FAILURE;
     next_->execute_message = CONNECTION_CLOSED;
 
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
     now_ += std::chrono::minutes(61);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
@@ -490,10 +513,9 @@ TEST_F(DsqlErrorHintPluginTest, Execute_ShorterLifetime_TheHintKeepsItsThreshold
     const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
     next_->execute_ret = SQL_ERROR;
     plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
-    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}};
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin, std::chrono::seconds(1800)));
     now_ += std::chrono::minutes(31);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -509,10 +531,9 @@ TEST_F(DsqlErrorHintPluginTest, Execute_LifetimeOff_TheHintKeepsItsThreshold) {
     const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
     next_->execute_ret = SQL_ERROR;
     plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
-    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "0"}};
 
     CapturingLogSink sink;
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin, DsqlConnectionLifetime::DEFAULT_MAX_LIFETIME));
     now_ += DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD - std::chrono::seconds(1);
     EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
     EXPECT_EQ(0, sink.Count(AGE_HINT));
@@ -522,53 +543,55 @@ TEST_F(DsqlErrorHintPluginTest, Execute_LifetimeOff_TheHintKeepsItsThreshold) {
     EXPECT_EQ(1, sink.Count(AGE_HINT));
 }
 
-// The age counts from before the connect, so it is never less than the server's; a failed connect leaves none.
-TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheAgeBeforeTheConnectAndClearsItOnFailure) {
+// The machine slept: 61 minutes passed, of which the steady clock counted 30, and Aurora DSQL closed the connection.
+TEST_F(DsqlErrorHintPluginTest, Execute_ConnectionLostAfterASuspend_LogsTheHint) {
+    dbc_->dsql_lifetime = std::make_shared<DsqlConnectionLifetime>([this] { return now_; },
+                                                                   [this] { return system_now_; });
     const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
-    next_->during_connect = [this] { now_ += std::chrono::seconds(5); };
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
 
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
+    now_ += std::chrono::minutes(30);
+    system_now_ += std::chrono::minutes(61);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
+
+    EXPECT_EQ(1, sink.Count("[DSQL] The connection failed after 61 minutes. " + AGE_HINT));
+}
+
+// A handle whose first connect was Aurora DSQL keeps the hint plugin in its chain. Reconnected to another engine, the
+// age the earlier connect left isn't this connection's, and the 60-minute limit isn't its engine's.
+TEST_F(DsqlErrorHintPluginTest, Execute_ReconnectedToAnotherEngine_LogsNoAgeHint) {
+    const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("08S01"), CONNECTION_CLOSED);
+
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
+    now_ += std::chrono::minutes(61);
+    ASSERT_EQ(SQL_SUCCESS, ReconnectToAnotherEngine(plugin));
     const std::optional<std::chrono::steady_clock::duration> age = dbc_->dsql_lifetime->Age();
-    ASSERT_TRUE(age.has_value());
-    EXPECT_EQ(5, std::chrono::duration_cast<std::chrono::seconds>(age.value()).count());
+    ASSERT_TRUE(age.has_value() && age.value() >= DsqlErrorHintPlugin::CONNECTION_AGE_HINT_THRESHOLD);
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
-    next_->connect_ret = SQL_ERROR;
-    EXPECT_EQ(SQL_ERROR, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    EXPECT_FALSE(dbc_->dsql_lifetime->Age().has_value());
+    EXPECT_EQ(0, sink.Count(AGE_HINT));
+    // The call passes straight through: the record isn't read, and no dead check clears psqlODBC's connection record.
+    EXPECT_TRUE(plugin->calls.empty());
 }
 
-// Each connect starts the lifetime with the connection's MAX_CONNECTION_LIFETIME, which SQL_ATTR_CONNECTION_DEAD reads.
-TEST_F(DsqlErrorHintPluginTest, Connect_StartsTheLifetimeWithMaxConnectionLifetime) {
+// The advisory-lock hint too: the other engine, Aurora PostgreSQL, has advisory locks.
+TEST_F(DsqlErrorHintPluginTest, Execute_ReconnectedToAnotherEngine_LogsNoAdvisoryLockHint) {
     const auto plugin = std::make_shared<TestHintPlugin>(dbc_, next_);
-    // An open connection, as the rest of the chain leaves it.
-    dbc_->wrapped_dbc = static_cast<SQLHDBC>(dbc_);
-    dbc_->conn_status = CONN_CONNECTED;
+    next_->execute_ret = SQL_ERROR;
+    plugin->diag = std::make_pair(std::string("42883"),
+                                  std::string("ERROR: function pg_advisory_lock(bigint) does not exist"));
 
-    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}, {KEY_MAX_CONNECTION_LIFETIME, "1800"}};
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    now_ += std::chrono::seconds(1800) - std::chrono::milliseconds(1);
-    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
-    now_ += std::chrono::milliseconds(1);
-    EXPECT_TRUE(DsqlConnectionLifetime::IsRetired(dbc_));
+    CapturingLogSink sink;
+    ASSERT_EQ(SQL_SUCCESS, ConnectPlugin(plugin));
+    ASSERT_EQ(SQL_SUCCESS, ReconnectToAnotherEngine(plugin));
+    EXPECT_EQ(SQL_ERROR, plugin->Execute(stmt_, nullptr, SQL_NTS));
 
-    // Read again on every connect: 0 turns retirement off.
-    dbc_->conn_attr.insert_or_assign(KEY_MAX_CONNECTION_LIFETIME, "0");
-    ASSERT_EQ(SQL_SUCCESS, plugin->Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
-    now_ += std::chrono::hours(24);
-    EXPECT_FALSE(DsqlConnectionLifetime::IsRetired(dbc_));
-
-    dbc_->wrapped_dbc = SQL_NULL_HDBC;
-}
-
-// The plugin that keeps the age creates it, so SQL_ATTR_CONNECTION_DEAD can read it. Other connections get none.
-TEST_F(DsqlErrorHintPluginTest, AddToChain_GivesOnlyAuroraDsqlConnectionsALifetime) {
-    const std::shared_ptr<BasePlugin> head = next_;
-    dbc_->dsql_lifetime = nullptr;
-    dbc_->conn_attr = {{KEY_SERVER, AURORA_HOST}};
-    EXPECT_TRUE(DsqlErrorHintPlugin::AddToChain(dbc_, head) == head);
-    EXPECT_TRUE(dbc_->dsql_lifetime == nullptr);
-
-    dbc_->conn_attr = {{KEY_SERVER, DSQL_HOST}};
-    EXPECT_FALSE(DsqlErrorHintPlugin::AddToChain(dbc_, head) == head);
-    EXPECT_TRUE(dbc_->dsql_lifetime != nullptr);
+    EXPECT_EQ(0, sink.Count("[DSQL]"));
+    EXPECT_TRUE(plugin->calls.empty());
 }

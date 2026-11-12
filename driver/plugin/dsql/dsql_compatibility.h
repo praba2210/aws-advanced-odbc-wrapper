@@ -23,32 +23,51 @@
 #include <optional>
 #include <string>
 
+#include "../../util/dsql_connection_lifetime.h"
+
 struct DBC;
 struct STMT;
 
-// What the wrapper changes so that psqlODBC works on Aurora DSQL. Everything here applies only to connections
-// DsqlConnectionValidator::IsDsqlTarget calls Aurora DSQL.
+// What the wrapper changes so that psqlODBC works on Aurora DSQL. Everything here applies only to connects
+// RDS_InitializeConnection decided are Aurora DSQL (DBC::is_dsql).
 namespace DsqlCompatibility {
-    // True when the connection targets Aurora DSQL. False before the first connect, when conn_attr is still empty.
+    // True when this connect targets Aurora DSQL (dbc->is_dsql). False before the first connect.
     bool IsDsql(const DBC* dbc);
 
     // Sets the psqlODBC options Aurora DSQL needs in the upper-cased connection attributes. A value the user set is
     // replaced, with a warning when it differs. Public for tests.
     void ApplyBaseDriverOptions(std::map<std::string, std::string>& conn_attr);
 
+    // What PrepareConnect leaves for the rest of DefaultPlugin::Connect.
+    struct PreparedConnect {
+        // The moment the connect begins, for ConnectSucceeded; std::nullopt off Aurora DSQL or without a lifetime.
+        std::optional<DsqlConnectionLifetime::Instant> started_at;
+        // The 01S02 text for an SSLmode replaced with verify-full, or "".
+        std::string tls_warning;
+    };
+
     // Called by DefaultPlugin::Connect before it builds the base driver's connection string: sets the forced options
-    // and drops psqlODBC attributes set before connect that would undo them. Does nothing unless the connection
-    // targets Aurora DSQL.
-    void PrepareConnect(DBC* dbc);
+    // and drops psqlODBC attributes set before connect that would undo them. With an auth type other than DSQL it also
+    // sets the postgres database when none is set (DsqlAuthPlugin::ApplyDatabaseDefault) and, for an SSLmode psqlODBC
+    // would run as disable, the TLS defaults (DsqlAuthPlugin::ApplyTlsDefaults, OTHER_AUTH) with their 01S02 text,
+    // which a retry of the base connect within the connect returns too (DBC::dsql_tls_warning). Clears the
+    // connection's age and returns the moment the connect begins, for ConnectSucceeded. Does nothing and returns no
+    // moment and no text unless the connect targets Aurora DSQL; no moment either without a lifetime.
+    PreparedConnect PrepareConnect(DBC* dbc);
+
+    // Called by DefaultPlugin::Connect once the base driver has connected: starts the connection's age from the
+    // moment PrepareConnect returned, with its MAX_CONNECTION_LIFETIME, and drops the connect's SSLmode change
+    // (DBC::dsql_tls_warning), so the app gets one 01S02 for its connect. No age without that moment.
+    void ConnectSucceeded(DBC* dbc, const std::optional<DsqlConnectionLifetime::Instant>& started_at);
 
     // SQLSetConnectAttr on an Aurora DSQL connection, for the attributes that would undo a forced psqlODBC option or
     // make psqlODBC send a statement Aurora DSQL rejects: the result to return without calling psqlODBC, or nullopt to
-    // call it as usual.
+    // call it as usual. An autocommit change on a connected Aurora DSQL connection commits first (SQLEndTran): when
+    // that fails, its result, and autocommit isn't switched.
     std::optional<SQLRETURN> TrySetConnectAttr(DBC* dbc, SQLINTEGER attribute, SQLPOINTER value);
 
-    // SQLSetStmtAttr on an Aurora DSQL connection whose first connect built the Aurora DSQL chain (dbc->dsql_lifetime
-    // is set): a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without calling psqlODBC. nullopt for anything
-    // else.
+    // SQLSetStmtAttr on an Aurora DSQL connection: a non-zero SQL_ATTR_QUERY_TIMEOUT becomes 0 with 01S02, without
+    // calling psqlODBC. nullopt for anything else.
     std::optional<SQLRETURN> TrySetStmtAttr(STMT* stmt, SQLINTEGER attribute, SQLPOINTER value);
 
     // SQLGetConnectAttr(SQL_ATTR_TXN_ISOLATION) on an Aurora DSQL connection whose wrapped handle is allocated: writes
@@ -58,6 +77,16 @@ namespace DsqlCompatibility {
     // SQLGetInfo(SQL_DEFAULT_TXN_ISOLATION or SQL_TXN_ISOLATION_OPTION) on an Aurora DSQL connection whose wrapped
     // handle is allocated: writes SQL_TXN_REPEATABLE_READ and returns true. False for anything else.
     bool TryGetInfo(DBC* dbc, SQLUSMALLINT info_type, SQLPOINTER value, SQLSMALLINT* length);
+
+    // After SQLExecDirect, SQLExecute or SQLParamData: on an Aurora DSQL connection, notes a call that failed or warned
+    // inside a transaction (DBC::dsql_statement_failed_in_transaction), for RollBackAbortedTransaction.
+    void NoteStatementResult(DBC* dbc, SQLRETURN ret);
+
+    // Before SQLEndTran(SQL_COMMIT) on a connection: when a statement failed in the transaction, checks with SELECT 1
+    // whether Aurora DSQL ended it. 25P02 means it did: rolls it back and returns SQL_ERROR with 25S03 on the
+    // connection. Otherwise std::nullopt, for the commit to go ahead, with a warning when the check itself failed.
+    // Clears the note.
+    std::optional<SQLRETURN> RollBackAbortedTransaction(DBC* dbc);
 }  // namespace DsqlCompatibility
 
 #endif // DSQL_COMPATIBILITY_H_

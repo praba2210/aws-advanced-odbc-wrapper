@@ -79,6 +79,12 @@ namespace {
         std::vector<SQLHDESC> bound;  // the descriptor each SQLBindCol and SQLBindParameter wrote to
         int foreign = 0;
         int desc_frees = 0;
+        int dead_desc_frees = 0;  // SQLFreeHandle(DESC) on a descriptor that isn't live
+        // psqlODBC before 18.00.0002 frees every descriptor of the connection in its SQLDisconnect; 18.00.0002 and later
+        // only detach them.
+        bool free_descs_on_disconnect = false;
+        // The base driver's frees of descriptors ("desc") and its disconnects ("disconnect"), in order.
+        std::vector<std::string> order;
         // Each descriptor's records, by record number.
         std::map<SQLHDESC, std::map<SQLUSMALLINT, FakeRecord>> records;
         // Its SQLWCHAR is 4 bytes (a psqlODBC built for iODBC), else 2.
@@ -132,6 +138,10 @@ namespace {
     SQLRETURN FakeFreeHandle(SQLSMALLINT type, SQLHANDLE handle) {
         if (type == SQL_HANDLE_DESC) {
             ++desc_base_driver->desc_frees;
+            desc_base_driver->order.emplace_back("desc");
+            if (!desc_base_driver->descs.contains(handle)) {
+                ++desc_base_driver->dead_desc_frees;
+            }
             desc_base_driver->descs.erase(handle);
             desc_base_driver->records.erase(handle);
         } else if (type == SQL_HANDLE_STMT && desc_base_driver->stmts.contains(handle)) {
@@ -144,7 +154,11 @@ namespace {
         return SQL_SUCCESS;
     }
 
-    SQLRETURN FakeDisconnect(SQLHDBC /*dbc*/) {
+    SQLRETURN FakeDisconnect(SQLHDBC dbc) {
+        desc_base_driver->order.emplace_back("disconnect");
+        if (desc_base_driver->free_descs_on_disconnect) {
+            std::erase_if(desc_base_driver->descs, [dbc](const auto& entry) { return entry.second == dbc; });
+        }
         return SQL_SUCCESS;
     }
 
@@ -824,6 +838,84 @@ TEST_F(DescriptorTest, AnotherConnectionsDescriptorGetsHY024) {
     EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt));
     EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, other_desc));
     Disconnect(other_dbc);
+    Disconnect(dbc);
+}
+
+// The descriptors the app left for the disconnect lose their base descriptors before the base disconnect, once. A
+// psqlODBC before 18.00.0002 frees them in its disconnect, and the connection's later free freed them again.
+TEST_F(DescriptorTest, Disconnect_FreesTheAppsDescriptorsBeforeTheBaseDisconnect) {
+    for (const bool free_descs_on_disconnect : {true, false}) {
+        SCOPED_TRACE(free_descs_on_disconnect ? "psqlODBC 16" : "psqlODBC 18");
+        desc_base_driver = std::make_unique<FakeDescBaseDriver>();
+        desc_base_driver->free_descs_on_disconnect = free_descs_on_disconnect;
+        DBC* dbc = Connect(&base_dbc_);
+        SQLHSTMT stmt = AllocStmt(dbc);
+        SQLHDESC ard = AllocDesc(dbc);
+        EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetStmtAttr(stmt, SQL_ATTR_APP_ROW_DESC, ard, SQL_IS_POINTER));
+        EXPECT_EQ(SQL_SUCCESS, BindColumn(stmt));
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt));
+
+        Disconnect(dbc);
+
+        EXPECT_EQ((std::vector<std::string>{"desc", "disconnect"}), desc_base_driver->order);
+        EXPECT_EQ(1, desc_base_driver->desc_frees);
+        EXPECT_EQ(0, desc_base_driver->dead_desc_frees);
+    }
+}
+
+TEST_F(DescriptorTest, Disconnect_ADescriptorNeverAttachedIsFreedFirstToo) {
+    for (const bool free_descs_on_disconnect : {true, false}) {
+        SCOPED_TRACE(free_descs_on_disconnect ? "psqlODBC 16" : "psqlODBC 18");
+        desc_base_driver = std::make_unique<FakeDescBaseDriver>();
+        desc_base_driver->free_descs_on_disconnect = free_descs_on_disconnect;
+        DBC* dbc = Connect(&base_dbc_);
+        AllocDesc(dbc);
+
+        Disconnect(dbc);
+
+        EXPECT_EQ((std::vector<std::string>{"desc", "disconnect"}), desc_base_driver->order);
+        EXPECT_EQ(0, desc_base_driver->dead_desc_frees);
+    }
+}
+
+// No driver manager frees the descriptor after the disconnect: the DESC is still the app's, and its free makes no
+// base call.
+TEST_F(DescriptorTest, Disconnect_ThenTheAppFreesTheDescriptor_NoBaseCall) {
+    for (const bool free_descs_on_disconnect : {true, false}) {
+        SCOPED_TRACE(free_descs_on_disconnect ? "psqlODBC 16" : "psqlODBC 18");
+        desc_base_driver = std::make_unique<FakeDescBaseDriver>();
+        desc_base_driver->free_descs_on_disconnect = free_descs_on_disconnect;
+        DBC* dbc = Connect(&base_dbc_);
+        SQLHDESC desc = AllocDesc(dbc);
+        dbc->plugin_head = nullptr;
+        EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
+        const int frees = desc_base_driver->desc_frees;
+
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, desc));
+
+        EXPECT_EQ(frees, desc_base_driver->desc_frees);
+        EXPECT_EQ(0, desc_base_driver->dead_desc_frees);
+        EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DBC, dbc));
+    }
+}
+
+// After a reconnect on the same handle the descriptor gets a base descriptor again when a statement uses it.
+TEST_F(DescriptorTest, Reconnect_SetStmtAttrGivesTheDescriptorANewBaseDescriptor) {
+    DBC* dbc = Connect(&base_dbc_);
+    SQLHDESC ard = AllocDesc(dbc);
+    dbc->plugin_head = nullptr;
+    EXPECT_EQ(SQL_SUCCESS, SQLDisconnect(dbc));
+    ASSERT_EQ(nullptr, AsDesc(ard)->wrapped_desc);
+    dbc->conn_status = CONN_CONNECTED;
+    SQLHSTMT stmt = AllocStmt(dbc);
+
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetStmtAttr(stmt, SQL_ATTR_APP_ROW_DESC, ard, SQL_IS_POINTER));
+
+    ASSERT_NE(nullptr, AsDesc(ard)->wrapped_desc);
+    EXPECT_TRUE(desc_base_driver->descs.contains(AsDesc(ard)->wrapped_desc));
+    EXPECT_EQ(0, desc_base_driver->foreign);
+    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_STMT, stmt));
+    EXPECT_EQ(SQL_SUCCESS, SQLFreeHandle(SQL_HANDLE_DESC, ard));
     Disconnect(dbc);
 }
 

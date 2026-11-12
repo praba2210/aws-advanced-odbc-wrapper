@@ -12,7 +12,7 @@ Sample connection string, with the Unicode wrapper on Linux:
 DRIVER={AWS Advanced ODBC Wrapper Unicode};SERVER=abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws;RDS_AUTH_TYPE=DSQL;BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;
 ```
 
-`RDS_AUTH_TYPE=DSQL` makes the wrapper sign an Aurora DSQL authentication token for each connection. To retry statements that fail with an optimistic concurrency control (OCC) conflict, see the [OCC Retry Plugin](./plugins/occ-retry-plugin.md).
+`RDS_AUTH_TYPE=DSQL` makes the wrapper sign an Aurora DSQL authentication token for each connection. For its options, TLS, region and cluster IDs, see the [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md). To retry statements that fail with an optimistic concurrency control (OCC) conflict, see the [OCC Retry Plugin](./plugins/occ-retry-plugin.md).
 
 The warnings and hints on this page go to the wrapper's log, in the `aws-odbc-wrapper` folder of the user's temporary directory (see [Logging](./using-the-aws-odbc-wrapper.md#logging)).
 
@@ -24,9 +24,9 @@ The wrapper treats a connection as Aurora DSQL when any of these holds (keys and
 - `SERVER` is an Aurora DSQL endpoint, such as `abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws`
 - `DATABASE_DIALECT=AURORA_DSQL`
 
-Everything on this page applies to such a connection, whatever its authentication type.
+Everything on this page applies to such a connection, whatever its authentication type. The wrapper decides this on each connect: a connection handle that connects again, to a database that isn't Aurora DSQL, gets none of it there, including the OCC retries, hints and connection lifetime of its earlier Aurora DSQL connect.
 
-- With AWS PrivateLink, a DNS alias or an IP address in `SERVER`, and an authentication type other than `DSQL` (for example `DATABASE`, with a token you generate as `PWD`), set `DATABASE_DIALECT=AURORA_DSQL`. Otherwise the wrapper treats the connection as Aurora PostgreSQL, and nothing on this page applies.
+- With AWS PrivateLink, a DNS alias or an IP address in `SERVER`, and an authentication type other than `DSQL` (for example `DATABASE`, with a token you generate as `PWD`), set `DATABASE_DIALECT=AURORA_DSQL`, and an `SSLmode` as in [TLS](#tls). Otherwise the wrapper treats the connection as Aurora PostgreSQL, and nothing on this page applies.
 - Don't set `DATABASE_DIALECT=AURORA_DSQL` for an RDS or Aurora PostgreSQL database, for example to avoid topology queries: it turns on everything on this page.
 - When `DATABASE_DIALECT` names another dialect on an Aurora DSQL connection, the wrapper uses that dialect, which expects Aurora or RDS topology, but still applies this page. It logs a warning on each connect, for example:
 
@@ -36,22 +36,37 @@ Everything on this page applies to such a connection, whatever its authenticatio
 
 ## psqlODBC Settings the Wrapper Sets
 
-On every connect, the wrapper sets four psqlODBC options. Its value replaces yours wherever you set it: in the connection string, `BASE_CONN` or the base DSN, in the long or the short form, or in psqlODBC's `CX` flags. When your value differs, the wrapper logs a warning.
+On every connect, the wrapper sets five psqlODBC options. Its value replaces yours wherever you set it: in the connection string, `BASE_CONN` or the base DSN, in the long or the short form, or in psqlODBC's `CX` flags. When your value differs, the wrapper logs a warning.
 
-| psqlODBC Option                          | Set To  | Why                                                                                               | Warning When Your Value Differs                                                                                                                                  |
-|------------------------------------------|---------|---------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `Protocol` (short form `A1`)             | `7.4-0` | Other rollback levels make psqlODBC send `SAVEPOINT`, which Aurora DSQL doesn't support.          | `[DSQL] Overriding Protocol=<value> with 7.4-0: Aurora DSQL doesn't support savepoints`                                                                          |
-| `IgnoreTimeout` (short form `D9`)        | `1`     | A query timeout makes psqlODBC send `SET statement_timeout`, which Aurora DSQL doesn't support.   | `[DSQL] Overriding IgnoreTimeout=<value> with 1: Aurora DSQL doesn't support statement_timeout`                                                                  |
-| `UseDeclareFetch` (short form `B6`)      | `0`     | With `1`, psqlODBC reads results through `DECLARE ... CURSOR`, which Aurora DSQL doesn't support. | `[DSQL] Overriding UseDeclareFetch=<value> with 0: Aurora DSQL doesn't support cursors`                                                                          |
-| `UseServerSidePrepare` (short form `C8`) | `0`     | See [Server-Side Prepare](#server-side-prepare).                                                  | `[DSQL] Overriding UseServerSidePrepare=<value> with 0: freeing a prepared statement inside a transaction can silently roll the transaction back on Aurora DSQL` |
+| psqlODBC Option                          | Set To  | Why                                                                                                          | Warning When Your Value Differs                                                                                                                                       |
+|------------------------------------------|---------|--------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `Protocol` (short form `A1`)             | `7.4-0` | Other rollback levels make psqlODBC send `SAVEPOINT`, which Aurora DSQL doesn't support.                     | `[DSQL] Overriding Protocol=<value> with 7.4-0: Aurora DSQL doesn't support savepoints`                                                                               |
+| `IgnoreTimeout` (short form `D9`)        | `1`     | A query timeout makes psqlODBC send `SET statement_timeout`, which Aurora DSQL doesn't support.              | `[DSQL] Overriding IgnoreTimeout=<value> with 1: Aurora DSQL doesn't support statement_timeout`                                                                       |
+| `UseDeclareFetch` (short form `B6`)      | `0`     | With `1`, psqlODBC reads results through `DECLARE ... CURSOR`, which Aurora DSQL doesn't support.            | `[DSQL] Overriding UseDeclareFetch=<value> with 0: Aurora DSQL doesn't support cursors`                                                                               |
+| `UseServerSidePrepare` (short form `C8`) | `0`     | See [Server-Side Prepare](#server-side-prepare).                                                             | `[DSQL] Overriding UseServerSidePrepare=<value> with 0: freeing a prepared statement inside a transaction can silently roll the transaction back on Aurora DSQL`      |
+| `UpdatableCursors` (short form `C4`)     | `0`     | With `1`, keyset-driven and updatable cursors make psqlODBC select `ctid`, which Aurora DSQL doesn't return. | `[DSQL] Overriding UpdatableCursors=<value> with 0: Aurora DSQL doesn't return system columns such as ctid, which psqlODBC's keyset-driven and updatable cursors use` |
 
 `<value>` is your value. A value set only in `CX` is replaced without a warning.
 
 psqlODBC's connection attributes `SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE`, `SQL_ATTR_PGOPT_USE_DECLAREFETCH` and `SQL_ATTR_PGOPT_IGNORETIMEOUT` would undo three of these options. On an open Aurora DSQL connection, setting one of them to another value returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01S02`, for example `SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE changed to 0: freeing a prepared statement inside a transaction can silently roll the transaction back on Aurora DSQL`, and the option keeps the wrapper's value. A value set before connecting is dropped at connect, with a warning in the log: `[DSQL] Ignoring SQL_ATTR_PGOPT_SERVER_SIDE_PREPARE=<n> set before connect: ...`.
 
+### TLS
+
+With `RDS_AUTH_TYPE=DSQL`, the [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md#tls) sets TLS. With another authentication type, an `SSLmode` that psqlODBC doesn't run as `disable`, such as `allow`, `prefer`, `require`, `verify-ca` or `verify-full`, is left exactly as you set it: the wrapper adds no root certificate and no `application_name` to `pqopt`. Only `verify-full` checks the host name.
+
+An `SSLmode` that psqlODBC would run as `disable` (not set, `disable`, or a value that doesn't start with `a`, `p`, `r` or `v`: psqlODBC reads only the first letter, case-sensitively) becomes `verify-full`, with the same root certificate default as the Aurora DSQL plugin (see [Root Certificates](./plugins/aurora-dsql-authentication-plugin.md#root-certificates)); a full mode name in another case, such as `Require`, which psqlODBC also runs as `disable`, becomes that mode in lowercase instead. When the wrapper replaces a value you set with `verify-full`, it logs `[DSQL] Overriding SSLmode=<value> with verify-full: psqlODBC would connect without TLS, which Aurora DSQL refuses` at WARNING level, where `<value>` is your value, and the connect returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01S02`, unless it returns another warning. When it lowercases a mode, it logs `[DSQL] Lowercasing SSLmode=<value> to <mode>: psqlODBC reads the mode case-sensitively and would connect without TLS` at INFO level, where `<mode>` is the lowercase mode, and the connect returns no warning for it.
+
+With an IP address or a PrivateLink name in `SERVER`, `verify-full` fails: set `SSLmode=verify-ca` with a root certificate file, or `require`, and the cluster ID in libpq's `options`, as in [AWS PrivateLink Without Private DNS](./plugins/aurora-dsql-authentication-plugin.md#aws-privatelink-without-private-dns).
+
 ### Savepoints and Errors in a Transaction
 
-With `Protocol=7.4-0`, psqlODBC doesn't roll back a failed statement inside a transaction. After any error in a transaction, call `SQLEndTran` with `SQL_ROLLBACK` before you go on. A `COMMIT` after an error returns success but saves nothing.
+With `Protocol=7.4-0`, psqlODBC doesn't roll back a failed statement inside a transaction, and Aurora DSQL ends the whole transaction at the first error: later statements fail with SQLSTATE `25P02`. After an error in a transaction, call `SQLEndTran` with `SQL_ROLLBACK` and run the transaction again.
+
+If the application commits instead, and a call to `SQLExecDirect`, `SQLExecute` or `SQLParamData` in the transaction failed or returned `SQL_SUCCESS_WITH_INFO`, the wrapper first runs `SELECT 1`. When that fails with `25P02`, the wrapper rolls the transaction back, and `SQLEndTran` returns `SQL_ERROR` with SQLSTATE `25S03` and `The transaction was rolled back, not committed: a statement in it failed, and Aurora DSQL ends a transaction at its first error (it has no savepoints). Roll back after an error, and run the whole transaction again.` When the check fails otherwise, the wrapper commits as psqlODBC would and logs a warning. A failed catalog function doesn't start the check.
+
+Setting `SQL_ATTR_AUTOCOMMIT` on or off while a transaction is open commits it first, with the same check. When that commit fails, for example with an OCC conflict (`40001`) or `25S03`, `SQLSetConnectAttr` returns its error and autocommit stays as it was.
+
+Run transactions with autocommit off, and end them with `SQLEndTran`. After an error, a `COMMIT` sent as SQL text still returns success and saves nothing. After a `BEGIN` sent as SQL text with autocommit on, the Windows driver manager doesn't pass `SQLEndTran` to the wrapper, so no check runs there.
 
 `SAVEPOINT`, `RELEASE SAVEPOINT` and `ROLLBACK TO SAVEPOINT` statements that the application sends fail with Aurora DSQL's error.
 
@@ -66,7 +81,7 @@ With `UseServerSidePrepare=0`, psqlODBC puts the parameter values into the state
 
 `SQLNumResultCols` and `SQLDescribeCol` before `SQLExecute` still work, and a schema change no longer makes a prepared statement fail with `cached plan must not change result type`.
 
-Keyset-driven cursors (`SQL_CURSOR_KEYSET_DRIVEN`) still make psqlODBC create and free a plan, with the same risk inside a transaction, and they rely on the `ctid` column. Use forward-only or static cursors.
+psqlODBC's keyset-driven and updatable cursors use the `ctid` column, which Aurora DSQL doesn't return, so the wrapper sets `UpdatableCursors=0`. psqlODBC then makes a keyset-driven or dynamic cursor static and an updatable concurrency read-only: `SQLSetStmtAttr` returns `SQL_SUCCESS_WITH_INFO` with SQLSTATE `01S02`. `SQLSetPos` with `SQL_UPDATE`, `SQL_DELETE` or `SQL_ADD` and `SQLBulkOperations` fail: change rows with `UPDATE`, `DELETE` and `INSERT` statements.
 
 ### Large Results
 
@@ -75,9 +90,6 @@ With `UseDeclareFetch=0`, psqlODBC reads a query's whole result into memory when
 ## ODBC Calls the Wrapper Answers
 
 On an open Aurora DSQL connection, the wrapper answers some calls itself, so that psqlODBC doesn't send statements Aurora DSQL rejects.
-
-> [!NOTE]\
-> On an open connection, `SQLGetDiagField` returns psqlODBC's diagnostics instead of the wrapper's records described in this section, with the Windows driver manager and with unixODBC. Read them with `SQLGetDiagRec` or `SQLError`.
 
 ### Query Timeout
 
@@ -107,24 +119,40 @@ The wrapper knows that a connection is Aurora DSQL only once it connects. It dro
 
 ### Catalog Functions
 
-Catalog functions go to psqlODBC unchanged. `SQLStatistics` also lists an index that `CREATE INDEX ASYNC` is still building, or whose build failed.
+Catalog functions go to psqlODBC unchanged.
+
+Aurora DSQL's primary-key index includes every column of the table, after the key columns. psqlODBC reads that index, so some versions report more key columns than the table has:
+
+| Function                                  | Result on Aurora DSQL                   | Correct from psqlODBC                         |
+|-------------------------------------------|-----------------------------------------|-----------------------------------------------|
+| `SQLPrimaryKeys`                          | every column of the table               | 18.00.0002                                    |
+| `SQLStatistics`                           | every column, for the primary-key index | none: the extra columns are part of the index |
+| `SQLSpecialColumns` with `SQL_BEST_ROWID` | no columns                              | 17.00.0006                                    |
+
+A tool that builds `UPDATE` and `DELETE` statements from these key columns then matches rows on every column, which finds no row when a column is NULL or holds an inexact value. Use psqlODBC 18.00.0002 or later, and take the key from `SQLPrimaryKeys`.
+
+`SQLStatistics` also lists an index that `CREATE INDEX ASYNC` is still building, or whose build failed.
 
 ## Settings the Wrapper Rejects
 
-The wrapper checks these on every connect, before it loads the underlying driver. A problem fails the connect with `SQL_ERROR` and SQLSTATE `08001`, and the wrapper logs the message at ERROR level. An invalid option value is reported first, with SQLSTATE `01S00`, in one message that lists the invalid values (of the OCC options, only the first). Then the authentication type is checked, then the plugins, then `ENABLE_OCC_RETRY`, then `MAX_CONNECTION_LIFETIME`, and only the first of these problems is reported.
+The wrapper checks these on every connect, before it loads the underlying driver. A problem fails the connect with `SQL_ERROR` and SQLSTATE `08001`, and the wrapper logs the message at ERROR level. With `RDS_AUTH_TYPE=DSQL`, the host comes first: the connect fails with `08001` when `SERVER` and `SERVERNAME` name different hosts, or when a cluster ID in `SERVER` or `IAM_HOST` can't be expanded because the region is missing or invalid (see [Cluster IDs](./plugins/aurora-dsql-authentication-plugin.md#cluster-ids)). Then an invalid option value is reported, with SQLSTATE `01S00`, in one message that lists the invalid values (of the OCC options, only the first). Then the authentication type is checked, then the plugins, then `ENABLE_OCC_RETRY`, then `MAX_CONNECTION_LIFETIME`, and only the first of these problems is reported.
 
 ### RDS IAM Authentication Types
 
-The `RDS_AUTH_TYPE` values `IAM`, `ADFS`, `OKTA` and `AWS_SSO` sign RDS IAM tokens, which Aurora DSQL rejects. When `SERVER` or `IAM_HOST` is an Aurora DSQL endpoint, the connect fails, for example:
+The `RDS_AUTH_TYPE` values `IAM`, `ADFS`, `OKTA` and `AWS_SSO` sign RDS IAM tokens, which Aurora DSQL rejects. When `SERVER` or `IAM_HOST` is an Aurora DSQL endpoint, or `DATABASE_DIALECT` is `AURORA_DSQL`, the connect fails, for example:
 
 ```
 RDS_AUTH_TYPE=IAM doesn't work with Aurora DSQL: it signs an RDS IAM token, which Aurora DSQL rejects (SERVER is an Aurora DSQL endpoint). Use RDS_AUTH_TYPE=DSQL, which signs an Aurora DSQL token with the credentials of AWS_PROFILE or the default credential chain; for an AWS IAM Identity Center (SSO) profile, run 'aws sso login' first.
 ```
 
+With the dialect, the reason in parentheses is `DATABASE_DIALECT=AURORA_DSQL`. For an RDS or Aurora PostgreSQL database, remove `DATABASE_DIALECT`.
+
 Other authentication types are allowed:
 
 - `DATABASE`, or no `RDS_AUTH_TYPE`: `PWD` must be an Aurora DSQL token that you generate.
 - `SECRETS_MANAGER`: the secret's password must be a current Aurora DSQL token. The wrapper logs at INFO level: `[DSQL] With RDS_AUTH_TYPE=SECRETS_MANAGER, the secret's password must be a current Aurora DSQL token: DSQL accepts no other password. RDS_AUTH_TYPE=DSQL generates the token instead.`
+
+With either, when neither `DATABASE` nor its short form `DX` is set, the wrapper uses `postgres`, whatever the `SSLmode`. See [TLS](#tls) for the `SSLmode` to use.
 
 ### Aurora-Only Plugins
 
@@ -156,28 +184,31 @@ MAX_CONNECTION_LIFETIME=1800 works only with Aurora DSQL. Use an Aurora DSQL end
 
 Aurora DSQL closes every connection after 60 minutes, without an error code or message ([Cluster quotas and database limits](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). The next statement on the connection fails with SQLSTATE `08S01`, and so does every later call. The wrapper doesn't reconnect. Call `SQLDisconnect` and connect again: `SQLDriverConnect` refuses a handle that is still connected.
 
-Recycle pooled connections before they're 55 minutes old, as the Aurora DSQL connectors do. A pool in the application that limits only idle time doesn't prevent this; a driver manager's pool does, because the wrapper retires its connections, as described below.
+Recycle pooled connections before they're 55 minutes old, as the Aurora DSQL connectors do. A pool in the application that limits only idle time doesn't prevent this. For a driver manager's pool, set `MAX_CONNECTION_LIFETIME`, as described below.
 
-Once a connection is `MAX_CONNECTION_LIFETIME` seconds old, counted from the start of its connect, `SQLGetConnectAttr` with `SQL_ATTR_CONNECTION_DEAD` returns `SQL_CD_TRUE`, without asking the server. The Windows driver manager and unixODBC read this attribute before they reuse a pooled connection, and replace a connection that reports it with a new one, which gets a new token. The wrapper logs this at INFO level, once per connection:
+When `MAX_CONNECTION_LIFETIME` is set, and a connection is that many seconds old, counted from the start of its connect and including time the machine was asleep, `SQLGetConnectAttr` with `SQL_ATTR_CONNECTION_DEAD` returns `SQL_CD_TRUE`, without asking the server. The Windows driver manager and unixODBC read this attribute before they reuse a pooled connection, and replace a connection that reports it with a new one, which gets a new token. The wrapper logs this at INFO level, once per connection:
 
 ```
 [DSQL] Retiring the connection after 3300 seconds (MAX_CONNECTION_LIFETIME=3300): SQL_ATTR_CONNECTION_DEAD now reports it dead, so a connection pool replaces it.
 ```
 
-| Option                    | Description                                                                                             | Value                   | Default |
-|---------------------------|---------------------------------------------------------------------------------------------------------|-------------------------|---------|
-| `MAX_CONNECTION_LIFETIME` | The age in seconds from which `SQL_ATTR_CONNECTION_DEAD` reports a connection dead. `0` turns this off. | `0`, or `120` to `3300` | `3300`  |
+| Option                    | Description                                                                                             | Value                   | Default   |
+|---------------------------|---------------------------------------------------------------------------------------------------------|-------------------------|-----------|
+| `MAX_CONNECTION_LIFETIME` | The age in seconds from which `SQL_ATTR_CONNECTION_DEAD` reports a connection dead. `0` turns this off. | `0`, or `120` to `3300` | `0` (off) |
 
-A value outside that range fails the connect with SQLSTATE `01S00`, for example `MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)`. The wrapper reads the option on every connect. To turn retirement off, set it to `0`, also on a reused connection handle. On a connection that isn't Aurora DSQL, see [Connection Lifetime Outside Aurora DSQL](#connection-lifetime-outside-aurora-dsql).
+A value outside that range fails the connect with SQLSTATE `01S00`, for example `MAX_CONNECTION_LIFETIME=3600 (use 0 for off, or an integer from 120 to 3300)`. The wrapper reads the option on every connect. On a connection that isn't Aurora DSQL, see [Connection Lifetime Outside Aurora DSQL](#connection-lifetime-outside-aurora-dsql).
 
-In a Windows DSN, set `MAX_CONNECTION_LIFETIME` in the DSN setup dialog, on the **Aurora DSQL** tab under **Connection Lifetime**. A blank field uses the default, and the dialog checks the value when it saves the DSN.
+In a Windows DSN, set `MAX_CONNECTION_LIFETIME` in the DSN setup dialog, on the **Aurora DSQL** tab under **Connection Lifetime**. A blank field leaves it off, and the dialog checks the value when it saves the DSN.
 
-Turn on the driver manager's pool, and keep its idle timeout at 600 seconds or less, as the Aurora DSQL connectors do:
+For a driver manager's pool, set `MAX_CONNECTION_LIFETIME=3300`, turn the pool on, and keep its idle timeout at 600 seconds or less, as the Aurora DSQL connectors do:
 
 - Windows: in ODBC Data Source Administrator, on the Connection Pooling tab, turn on pooling for the wrapper's driver and set its timeout. The application turns pooling on with `SQLSetEnvAttr` and `SQL_ATTR_CONNECTION_POOLING` before it allocates its environment.
 - unixODBC: in `odbcinst.ini`, set `CPTimeout` to more than 0 and at most 600 in the wrapper's driver section, and connect with `DRIVER={<that section's name>}` or a DSN whose `Driver` names it. Turn pooling on with `Pooling=Yes` in the `[ODBC]` section, or in the application with `SQL_ATTR_CONNECTION_POOLING` (pyodbc does this by default). `CPTimeToLive` counts how often a connection is reused, not its age.
 
-Outside a driver manager's pool nothing is forced: a statement on an older connection still runs until Aurora DSQL closes it. An application that reads `SQL_ATTR_CONNECTION_DEAD` itself gets `SQL_CD_TRUE` and should disconnect and connect again, as PHP does for its persistent ODBC links (`odbc.check_persistent`, on by default). A pool inside the application, such as SQLAlchemy's, keeps its connections open, so the driver manager never checks them: set that pool's recycle age to 55 minutes or less, for example `pool_recycle=3300`.
+> [!WARNING]\
+> Set it only for connections a driver manager's pool hands out, and not for applications built on nanodbc, which reads `SQL_ATTR_CONNECTION_DEAD` before each commit: on a connection that reports itself dead, the commit returns without committing and the connection stays in manual-commit mode, so its later changes are lost too. System.Data.Odbc (.NET) reads it after a failed call and closes the connection.
+
+Without `MAX_CONNECTION_LIFETIME`, or outside a driver manager's pool, nothing is retired: a statement on an older connection still runs until Aurora DSQL closes it. PHP persistent links (`odbc.check_persistent`, on by default) also read the attribute and reconnect. A pool inside the application, such as SQLAlchemy's, keeps its connections open, so the driver manager never checks them: set that pool's recycle age to 55 minutes or less, for example `pool_recycle=3300`.
 
 When `SQLExecDirect` or `SQLExecute` fails on a connection that is at least 55 minutes old, and psqlODBC reports the connection closed, the wrapper logs this at WARNING level, once per connection:
 
@@ -200,7 +231,7 @@ The hint is logged when `SQLExecDirect` or `SQLExecute` fails and the server's m
 ### Transactions and DDL
 
 - A transaction can have one DDL statement and no DML. A second DDL statement, or a mix of DDL and DML, fails with SQLSTATE `0A000`. Run each DDL statement in its own transaction, or in autocommit mode ([DDL and distributed transactions](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-ddl.html)).
-- Aurora DSQL builds indexes in the background. Write `CREATE INDEX ASYNC`: a plain `CREATE INDEX` fails on a table that has rows. `CREATE INDEX ASYNC` returns a `job_id` at once, and queries use the index once the job completes. To wait for it, run `CALL sys.wait_for_job('<job_id>')`, which returns false when the build failed (psqlODBC returns it as `0`, and `1` when the build finished); then drop the index and create it again ([Asynchronous indexes in Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-create-index-async.html)).
+- Aurora DSQL builds indexes in the background. Write `CREATE INDEX ASYNC`: a plain `CREATE INDEX` fails on a table that has rows. `CREATE INDEX ASYNC` returns a `job_id` at once, and queries use the index once the job completes. To wait for it, run `CALL sys.wait_for_job('<job_id>')`, which returns false when the build failed (psqlODBC returns it as `0`, and `1` when the build finished); then drop the index and create it again ([Asynchronous indexes in Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-create-index-async.html)). Send it as a plain `CALL` statement: psqlODBC turns the ODBC escape `{CALL sys.wait_for_job(?)}` into a `SELECT`, which Aurora DSQL rejects for a procedure (SQLSTATE `42809`).
 - `TRUNCATE` isn't supported. Use `DELETE FROM <table>` in batches of up to 3,000 rows and 10 MiB, the most one transaction can change: a larger `DELETE` fails with SQLSTATE `54000`, also in autocommit mode. Or drop the table and create it again.
 - Temporary tables aren't supported. Use a common table expression (`WITH ...`), or a regular table that the application cleans up ([Migrating from PostgreSQL to Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-migration-guide.html)).
 
@@ -236,6 +267,7 @@ Give one statement only: the wrapper ends an option's value at the first `;`, al
 ## Additional Reading
 
 - [Using the AWS Advanced ODBC Wrapper](./using-the-aws-odbc-wrapper.md)
+- [Aurora DSQL Authentication Plugin](./plugins/aurora-dsql-authentication-plugin.md)
 - [OCC Retry Plugin](./plugins/occ-retry-plugin.md)
 - [What is Amazon Aurora DSQL?](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/what-is-aurora-dsql.html)
 - [Migrating from PostgreSQL to Aurora DSQL](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-postgresql-compatibility-migration-guide.html)

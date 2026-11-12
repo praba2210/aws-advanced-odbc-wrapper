@@ -15,11 +15,21 @@
 #include "dsql_auth_plugin.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdlib>
+#include <exception>
+#include <functional>
 #include <initializer_list>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_auth_provider.h"
@@ -27,6 +37,8 @@
 #include "../../util/map_utils.h"
 #include "../../util/rds_strings.h"
 #include "../../util/rds_utils.h"
+#include "../../util/secure_wipe.h"
+#include "dsql_plugin_helper.h"
 
 namespace {
     // psqlODBC keywords, upper-cased as in conn_attr. They aren't wrapper keys, so they reach the base driver.
@@ -39,8 +51,18 @@ namespace {
     const std::string SSLMODE_VERIFY_FULL = "verify-full";
     const std::string SSLMODE_VERIFY_CA = "verify-ca";
     const std::string SSLMODE_REQUIRE = "require";
+    const std::string SSLMODE_PREFER = "prefer";
+    const std::string SSLMODE_ALLOW = "allow";
     const std::string ROOT_CERT_KEYWORD = "sslrootcert";
     const std::string SYSTEM_ROOT_CERT = "system";
+    constexpr int LIBPQ_16 = 160000;  // first libpq where sslrootcert=system means the system's roots
+    // System CA bundles, each with Amazon Root CA 1, in this order.
+    constexpr std::array<const char*, 4> SYSTEM_CA_BUNDLES = {
+        "/etc/ssl/certs/ca-certificates.crt",  // Debian, Ubuntu, Alpine, Arch
+        "/etc/pki/tls/certs/ca-bundle.crt",    // RHEL, Fedora, Amazon Linux
+        "/etc/ssl/ca-bundle.pem",              // SUSE
+        "/etc/ssl/cert.pem",                   // macOS
+    };
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
@@ -50,9 +72,75 @@ namespace {
     // The characters libpq's isspace() skips between conninfo options.
     constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";
 
-    bool ContainsAny(const std::map<std::string, std::string>& conn_attr, std::initializer_list<std::string> keys)
+    // An environment variable a credentials chain reads when it is built, so that a change needs a new chain.
+    struct BuildEnvVar {
+        const char* name;
+        bool key_chain;  // the AWS_PROFILE key's chain reads it too, not only the default chain
+    };
+
+    // The key's chain reads its profile's files, the region variables for a profile with role_arn (the STS provider's
+    // region: AWS_REGION, then AWS_DEFAULT_REGION, then the profile's) and, for credential_source = EcsContainer, the
+    // container endpoint. The default chain also reads the region variables for its EKS web identity provider, the
+    // other web identity settings and AWS_EC2_METADATA_DISABLED.
+    constexpr std::array BUILD_ENV_VARS = {
+        BuildEnvVar{.name = "AWS_CONFIG_FILE", .key_chain = true},
+        BuildEnvVar{.name = "AWS_SHARED_CREDENTIALS_FILE", .key_chain = true},
+        BuildEnvVar{.name = "AWS_REGION", .key_chain = true},
+        BuildEnvVar{.name = "AWS_DEFAULT_REGION", .key_chain = true},
+        BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", .key_chain = true},
+        BuildEnvVar{.name = "AWS_CONTAINER_CREDENTIALS_FULL_URI", .key_chain = true},
+        BuildEnvVar{.name = "AWS_ROLE_ARN", .key_chain = false},
+        BuildEnvVar{.name = "AWS_WEB_IDENTITY_TOKEN_FILE", .key_chain = false},
+        BuildEnvVar{.name = "AWS_ROLE_SESSION_NAME", .key_chain = false},
+        BuildEnvVar{.name = "AWS_EC2_METADATA_DISABLED", .key_chain = false},
+    };
+
+    // The error for a connect that names two different hosts in SERVER and SERVERNAME (any key case; hosts compare
+    // ASCII case-insensitively), or "" when there is at most one. The token is signed for one host, and the key that
+    // loses would be dropped without a word: a DSN's SERVER would beat the connection string's SERVERNAME.
+    std::string ServernameConflict(const std::map<std::string, std::string>& conn_attr)
     {
-        return std::ranges::any_of(keys, [&conn_attr](const std::string& key) { return conn_attr.contains(key); });
+        const std::string* first = nullptr;
+        for (const auto& [key, value] : conn_attr) {
+            const std::string upper = ToAsciiUpper(key);
+            if (upper != KEY_SERVER && upper != ALIAS_KEY_SERVER_1) {
+                continue;
+            }
+            if (first == nullptr) {
+                first = &value;
+            } else if (AsciiLower(*first) != AsciiLower(value)) {
+                return std::string("DSQL Authentication failed. ") + KEY_SERVER + " and " + ALIAS_KEY_SERVER_1
+                    + " name different hosts ('" + *first + "' and '" + value + "'): set only one of them";
+            }
+        }
+        return "";
+    }
+
+    // psqlODBC reads SERVERNAME as SERVER and the later one in its connection string wins; the wrapper writes the keys
+    // in sorted order, so SERVERNAME would win. The token is signed for SERVER, so a DSQL connect keeps one host: the
+    // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. The parsers upper-case every key,
+    // and a DSN's Servername is read as SERVER (OdbcDsnHelper::LoadAll), so SERVERNAME comes only from the connection
+    // string or BASE_CONN; a key in any case matches all the same, defensively.
+    void FoldServername(std::map<std::string, std::string>& conn_attr)
+    {
+        std::optional<std::string> servername;
+        bool has_server = false;
+        for (auto it = conn_attr.begin(); it != conn_attr.end();) {
+            const std::string key = ToAsciiUpper(it->first);
+            if (key == KEY_SERVER) {
+                has_server = true;
+            } else if (key == ALIAS_KEY_SERVER_1) {
+                if (!servername) {
+                    servername = std::move(it->second);
+                }
+                it = conn_attr.erase(it);
+                continue;
+            }
+            ++it;
+        }
+        if (servername && !has_server) {
+            conn_attr.emplace(KEY_SERVER, std::move(*servername));
+        }
     }
 
     // Letters match in any case, as the endpoint pattern does; the expansion lowercases them.
@@ -106,6 +194,50 @@ namespace {
             LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
         }
         return mode.empty() ? SSLMODE_VERIFY_FULL : mode;
+    }
+
+    // psqlODBC reads SSLmode by its first byte, case-sensitively, and runs what it doesn't know as disable.
+    bool RunsAsDisable(const std::string& mode)
+    {
+        return mode.empty() || (mode[0] != 'a' && mode[0] != 'p' && mode[0] != 'r' && mode[0] != 'v');
+    }
+
+    // The mode another auth type gets in place of one psqlODBC would run as disable, which Aurora DSQL always refuses:
+    // a full mode name in another case, lowercased (psqlODBC reads Require as disable), else verify-full.
+    std::string RaiseSslModeForOtherAuth(const std::string& requested_mode)
+    {
+        const std::string requested_lower = AsciiLower(requested_mode);
+        for (const std::string& mode :
+             {SSLMODE_ALLOW, SSLMODE_PREFER, SSLMODE_REQUIRE, SSLMODE_VERIFY_CA, SSLMODE_VERIFY_FULL}) {
+            if (requested_lower == mode) {
+                // The mode the user meant, so the app gets no 01S02; the log still says it changed.
+                if (requested_mode != mode) {
+                    LOG(INFO) << "[DSQL] Lowercasing SSLmode=" << requested_mode << " to " << mode
+                              << ": psqlODBC reads the mode case-sensitively and would connect without TLS";
+                }
+                return mode;
+            }
+        }
+        if (!requested_mode.empty()) {
+            LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL
+                         << ": psqlODBC would connect without TLS, which Aurora DSQL refuses";
+        }
+        return SSLMODE_VERIFY_FULL;
+    }
+
+    // The SSLmode the user set, under its long or short keyword, or "". The long one wins, as it does in psqlODBC,
+    // which reads the sorted connection string from left to right.
+    std::string RequestedSslMode(const std::map<std::string, std::string>& conn_attr)
+    {
+        return MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
+                                        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
+    }
+
+    // The 01S02 text for a requested SSLmode replaced with verify-full.
+    std::string SslModeChangedText(const std::string& requested_mode)
+    {
+        return "SSLmode=" + requested_mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to "
+               "verify-full, verify-ca or require.";
     }
 
     bool IsConninfoSpace(char c)
@@ -183,8 +315,9 @@ namespace {
     }
 
     // pqopt is a brace-quoted libpq conninfo string. Add each option the user didn't set; keep theirs. libpq rejects
-    // sslrootcert=system with any mode weaker than verify-full, so it's only a default for verify-full.
-    std::string MergePqopt(const std::string& pqopt, const std::string& ssl_mode)
+    // sslrootcert=system with any mode weaker than verify-full, so the root certificate is only a default for
+    // verify-full, and not added when root_cert is empty.
+    std::string MergePqopt(const std::string& pqopt, const std::string& ssl_mode, std::string_view root_cert)
     {
         const std::string_view conninfo = UnwrapPqopt(pqopt);
         const std::map<std::string, std::string> options = ParseConninfo(conninfo);
@@ -194,18 +327,30 @@ namespace {
                 merged += (merged.empty() ? "" : " ") + keyword + "=" + value;
             }
         };
-        if (ssl_mode == SSLMODE_VERIFY_FULL) {
-            add_if_missing(ROOT_CERT_KEYWORD, SYSTEM_ROOT_CERT);
+        if (ssl_mode == SSLMODE_VERIFY_FULL && !root_cert.empty()) {
+            add_if_missing(ROOT_CERT_KEYWORD, std::string(root_cert));
         }
         add_if_missing("application_name", APPLICATION_NAME);
         return "{" + merged + "}";
     }
 
-    bool UsesSystemRootCert(const std::string& pqopt)
+    // What pqopt gives for sslrootcert: system or a system CA bundle (the defaults the plugin adds, though a user can set
+    // them too), another value of the user's, or none.
+    enum class RootCertSource : std::uint8_t { NONE, SYSTEM, BUNDLE, USER };
+
+    RootCertSource ClassifyRootCert(const std::string& pqopt)
     {
         const std::map<std::string, std::string> options = ParseConninfo(UnwrapPqopt(pqopt));
         const auto it = options.find(ROOT_CERT_KEYWORD);
-        return it != options.end() && it->second == SYSTEM_ROOT_CERT;
+        if (it == options.end()) {
+            return RootCertSource::NONE;
+        }
+        if (it->second == SYSTEM_ROOT_CERT) {
+            return RootCertSource::SYSTEM;
+        }
+        const bool is_bundle = std::ranges::any_of(SYSTEM_CA_BUNDLES,
+            [&it](const char* bundle) { return it->second == bundle; });
+        return is_bundle ? RootCertSource::BUNDLE : RootCertSource::USER;
     }
 
     // pqopt, or its short form D5 when only that one is set.
@@ -259,15 +404,12 @@ namespace {
         return profile.empty() ? DEFAULT_PROFILE : profile;
     }
 
-    // The profile DsqlAuthProvider signs with: the AWS_PROFILE key, else "" for the SDK's default chain, which reads
-    // the AWS_PROFILE variable itself. The SDK reads the variable as is, even when it's empty, so one with blanks
-    // around it is passed trimmed instead, and an empty or blank one as "default", the profile the SDK uses when the
-    // variable is unset.
+    // The profile the SDK's default chain is given when there is no AWS_PROFILE key: "", so that the chain reads the
+    // AWS_PROFILE variable itself. The SDK reads the variable as is, even when it's empty, so one with blanks around
+    // it is passed trimmed instead, and an empty or blank one as "default", the profile the SDK uses when the variable
+    // is unset.
     std::string GetProviderProfile(const std::map<std::string, std::string>& conn_attr)
     {
-        if (std::string profile = GetProfileKey(conn_attr); !profile.empty()) {
-            return profile;
-        }
         const char* value = std::getenv("AWS_PROFILE");
         if (value == nullptr || (value[0] != '\0' && TrimValue(value) == value)) {
             return "";
@@ -279,6 +421,12 @@ namespace {
     // expired AWS IAM Identity Center (SSO) session is the usual cause, so it says how to renew one.
     std::string CredentialsError(const std::map<std::string, std::string>& conn_attr)
     {
+        if (const std::string key = GetProfileKey(conn_attr); !key.empty() && !DsqlAuthProvider::ProfileExists(key)) {
+            return "Unable to resolve AWS credentials for DSQL authentication: the '" + std::string(KEY_AWS_PROFILE)
+                + "' profile '" + key + "' isn't in the AWS config or credentials file (~/.aws/config, "
+                  "~/.aws/credentials, or the files AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE name). Check the "
+                  "name, or remove " + std::string(KEY_AWS_PROFILE) + " to use the default credential chain.";
+        }
         const std::string profile = GetNamedProfile(conn_attr);
         if (profile.empty()) {
             return "Unable to resolve AWS credentials for DSQL authentication from the default credential chain (such "
@@ -313,12 +461,15 @@ namespace {
         return AsciiLower(region);
     }
 
-    std::shared_ptr<AuthProvider> CreateDsqlAuthProvider(DBC* dbc, const std::shared_ptr<AuthProvider>& auth_provider)
+    // With the AWS_PROFILE key only that profile signs. Without it the SDK's default chain does, which reads the
+    // AWS_PROFILE variable after the environment's keys.
+    std::shared_ptr<AuthProvider> MakeDsqlAuthProvider(const std::map<std::string, std::string>& conn_attr,
+                                                       const std::string& region)
     {
-        if (auth_provider) {
-            return auth_provider;
+        if (const std::string key = GetProfileKey(conn_attr); !key.empty()) {
+            return std::make_shared<DsqlAuthProvider>(region, key, DsqlAuthProvider::ProfileSource::KEY);
         }
-        return std::make_shared<DsqlAuthProvider>(ResolveDsqlRegion(dbc->conn_attr), GetProviderProfile(dbc->conn_attr));
+        return std::make_shared<DsqlAuthProvider>(region, GetProviderProfile(conn_attr));
     }
 }  // namespace
 
@@ -328,18 +479,58 @@ DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin
 DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin, const std::shared_ptr<AuthProvider>& auth_provider)
     : DsqlAuthPlugin(dbc, next_plugin, auth_provider, nullptr, nullptr) {}
 
+// The plugin's own provider is built by the first connect, which resolves the region it needs.
 DsqlAuthPlugin::DsqlAuthPlugin(DBC *dbc, std::shared_ptr<BasePlugin> next_plugin,
                                const std::shared_ptr<AuthProvider>& auth_provider,
                                std::shared_ptr<Dialect> dialect,
                                std::shared_ptr<OdbcHelper> odbc_helper)
-    : BaseTokenAuthPlugin(dbc, next_plugin, CreateDsqlAuthProvider(dbc, auth_provider), dialect, odbc_helper)
+    : BaseTokenAuthPlugin(dbc, next_plugin, auth_provider, dialect, odbc_helper), owns_provider_(!auth_provider)
 {
     this->plugin_name_ = "DSQL";
 }
 
-std::string DsqlAuthPlugin::ResolveRegion(DBC* dbc)
+DsqlAuthPlugin::ProviderInputs DsqlAuthPlugin::ReadProviderInputs(const std::map<std::string, std::string>& conn_attr,
+                                                                  std::string region)
 {
-    return ResolveDsqlRegion(dbc->conn_attr);
+    ProviderInputs inputs{.key_profile = GetProfileKey(conn_attr), .env_profile = std::nullopt,
+                          .region = std::move(region), .build_env = {},
+    };
+    if (const char* value = std::getenv("AWS_PROFILE"); inputs.key_profile.empty() && value) {
+        inputs.env_profile = value;
+    }
+    for (const auto& [name, key_chain] : BUILD_ENV_VARS) {
+        if (key_chain || inputs.key_profile.empty()) {
+            const char* value = std::getenv(name);
+            inputs.build_env.emplace(name, value ? std::optional<std::string>(value) : std::nullopt);
+        }
+    }
+    return inputs;
+}
+
+bool DsqlAuthPlugin::RebuildProviderIfNeeded(DBC* dbc, const std::string& region)
+{
+    ProviderInputs inputs = ReadProviderInputs(dbc->conn_attr, region);
+    if (!rebuild_provider_ && built_for_ == inputs) {
+        return true;
+    }
+    try {
+        // Built before the old one goes, so the SDK's reference count never reaches 0 in between.
+        auth_provider_ = MakeDsqlAuthProvider(dbc->conn_attr, inputs.region);
+    } catch (const std::exception& ex) {
+        const std::string message = std::string("Unable to create the AWS credentials provider: ") + ex.what();
+        LOG(ERROR) << message;
+        ClearError(dbc);
+        dbc->err = std::make_unique<ErrInfo>(message.c_str(), ERR_CLIENT_UNABLE_TO_ESTABLISH_CONNECTION);
+        return false;
+    }
+    built_for_ = std::move(inputs);
+    rebuild_provider_ = false;
+    return true;
+}
+
+std::string DsqlAuthPlugin::ResolveRegion(DBC* /*dbc*/)
+{
+    return connect_region_;
 }
 
 bool DsqlAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std::string& out_error)
@@ -351,6 +542,7 @@ bool DsqlAuthPlugin::EnsureCredentials(DBC* dbc, const std::string& region, std:
     if (auth_provider_->HasResolvedCredentials()) {
         return true;
     }
+    rebuild_provider_ = true;
     out_error = CredentialsError(dbc->conn_attr);
     return false;
 }
@@ -364,13 +556,29 @@ SQLRETURN DsqlAuthPlugin::Connect(
     SQLUSMALLINT   DriverCompletion)
 {
     DBC* dbc = static_cast<DBC*>(ConnectionHandle);
-    // Read before the defaults replace the requested mode.
-    const std::string tls_warning = GetTlsOverrideWarning(dbc->conn_attr);
-    ApplyConnectionDefaults(dbc->conn_attr);
+    // A reused handle keeps its first connect's plugin chain: a connect without RDS_AUTH_TYPE=DSQL gets no token.
+    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(dbc->conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
+        return ConnectNext(ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr,
+                           DriverCompletion);
+    }
+    const std::string tls_warning = ApplyConnectionDefaults(dbc->conn_attr,
+        DefaultRootCert(DsqlPluginHelper::BaseLibpqVersion(dbc->env ? dbc->env->driver_lib_loader : nullptr)));
+    // Once, after SERVERNAME is folded into SERVER: the provider is built for this region and the token signed for it
+    // (ResolveRegion).
+    connect_region_ = ResolveDsqlRegion(dbc->conn_attr);
+    if (owns_provider_ && !RebuildProviderIfNeeded(dbc, connect_region_)) {
+        return SQL_ERROR;
+    }
     const SQLRETURN ret = BaseTokenAuthPlugin::Connect(
         ConnectionHandle, WindowHandle, OutConnectionString, BufferLength, StringLengthPtr, DriverCompletion);
+    // The token was for this connect only: a reconnect signs a new one, and nothing reads PWD after the connect (the
+    // output connection string was built before the chain ran). psqlODBC's own copy stays with its connection.
+    if (const auto password = dbc->conn_attr.find(KEY_DB_PASSWORD); password != dbc->conn_attr.end()) {
+        SecureWipeString(password->second);
+        dbc->conn_attr.erase(password);
+    }
     // The wrapper keeps one diagnostic record per handle, and it hides the base driver's. Report the override only
-    // when the base driver has nothing to report (a short output buffer, for one, gets psqlODBC's 01004).
+    // when the base driver has nothing to report.
     if (ret != SQL_SUCCESS || tls_warning.empty()) {
         return ret;
     }
@@ -381,17 +589,78 @@ SQLRETURN DsqlAuthPlugin::Connect(
 
 void DsqlAuthPlugin::OnConnectError(DBC* dbc, const std::string& sql_state, const std::string& error_message)
 {
+    // The server rejected the token (28000, 28P01, or Aurora DSQL's "access denied", which psqlODBC reports as 08001):
+    // the keys may have been rotated or revoked since the chain read them, and a chain that caches them would keep
+    // failing, so the next connect builds a new one.
+    if (sql_state == "28000" || sql_state == "28P01" || error_message.find("access denied") != std::string::npos) {
+        rebuild_provider_ = true;
+    }
     if (const std::string_view hint = GetRootCertHint(dbc->conn_attr, error_message); !hint.empty()) {
         LOG(WARNING) << hint;
     }
 }
 
-void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr)
+std::string DsqlAuthPlugin::DefaultRootCert(const std::optional<int> libpq_version,
+                                            const std::function<bool(const char*)>& is_trusted_file)
 {
-    const std::string ssl_mode = ResolveSslMode(MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
-        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, "")));
+    if (!libpq_version) {
+        LOG(INFO) << "[DSQL] The base driver's libpq version is unknown; the sslrootcert default is system.";
+        return SYSTEM_ROOT_CERT;
+    }
+    if (*libpq_version >= LIBPQ_16) {
+        return SYSTEM_ROOT_CERT;
+    }
+    for (const char* bundle : SYSTEM_CA_BUNDLES) {
+        if (is_trusted_file(bundle)) {
+            return bundle;
+        }
+    }
+    return "";
+}
+
+bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)
+{
+#ifdef _WIN32
+    (void)path;
+    return false;
+#else
+    struct stat info {};
+    return stat(path, &info) == 0 && S_ISREG(info.st_mode) && info.st_uid == 0
+        && (info.st_mode & static_cast<mode_t>(S_IWGRP | S_IWOTH)) == 0;
+#endif
+}
+
+std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, const TlsPolicy policy,
+                                             const std::string_view root_cert)
+{
+    const std::string requested = RequestedSslMode(conn_attr);
+    // Another auth type keeps a mode psqlODBC runs exactly as set, pqopt included: the connection works today, maybe
+    // with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT) or PGAPPNAME, which a default here
+    // would override.
+    if (policy == TlsPolicy::OTHER_AUTH && !RunsAsDisable(requested)) {
+        return "";
+    }
+    const std::string ssl_mode =
+        policy == TlsPolicy::DSQL_AUTH ? ResolveSslMode(requested) : RaiseSslModeForOtherAuth(requested);
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
     conn_attr.insert_or_assign(PG_KEY_SSLMODE, ssl_mode);
+
+    const std::string& pqopt_key = PqoptKey(conn_attr);
+    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode,
+                                                     root_cert));
+
+    // A mode that was set, and wasn't verify-full in any case, was replaced.
+    if (requested.empty() || ssl_mode != SSLMODE_VERIFY_FULL || AsciiLower(requested) == SSLMODE_VERIFY_FULL) {
+        return "";
+    }
+    return SslModeChangedText(requested);
+}
+
+std::string DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
+                                                    const std::string_view root_cert)
+{
+    FoldServername(conn_attr);
+    std::string tls_warning = ApplyTlsDefaults(conn_attr, TlsPolicy::DSQL_AUTH, root_cert);
 
     // A connection string keeps USER and USERNAME as typed (only DSN entries are mapped to UID), but the token is
     // signed for UID. Move an alias to UID, so psqlODBC also gets a single user name.
@@ -402,30 +671,50 @@ void DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::string>&
         }
     }
     conn_attr.try_emplace(KEY_DB_USERNAME, DsqlAuthProvider::ADMIN_USER);
-    if (!ContainsAny(conn_attr, {KEY_DATABASE, PG_KEY_DATABASE_SHORT})) {
-        conn_attr.insert_or_assign(KEY_DATABASE, DEFAULT_DATABASE);
-    }
+    ApplyDatabaseDefault(conn_attr);
+    return tls_warning;
+}
 
-    const std::string& pqopt_key = PqoptKey(conn_attr);
-    conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode));
+void DsqlAuthPlugin::ApplyDatabaseDefault(std::map<std::string, std::string>& conn_attr)
+{
+    if (!conn_attr.contains(KEY_DATABASE) && !conn_attr.contains(PG_KEY_DATABASE_SHORT)) {
+        conn_attr.emplace(KEY_DATABASE, DEFAULT_DATABASE);
+    }
 }
 
 std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
                                                  const std::string& error_message)
 {
-    // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". On Windows it means
-    // OpenSSL's default paths, not the Windows certificate store, which can leave no root to verify against; there
-    // libpq can also report OpenSSL's "unregistered scheme" (DSQL user guide). A host name mismatch isn't matched: the
-    // roots worked there.
-    const bool root_cert_error = error_message.find("root certificate file \"system\"") != std::string::npos
+    // sslrootcert=system needs libpq 16 or later: older libpq looks for a file named "system". Before 16 the plugin
+    // adds a system CA bundle instead, or nothing when none is found, and libpq then names the root certificate file
+    // it looked for. On Windows system means OpenSSL's default paths, not the Windows certificate store, which can
+    // leave no root to verify against; there libpq can also report OpenSSL's "unregistered scheme" (DSQL user guide).
+    // A host name mismatch isn't matched: the roots worked there.
+    const bool root_cert_error = error_message.find("root certificate file") != std::string::npos
         || error_message.find("certificate verify failed") != std::string::npos
         || error_message.find("unregistered scheme") != std::string::npos;
-    if (!root_cert_error || !UsesSystemRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
+    if (!root_cert_error) {
         return "";
     }
-    return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
-           "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
-           "AmazonRootCA1.pem>} instead.";
+    switch (ClassifyRootCert(MapUtils::GetStringValue(conn_attr, PqoptKey(conn_attr), ""))) {
+    case RootCertSource::SYSTEM:
+        return "[DSQL] The server certificate couldn't be verified with sslrootcert=system, which needs libpq 16 or "
+               "later and, on Windows, OpenSSL's default certificate paths. Set pqopt={sslrootcert=<path to "
+               "AmazonRootCA1.pem>} instead.";
+    case RootCertSource::BUNDLE:
+        return "[DSQL] The server certificate couldn't be verified with the system CA bundle, which may lack Amazon "
+               "Root CA 1. Set pqopt={sslrootcert=<path to AmazonRootCA1.pem>} instead.";
+    case RootCertSource::NONE:
+        // verify-ca and require need no root default, so a missing one isn't what failed.
+        if (MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE, "") != SSLMODE_VERIFY_FULL) {
+            return "";
+        }
+        return "[DSQL] libpq 15 or earlier has no sslrootcert=system, and no system CA bundle was found. Set "
+               "pqopt={sslrootcert=<path to AmazonRootCA1.pem>}.";
+    case RootCertSource::USER:
+        break;
+    }
+    return "";
 }
 
 bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error)
@@ -433,6 +722,12 @@ bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_at
     if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
         return true;
     }
+    if (std::string conflict = ServernameConflict(conn_attr); !conflict.empty()) {
+        out_error = std::move(conflict);
+        return false;
+    }
+    // This runs before the plugin chain and reads SERVER.
+    FoldServername(conn_attr);
     std::string region;
     for (const char* key : {KEY_SERVER, KEY_IAM_HOST}) {
         const auto it = conn_attr.find(key);
@@ -473,13 +768,14 @@ bool DsqlAuthPlugin::ExpandClusterId(DBC* dbc)
     return false;
 }
 
+bool DsqlAuthPlugin::SslModeRunsAsDisable(const std::map<std::string, std::string>& conn_attr)
+{
+    return RunsAsDisable(RequestedSslMode(conn_attr));
+}
+
 std::string DsqlAuthPlugin::GetTlsOverrideWarning(const std::map<std::string, std::string>& conn_attr)
 {
-    const std::string requested = MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE,
-        MapUtils::GetStringValue(conn_attr, PG_KEY_SSLMODE_SHORT, ""));
-    if (requested.empty() || !KeptSslMode(requested).empty()) {
-        return "";
-    }
-    return "SSLmode=" + requested + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
-           "verify-ca or require.";
+    // The rule a DSQL connect applies, on a copy.
+    std::map<std::string, std::string> copy = conn_attr;
+    return ApplyTlsDefaults(copy, TlsPolicy::DSQL_AUTH, "");
 }

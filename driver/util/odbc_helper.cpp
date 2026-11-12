@@ -58,6 +58,30 @@ void OdbcHelper::FreeWrappedStmt(const std::shared_ptr<RdsLibLoader>& lib_loader
     }
 }
 
+namespace {
+// Nulls the base descriptors of the descriptors the app allocated on the connection and returns them.
+std::vector<SQLHDESC> TakeWrappedDescs(DBC* dbc) {
+    std::vector<SQLHDESC> wrapped_descs;
+    const std::list<DESC*> desc_list = dbc->desc_list;
+    for (DESC* desc : desc_list) {
+        const std::lock_guard<std::recursive_mutex> desc_lock(desc->lock);
+        if (desc->wrapped_desc) {
+            wrapped_descs.push_back(desc->wrapped_desc);
+            desc->wrapped_desc = SQL_NULL_HDESC;
+        }
+    }
+    return wrapped_descs;
+}
+}  // namespace
+
+void OdbcHelper::FreeWrappedDescs(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC* dbc) {
+    for (const SQLHDESC wrapped_desc : TakeWrappedDescs(dbc)) {
+        RdsLibLoader::CallFunctionChecked<RDS_FP_SQLFreeHandle>(lib_loader, RdsFuncNames::FreeHandle,
+            SQL_HANDLE_DESC, wrapped_desc
+        );
+    }
+}
+
 SQLHDBC OdbcHelper::ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_loader, DBC* dbc, bool free_base_dbc) {
     // Underlying statements; NULL handles crash some base drivers.
     std::vector<SQLHSTMT> wrapped_stmts;
@@ -70,15 +94,7 @@ SQLHDBC OdbcHelper::ReleaseBaseHandles(const std::shared_ptr<RdsLibLoader>& lib_
         InvalidateImplicitDescriptors(stmt);
     }
     // and underlying descriptors
-    std::vector<SQLHDESC> wrapped_descs;
-    const std::list<DESC*> desc_list = dbc->desc_list;
-    for (DESC* desc : desc_list) {
-        const std::lock_guard<std::recursive_mutex> desc_lock(desc->lock);
-        if (desc->wrapped_desc) {
-            wrapped_descs.push_back(desc->wrapped_desc);
-            desc->wrapped_desc = SQL_NULL_HDESC;
-        }
-    }
+    const std::vector<SQLHDESC> wrapped_descs = TakeWrappedDescs(dbc);
     const SQLHDBC wrapped_dbc = dbc->wrapped_dbc;
     dbc->wrapped_dbc = SQL_NULL_HDBC;
 
@@ -353,6 +369,36 @@ std::string OdbcHelper::GetStmtErrorMessage(SQLHSTMT stmt) {
 #endif
     }
     return "";
+}
+
+std::string OdbcHelper::GetStmtSqlState(SQLHSTMT stmt) {
+    return GetSqlState(SQL_HANDLE_STMT, stmt);
+}
+
+std::string OdbcHelper::GetDbcSqlState(SQLHDBC dbc) {
+    return GetSqlState(SQL_HANDLE_DBC, dbc);
+}
+
+// Read in the base driver's characters, as DefaultPlugin::Connect reads its state: bytes in the ANSI build; 2 bytes, or
+// 4 for a base driver built with a 4-byte SQLWCHAR, in the Unicode build.
+std::string OdbcHelper::GetSqlState(SQLSMALLINT handle_type, SQLHANDLE handle) const {
+    SQLTCHAR sql_state[MAX_SQL_STATE_LEN * 2] = { 0 };
+    SQLTCHAR message[MAX_MSG_LEN * 2] = { 0 };
+    SQLINTEGER native_error = 0;
+    SQLSMALLINT text_length = 0;
+    const RdsLibResult res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLGetDiagRec>(lib_loader_,
+        RdsFuncNames::GetDiagRec, handle_type, handle, 1, sql_state, &native_error, message, MAX_MSG_LEN, &text_length);
+    if (!SQL_SUCCEEDED(res.fn_result)) {
+        return "";
+    }
+#if UNICODE
+    if (use_4_bytes_base_driver_) {
+        return Convert4ByteSqlWChar(sql_state, MAX_SQL_STATE_LEN);
+    }
+    return ConvertUTF16ToUTF8(reinterpret_cast<uint16_t*>(sql_state));
+#else
+    return {reinterpret_cast<const char*>(sql_state)};
+#endif
 }
 
 // Convert base driver output to either 2-byte or 4-byte output for the client application

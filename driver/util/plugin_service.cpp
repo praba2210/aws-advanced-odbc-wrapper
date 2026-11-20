@@ -353,6 +353,11 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
 }
 
 void PluginService::UpdateDialect(DBC* dbc) {
+    // Dialects without a topology query, such as the base dialect, have nothing to discover.
+    if (this->dialect_->GetTopologyQuery().empty()) {
+        return;
+    }
+
     const DatabaseDialectType update_candidate = this->dialect_->GetUpdateCandidate();
     std::shared_ptr<Dialect> new_dialect;
     switch (update_candidate) {

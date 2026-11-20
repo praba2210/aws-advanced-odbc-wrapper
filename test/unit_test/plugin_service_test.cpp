@@ -20,9 +20,24 @@
 #include <string>
 #include <vector>
 
+#include "../../driver/dialect/dialect.h"
+#include "../../driver/driver.h"
 #include "../../driver/host_info.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/plugin_service.h"
+#include "../../driver/util/rds_lib_loader.h"
+
+namespace {
+    // Records every base-driver function the wrapper looks up, and returns nullptr so nothing is called.
+    class RecordingRdsLibLoader : public RdsLibLoader {
+    public:
+        RdsPlatform::FuncHandle GetFunction(const std::string& function_name) override {
+            requested_functions.push_back(function_name);
+            return nullptr;
+        }
+        std::vector<std::string> requested_functions;
+    };
+}  // namespace
 
 class PluginServiceTest : public testing::Test {
 protected:
@@ -103,4 +118,19 @@ TEST_F(PluginServiceTest, InitClusterId_Generated) {
     EXPECT_FALSE(returned_id.empty());
     std::string map_id = conn_info.at(KEY_CLUSTER_ID);
     EXPECT_EQ(map_id, returned_id);
+}
+
+// A host and driver the wrapper doesn't recognize get the base dialect, which has no topology query to run.
+TEST_F(PluginServiceTest, UpdateDialect_BaseDialect_SkipsTopologyQuery) {
+    const auto lib_loader = std::make_shared<RecordingRdsLibLoader>();
+    PluginService service(lib_loader, nullptr, {{KEY_SERVER, "db.internal.example.com"}}, "");
+    ASSERT_EQ(DatabaseDialectType::UNKNOWN_DIALECT, service.GetDialect()->GetDialectType());
+    DBC dbc;
+    // Any non-null handle, so a topology query would get as far as allocating a statement.
+    dbc.wrapped_dbc = reinterpret_cast<SQLHDBC>(&dbc);
+
+    service.UpdateDialect(&dbc);
+
+    EXPECT_TRUE(lib_loader->requested_functions.empty());
+    dbc.wrapped_dbc = SQL_NULL_HDBC;
 }

@@ -322,6 +322,18 @@ inline std::vector<SQLTCHAR> ConvertUserAppInputToBaseDriver(bool user_4_byte, b
 
 #include <cstring>
 
+// Uppercases a-z and nothing else, whatever the locale: for connection string and DSN keys, the option values
+// that name an enum, driver names and SQL keywords. RDS_STR_UPPER uses ICU's default locale, which under a
+// Turkish one uppercases i to a dotted capital I, so a key such as Region or a value such as iam wouldn't match.
+inline std::string ToAsciiUpper(std::string str) {
+    for (char& c : str) {
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - 'a' + 'A');
+        }
+    }
+    return str;
+}
+
 inline std::string RDS_STR_UPPER(std::string str) {
     if (!str.empty()) {
         const size_t buf_len = str.length() * 4;
@@ -345,6 +357,18 @@ inline std::string RDS_STR_UPPER(std::string str) {
         ucasemap_close(ucasemap);
         delete[] buf;
         return upper;
+    }
+    return str;
+}
+
+// Lowercases A-Z and nothing else, whatever the locale: for host names, AWS Region names and other ASCII protocol
+// text. std::tolower follows the C locale: under tr_TR.UTF-8 glibc leaves I as I, and under tr_TR.ISO-8859-9 it maps
+// I to 0xFD (dotless i). RDS_STR_UPPER follows ICU's default locale.
+inline std::string AsciiLower(std::string str) {
+    for (char& c : str) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
     }
     return str;
 }

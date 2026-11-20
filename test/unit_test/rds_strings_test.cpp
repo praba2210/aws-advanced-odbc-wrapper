@@ -17,6 +17,20 @@
 
 class RdsStringsTest : public testing::Test {};
 
+TEST_F(RdsStringsTest, ToAsciiUpper_FoldsOnlyAsciiLetters) {
+    EXPECT_EQ("REGION=IL-CENTRAL-1;UID_9", ToAsciiUpper("Region=il-central-1;Uid_9"));
+    EXPECT_EQ("", ToAsciiUpper(""));
+    // A dotless i and a u with diaeresis (UTF-8) stay as they are.
+    EXPECT_EQ("\xC4\xB1\xC3\xBC", ToAsciiUpper("\xC4\xB1\xC3\xBC"));
+}
+
+TEST_F(RdsStringsTest, AsciiLower_FoldsOnlyAsciiLetters) {
+    EXPECT_EQ("abc-xyz_019.on.aws", AsciiLower("AbC-XyZ_019.ON.AWS"));
+    EXPECT_EQ("", AsciiLower(""));
+    // UTF-8 bytes stay as they are: U+0130 (capital I with dot) and U+00DC (capital U with diaeresis).
+    EXPECT_EQ("\xC4\xB0\xC3\x9C", AsciiLower("\xC4\xB0\xC3\x9C"));
+}
+
 #ifdef UNICODE
 
 TEST_F(RdsStringsTest, SimpleConversion) {

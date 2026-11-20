@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <type_traits>
 
 #include "auth_mock_objects.h"
 
@@ -153,4 +154,10 @@ TEST_F(AuthProviderTest, GetToken_EmptySdkToken_IsNotCached) {
     AuthProvider auth_provider(mock_rds_client_);
     EXPECT_EQ(std::make_pair(std::string(""), false), auth_provider.GetToken(server, region, port, username));
     EXPECT_EQ(std::make_pair(std::string("token"), false), auth_provider.GetToken(server, region, port, username));
+}
+
+// AuthProvider has subclasses (the test mocks) and is held through base pointers. A unique_ptr<AuthProvider> or a
+// delete through the base needs a virtual destructor to destroy the right type.
+TEST_F(AuthProviderTest, AuthProvider_HasVirtualDestructor) {
+    EXPECT_TRUE(std::has_virtual_destructor_v<AuthProvider>);
 }

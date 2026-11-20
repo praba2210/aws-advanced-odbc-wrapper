@@ -28,6 +28,9 @@
 #include "../../driver/util/rds_lib_loader.h"
 
 namespace {
+    const std::string DSQL_HOST = "abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws";
+    const std::string PSQLODBC_PATH = "/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so";
+
     // Records every base-driver function the wrapper looks up, and returns nullptr so nothing is called.
     class RecordingRdsLibLoader : public RdsLibLoader {
     public:
@@ -118,6 +121,34 @@ TEST_F(PluginServiceTest, InitClusterId_Generated) {
     EXPECT_FALSE(returned_id.empty());
     std::string map_id = conn_info.at(KEY_CLUSTER_ID);
     EXPECT_EQ(map_id, returned_id);
+}
+
+TEST_F(PluginServiceTest, InitDialect_DsqlHostWithPsqlodbc) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, DSQL_HOST},
+        {KEY_DRIVER, PSQLODBC_PATH},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+// A custom DNS name or VPC endpoint doesn't match the DSQL pattern, but the auth type still says DSQL.
+TEST_F(PluginServiceTest, InitDialect_DsqlAuthTypeCustomHost) {
+    const std::map<std::string, std::string> conn_info = {
+        {KEY_SERVER, "db.internal.example.com"},
+        {KEY_DRIVER, PSQLODBC_PATH},
+        {KEY_AUTH_TYPE, "dsql"},
+    };
+    EXPECT_EQ(DatabaseDialectType::AURORA_DSQL, PluginService::InitDialect(conn_info)->GetDialectType());
+}
+
+TEST_F(PluginServiceTest, DsqlDialect_Defaults) {
+    const std::map<std::string, std::string> conn_info = {{KEY_SERVER, DSQL_HOST}};
+    const std::shared_ptr<Dialect> dialect = PluginService::InitDialect(conn_info);
+    EXPECT_EQ(5432, dialect->GetDefaultPort());
+    EXPECT_EQ("", dialect->GetTopologyQuery());
+    EXPECT_TRUE(dialect->IsSqlStateAccessError("28P01", ""));
+    EXPECT_TRUE(dialect->IsSqlStateNetworkError("08006"));
+    EXPECT_FALSE(dialect->IsSqlStateNetworkError("40001"));
 }
 
 // A host and driver the wrapper doesn't recognize get the base dialect, which has no topology query to run.

@@ -17,6 +17,7 @@
 #include <optional>
 
 #include "../dialect/dialect.h"
+#include "../dialect/dialect_aurora_dsql.h"
 #include "../dialect/dialect_aurora_mysql.h"
 #include "../dialect/dialect_aurora_postgres.h"
 #include "../driver.h"
@@ -334,6 +335,14 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
         if (RdsUtils::IsLimitlessDbShardGroupDns(host)) {
             dialect = DatabaseDialectType::AURORA_POSTGRESQL_LIMITLESS;
         }
+
+        // Aurora DSQL has no topology. Detect it, from the endpoint or the auth type, before the psqlODBC
+        // driver-name default (Aurora PostgreSQL) starts a topology monitor.
+        if (RdsUtils::IsDsqlDns(host)
+            || ToAsciiUpper(MapUtils::GetStringValue(conn_info, KEY_AUTH_TYPE, "")) == VALUE_AUTH_DSQL)
+        {
+            dialect = DatabaseDialectType::AURORA_DSQL;
+        }
     }
 
     switch (dialect) {
@@ -347,6 +356,8 @@ std::shared_ptr<Dialect> PluginService::InitDialect(const std::map<std::string, 
             return std::make_shared<DialectMultiAzClusterPostgres>();
         case DatabaseDialectType::MULTI_AZ_MYSQL:
             return std::make_shared<DialectMultiAzClusterMySql>();
+        case DatabaseDialectType::AURORA_DSQL:
+            return std::make_shared<DialectAuroraDsql>();
         default:
             return std::make_shared<Dialect>();
     }

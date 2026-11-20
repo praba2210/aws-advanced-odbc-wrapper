@@ -28,6 +28,7 @@ public:
     static bool IsRdsReaderClusterDns(const std::string& host);
     static bool IsRdsCustomClusterDns(const std::string& host);
     static bool IsLimitlessDbShardGroupDns(const std::string& host);
+    static bool IsDsqlDns(const std::string& host);
     static bool IsIpv4(const std::string& host);
     static bool IsIpv6(const std::string& host);
 
@@ -40,6 +41,7 @@ public:
     static std::string GetRdsInstanceHostPattern(const std::string& host);
     static std::string GetRdsInstanceId(const std::string& host);
     static std::string GetRdsRegion(const std::string& host);
+    static std::string GetDsqlRegion(const std::string& host);
 };
 
 #endif // RDS_UTILS_H_

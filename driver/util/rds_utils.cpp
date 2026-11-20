@@ -58,6 +58,9 @@ namespace {
     const std::regex BG_GREEN_HOST_PATTERN(R"#(.*(-green-[0-9a-z]{6})\..*)#", std::regex_constants::icase);
     const std::regex BG_GREEN_HOSTID_PATTERN(R"#((.*)-green-[0-9a-z]{6})#", std::regex_constants::icase);
     const std::regex BG_OLD_HOST_PATTERN(R"#(.*(-old1)\..*)#", std::regex_constants::icase);
+
+    // <cluster-id>.dsql[-suffix].<region>.on.aws, the same pattern the Aurora DSQL connectors use.
+    const std::regex DSQL_DNS_PATTERN(R"#(\.dsql[^.]*\.([^.]+)\.on\.aws$)#", std::regex_constants::icase);
 } // anonymous namespace
 
 bool RdsUtils::IsDnsPatternValid(const std::string& host) {
@@ -94,6 +97,10 @@ bool RdsUtils::IsRdsCustomClusterDns(const std::string& host) {
 
 bool RdsUtils::IsLimitlessDbShardGroupDns(const std::string& host) {
     return std::regex_match(host, AURORA_LIMITLESS_CLUSTER_PATTERN);
+}
+
+bool RdsUtils::IsDsqlDns(const std::string& host) {
+    return std::regex_search(host, DSQL_DNS_PATTERN);
 }
 
 bool RdsUtils::IsNotOldInstance(const std::string& host) {
@@ -229,4 +236,13 @@ bool RdsUtils::IsIpv4(const std::string& host) {
 
 bool RdsUtils::IsIpv6(const std::string& host) {
     return std::regex_match(host, IPV6_PATTERN) || std::regex_match(host, IPV6_COMPRESSED_PATTERN);
+}
+
+std::string RdsUtils::GetDsqlRegion(const std::string& host) {
+    std::smatch m;
+    if (!std::regex_search(host, m, DSQL_DNS_PATTERN)) {
+        return "";
+    }
+    // SigV4 region names are lowercase; a token signed for "US-EAST-1" never authenticates.
+    return AsciiLower(m.str(1));
 }

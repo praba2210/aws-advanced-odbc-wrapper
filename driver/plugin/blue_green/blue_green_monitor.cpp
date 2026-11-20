@@ -366,6 +366,11 @@ void BlueGreenMonitor::CollectTopology() {
 }
 
 void BlueGreenMonitor::CollectStatus() {
+    if (!this->dialect_blue_green_) {
+        // The dialect has no blue/green deployment status to query.
+        this->current_phase_ = BlueGreenPhase::NOT_CREATED;
+        return;
+    }
     if (this->hdbc_ == SQL_NULL_HDBC || this->odbc_helper_->IsClosed(this->hdbc_)) {
         return;
     }

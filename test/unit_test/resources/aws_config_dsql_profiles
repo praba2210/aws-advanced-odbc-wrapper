@@ -1,0 +1,29 @@
+# Fake profiles for DsqlAuthProviderTest. Never real credentials; the tests build providers from them but never
+# sign in or read credentials through them.
+[default]
+login_session = arn:aws:iam::111122223333:user/default
+region = us-east-1
+
+[profile env_p]
+login_session = arn:aws:iam::111122223333:user/env_p
+region = us-east-1
+
+[profile login_p]
+login_session = arn:aws:iam::111122223333:user/login_p
+region = us-west-2
+
+[profile plain]
+region = us-east-1
+
+[profile sso_p]
+sso_session = s
+sso_account_id = 111122223333
+sso_role_name = ReadOnly
+
+[sso-session s]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+
+[profile wi]
+role_arn = arn:aws:iam::111122223333:role/wi
+web_identity_token_file = no_such_web_identity_token

@@ -60,6 +60,7 @@ set(TEST_SUITE
     ${CMAKE_CURRENT_SOURCE_DIR}/rds_strings_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/round_robin_host_selector_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/secrets_manager_plugin_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/secure_wipe_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/simple_read_write_splitting_plugin_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sliding_cache_map_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sql_query_analyzer_test.cpp

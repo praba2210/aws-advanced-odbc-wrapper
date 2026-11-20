@@ -115,6 +115,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/util/rds_lib_loader.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/rds_strings.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/rds_utils.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/util/secure_wipe.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/sliding_cache_map.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/sql_query_analyzer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/util/storage/storage_service.h

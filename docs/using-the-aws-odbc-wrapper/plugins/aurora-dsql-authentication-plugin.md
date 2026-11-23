@@ -4,9 +4,11 @@
 
 The plugin works with [psqlODBC](https://github.com/postgresql-interfaces/psqlodbc) as the underlying driver: it sets psqlODBC's `SSLmode` and `pqopt` options.
 
+For what the wrapper changes on Aurora DSQL connections, see [Support for Amazon Aurora DSQL](../SupportForAuroraDSQL.md).
+
 ### Prerequisites
 
-1. An Aurora DSQL cluster, and its endpoint (`<cluster-id>.dsql.<region>.on.aws`).
+1. An Aurora DSQL cluster, and its endpoint (`<cluster-id>.dsql.<region>.on.aws`) or its cluster ID.
 2. AWS credentials allowed to connect ([Connecting to your cluster using IAM](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/authentication-authorization.html#authentication-authorization-iam-role-connect)): `dsql:DbConnectAdmin` for the `admin` role, `dsql:DbConnect` for a custom database role.
 3. For a custom database role, the role linked to your IAM identity with `AWS IAM GRANT` ([Using database roles and IAM authentication](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/using-database-and-iam-roles.html)).
 4. psqlODBC with libpq 16 or later, a system CA bundle, or a root certificate file. See [Root Certificates](#root-certificates).
@@ -16,12 +18,12 @@ The plugin works with [psqlODBC](https://github.com/postgresql-interfaces/psqlod
 | Field               | Connection Option Key | Value                                                                                                                                                                                                  | Default Value     | Sample Value                                       |
 |---------------------|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|----------------------------------------------------|
 | Authentication Type | `RDS_AUTH_TYPE`       | Must be `DSQL`.                                                                                                                                                                                        | `database`        | `DSQL`                                             |
-| Server              | `SERVER`              | The cluster endpoint. `SERVERNAME` is read as `SERVER` when `SERVER` isn't set.                                                                                                                        | nil               | `abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws` |
+| Server              | `SERVER`              | The cluster endpoint, or the cluster ID. See [Cluster IDs](#cluster-ids). `SERVERNAME` is read as `SERVER` when `SERVER` isn't set.                                                                    | nil               | `abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws` |
 | Port                | `PORT`                | Port of the cluster.                                                                                                                                                                                   | `5432`            | `5432`                                             |
 | User Name           | `UID`                 | The database role to connect as. `USER` or `USERNAME` is used when `UID` isn't set. See [Database Roles](#database-roles).                                                                             | `admin`           | `app_user`                                         |
 | Database            | `DATABASE`            | Database to connect to.                                                                                                                                                                                | `postgres`        | `postgres`                                         |
 | Region              | `REGION`              | The cluster's region, used to sign the token. Needed only when no other source has it. See [Region](#region).                                                                                          | derived           | `us-east-1`                                        |
-| IAM Host            | `IAM_HOST`            | The cluster endpoint the token is signed for. Needed only when `SERVER` isn't the cluster endpoint, as with [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns).               | `SERVER`          | `abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws` |
+| IAM Host            | `IAM_HOST`            | The cluster endpoint or cluster ID the token is signed for. Needed only when `SERVER` isn't the cluster endpoint, as with [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns). | `SERVER`          | `abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws` |
 | AWS Profile         | `AWS_PROFILE`         | AWS profile to take credentials from. With this key only that profile is used. See [AWS Credentials](#aws-credentials).                                                                                | nil               | `dev`                                              |
 | Token Expiration    | `TOKEN_EXPIRATION`    | Token lifetime in seconds. `0` means the default. See [Token Expiration](#token-expiration).                                                                                                           | `900`             | `900`                                              |
 | SSL Mode            | `SSLmode`             | psqlODBC's TLS mode: `verify-full`, `verify-ca` or `require`. Other values are replaced with `verify-full`. See [TLS](#tls).                                                                           | `verify-full`     | `verify-ca`                                        |
@@ -72,10 +74,11 @@ SERVER          = abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws
 RDS_AUTH_TYPE   = DSQL
 BASE_DRIVER     = /usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so
 
-# Any libpq version: a custom database role, an AWS profile and the CA bundle of Debian or Ubuntu
+# Any libpq version: a cluster ID, a custom database role, an AWS profile and the CA bundle of Debian or Ubuntu
 [aurora-dsql-app]
 Driver          = AWS Advanced ODBC Wrapper Unicode
-SERVER          = abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws
+SERVER          = abcdefghijklmnopqrstuvwxyz
+REGION          = us-east-1
 RDS_AUTH_TYPE   = DSQL
 UID             = app_user
 AWS_PROFILE     = dev
@@ -88,13 +91,13 @@ BASE_DRIVER     = /usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so
 In ODBC Data Source Administrator (64-bit), add a DSN for `AWS Advanced ODBC Wrapper Unicode` or `AWS Advanced ODBC Wrapper Ansi`:
 
 1. **Data Source Name**: a name for the DSN.
-2. **Server**: the cluster endpoint.
+2. **Server**: the cluster endpoint or cluster ID.
 3. **Username**: leave it blank to connect as `admin`, or enter a custom database role. Leave **Password**, **Port** and **Database** blank.
-4. **Base Driver Location**: psqlODBC's driver DLL, `psqlodbc35w.dll` for the Unicode wrapper or `psqlodbc30a.dll` for the ANSI wrapper, in psqlODBC's `bin` folder. Or set **Base Driver Data Source Name** to a psqlODBC DSN, and set that DSN's SSL Mode to `verify-full`: psqlODBC saves `disable` by default, which the plugin replaces, with a warning, on every connect (see [TLS](#tls)).
+4. **Base Driver Location**: psqlODBC's driver DLL, `psqlodbc35w.dll` for the Unicode wrapper or `psqlodbc30a.dll` for the ANSI wrapper, in psqlODBC's `bin` folder. Or set **Base Driver Data Source Name** to a psqlODBC DSN, and set that DSN's SSL Mode to `verify-full`: psqlODBC saves `disable` by default, which the plugin replaces, with a warning, on every connect (see [TLS](#tls)). That DSN also saves `UseServerSidePrepare`, `UpdatableCursors` and `IgnoreTimeout`, which the wrapper replaces on Aurora DSQL, so the log gets three `[DSQL] Overriding ...` warnings on every connect (see [psqlODBC Settings the Wrapper Sets](../SupportForAuroraDSQL.md#psqlodbc-settings-the-wrapper-sets)); **Base Driver Location** avoids them.
 5. **Base Driver Connection String**: `pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`, with forward slashes (see [Root Certificates](#root-certificates)). Separate other psqlODBC options with `;`, for example `SSLmode=verify-ca;pqopt={sslrootcert='C:/Program Files/certs/AmazonRootCA1.pem'}`.
 6. **AWS Profile**: optional. See [AWS Credentials](#aws-credentials).
 7. **Database Dialect**: leave it blank, or choose **Aurora DSQL**.
-8. On the **Authentication** tab, choose **Aurora DSQL** as the **Authentication Mode**. The tab then shows **AWS Region**, **Expire Time** and **IAM Host**. Set **AWS Region** when **Server** isn't the cluster endpoint and no environment variable or AWS profile gives the region (see [Region](#region)). **Expire Time** is in seconds; leave it blank for 900. Leave **IAM Host** blank unless you use [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns).
+8. On the **Authentication** tab, choose **Aurora DSQL** as the **Authentication Mode**. The tab then shows **AWS Region**, **Expire Time** and **IAM Host**. Set **AWS Region** when **Server** is a cluster ID and no environment variable or AWS profile gives the region (see [Region](#region)). **Expire Time** is in seconds; leave it blank for 900. Leave **IAM Host** blank unless you use [AWS PrivateLink without private DNS](#aws-privatelink-without-private-dns).
 9. Choose **Test**, then **Save** and **OK**.
 
 ### Region
@@ -108,6 +111,19 @@ The token is signed for the cluster's region. The plugin uses the first region i
 5. The `region` in the AWS config file (`~/.aws/config`, or the file `AWS_CONFIG_FILE` names) of the profile named by `AWS_PROFILE`, else by the `AWS_PROFILE` environment variable, else `default`
 
 Spaces, tabs and line breaks around each of these values are dropped, and an empty value, or one with nothing else, such as `REGION= `, counts as unset, so the next source is used. The same goes for the `AWS_PROFILE` key and the `AWS_PROFILE` environment variable (see [AWS Credentials](#aws-credentials)), but not for `SERVER` or `IAM_HOST`, which aren't trimmed. The region is used in lowercase. There's no default region, and the region isn't read from EC2 instance metadata. Aurora DSQL rejects a token signed for another region (see [Troubleshooting](#troubleshooting)).
+
+### Cluster IDs
+
+With `RDS_AUTH_TYPE=DSQL`, `SERVER` can hold the cluster ID instead of the endpoint, for example `SERVER=abcdefghijklmnopqrstuvwxyz;REGION=us-east-1`.
+
+- A value of exactly 26 letters or digits, in any case, is a cluster ID. Before connecting, the plugin replaces it with `<cluster-id>.dsql.<region>.on.aws` in lowercase, with the region from [Region](#region).
+- `IAM_HOST` is expanded the same way.
+- Any other value is used as typed: an endpoint, an IP address, `localhost`, or a name with a dot, hyphen or underscore, or of another length.
+- Only `RDS_AUTH_TYPE=DSQL` expands cluster IDs. With another authentication type, a 26-character `SERVER` is a host name.
+- The Failover plugin's `CLUSTER_ID` option is unrelated. Put the Aurora DSQL cluster ID in `SERVER`.
+- The wrapper logs the endpoint at INFO level: `[DSQL] Expanded the cluster ID in SERVER to <endpoint>` (or `IAM_HOST`).
+- If no region is found, the connect fails with `DSQL Authentication failed. Region is required when host is a cluster ID (set 'REGION')` (SQLSTATE `08001`).
+- The region becomes part of the endpoint, so it must be a DNS host label: letters, digits and hyphens, starting and ending with a letter or digit, at most 63 characters. Every AWS Region name is one. Otherwise the connect fails with `DSQL Authentication failed. Invalid region '<region>' for a cluster ID host: it must be letters, digits and hyphens, start and end with a letter or digit, and be at most 63 characters long, such as us-east-1 (set 'REGION')` (SQLSTATE `08001`). A well-formed typo, such as `us-esat-1`, still fails when the endpoint's name is looked up.
 
 ### Database Roles
 
@@ -191,10 +207,10 @@ Without private DNS, the cluster endpoint doesn't resolve to the VPC endpoint ([
 - Resolve the cluster endpoint to the VPC endpoint yourself, with a Route 53 private hosted zone or a hosts-file entry, and connect to the cluster endpoint as usual.
 - Keep `SERVER` the cluster endpoint, and give the VPC endpoint's IP address in libpq's `hostaddr`, for example `pqopt={hostaddr=10.0.1.23}`. libpq then connects to that address and still checks the certificate against `SERVER`. psqlODBC passes one address, so this uses one of the endpoint's network interfaces.
 
-If you connect to the VPC endpoint's DNS name instead, `verify-full` fails because the server certificate doesn't name it. The token must still be signed for the cluster endpoint. Set `IAM_HOST` to the cluster endpoint, `SSLmode` to `verify-ca` with a root certificate file, and the cluster ID in libpq's `options`:
+If you connect to the VPC endpoint's DNS name instead, `verify-full` fails because the server certificate doesn't name it. The token must still be signed for the cluster endpoint. Set `IAM_HOST` to the cluster endpoint or cluster ID, `SSLmode` to `verify-ca` with a root certificate file, and the cluster ID in libpq's `options`:
 
 ```
-SERVER=vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.us-east-1.vpce.amazonaws.com;IAM_HOST=abcdefghijklmnopqrstuvwxyz.dsql.us-east-1.on.aws;REGION=us-east-1;RDS_AUTH_TYPE=DSQL;SSLmode=verify-ca;pqopt={sslrootcert=/path/to/AmazonRootCA1.pem options='-c amzn-cluster-id=abcdefghijklmnopqrstuvwxyz'};BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;
+SERVER=vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.us-east-1.vpce.amazonaws.com;IAM_HOST=abcdefghijklmnopqrstuvwxyz;REGION=us-east-1;RDS_AUTH_TYPE=DSQL;SSLmode=verify-ca;pqopt={sslrootcert=/path/to/AmazonRootCA1.pem options='-c amzn-cluster-id=abcdefghijklmnopqrstuvwxyz'};BASE_DRIVER=/usr/lib/x86_64-linux-gnu/odbc/psqlodbcw.so;
 ```
 
 `verify-ca` checks that the certificate chains to Amazon Root CA 1, not whose it is: any certificate issued under that root passes.
@@ -202,6 +218,18 @@ SERVER=vpce-0123456789abcdef0-abcdefgh.dsql-fnh4.us-east-1.vpce.amazonaws.com;IA
 ### Troubleshooting
 
 The wrapper's log has more detail; see [Logging](../using-the-aws-odbc-wrapper.md#logging).
+
+#### Region is required for a cluster ID
+
+`DSQL Authentication failed. Region is required when host is a cluster ID (set 'REGION')` (SQLSTATE `08001`)
+
+`SERVER` or `IAM_HOST` holds a cluster ID and no region was found. Set `REGION` or `AWS_REGION`, add a `region` to the AWS profile, or use the cluster endpoint.
+
+#### Invalid region for a cluster ID
+
+`DSQL Authentication failed. Invalid region '<region>' for a cluster ID host: it must be letters, digits and hyphens, start and end with a letter or digit, and be at most 63 characters long, such as us-east-1 (set 'REGION')` (SQLSTATE `08001`)
+
+`SERVER` or `IAM_HOST` holds a cluster ID, and the region found for it (see [Region](#region)) isn't a DNS host label: it has a character other than letters, digits and hyphens (often a space or a dot inside the name, or a `,` or `;` in `AWS_REGION` or the AWS profile), starts or ends with a hyphen, or is longer than 63 characters. The message shows the region as it was used: in lowercase, without the spaces around it. Fix the value where it comes from, or set `REGION`.
 
 #### Missing region for a host name
 
@@ -230,6 +258,12 @@ Each fails the connect with `SQL_ERROR` before a token is signed.
 `Failed to generate DSQL authentication token. See the driver log for the cause.` (SQLSTATE `28000`)
 
 The credentials resolved, but signing the token failed. The driver log has `Failed to generate an Aurora DSQL token`.
+
+#### SERVER and SERVERNAME name different hosts
+
+`DSQL Authentication failed. SERVER and SERVERNAME name different hosts ('<host>' and '<other host>'): set only one of them` (SQLSTATE `08001`)
+
+The token is signed for one host, so with `RDS_AUTH_TYPE=DSQL`, `SERVER` and `SERVERNAME` must name the same host, in any case. Remove one of them, from the connection string or the DSN.
 
 #### SSL mode changed
 
@@ -260,10 +294,14 @@ Aurora DSQL rejected the token. Check that:
 - the credentials allow `dsql:DbConnectAdmin` (for `admin`) or `dsql:DbConnect` (for other roles) on the cluster;
 - a custom role is linked to the IAM identity with `AWS IAM GRANT`, and `UID` is the role's name;
 - the region is the cluster's region (for a token signed for another region, the message continues with `Credential should be scoped to a valid region.`);
-- `IAM_HOST`, if set, is the cluster endpoint.
+- `IAM_HOST`, if set, is the cluster endpoint or cluster ID.
 
 #### Invalid token expiration
 
 `Invalid value specified for connection string attribute:` followed by `TOKEN_EXPIRATION` (SQLSTATE `01S00`)
 
 `TOKEN_EXPIRATION` must be a whole number of seconds, `0` or more. A value above 604,800 passes this check but fails when the connection opens (see [Token Expiration](#token-expiration)).
+
+### See Also
+
+- [Support for Amazon Aurora DSQL](../SupportForAuroraDSQL.md): what the wrapper changes on Aurora DSQL connections, and the Aurora DSQL behaviors the application handles.

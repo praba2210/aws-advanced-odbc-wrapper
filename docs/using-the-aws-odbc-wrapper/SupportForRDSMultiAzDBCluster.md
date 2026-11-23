@@ -67,6 +67,7 @@ The wrapper accepts a `DATABASE_DIALECT` parameter in the DSN or connection stri
 | `AURORA_MYSQL`                | Aurora MySQL                            |
 | `MULTI_AZ_POSTGRESQL`         | RDS Multi-AZ DB Cluster (PostgreSQL)    |
 | `MULTI_AZ_MYSQL`              | RDS Multi-AZ DB Cluster (MySQL)         |
+| `AURORA_DSQL`                 | Aurora DSQL                             |
 
 When `DATABASE_DIALECT` is omitted, the wrapper attempts to detect the dialect automatically as described in [General Usage](#general-usage).
 

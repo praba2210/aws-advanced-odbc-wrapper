@@ -9,6 +9,7 @@ Before using the AWS Advanced ODBC Wrapper, you must install:
 - and an underlying ODBC Driver of your choice
     - To use the wrapper with Aurora or RDS with PostgreSQL compatibility, install the [psqlodbc PostgreSQL ODBC Driver](https://github.com/postgresql-interfaces/psqlodbc).
     - To use the wrapper with Aurora or RDS with MySQL compatibility, install either [MySQL Connector/ODBC](https://dev.mysql.com/downloads/connector/odbc/) or [MariaDB Connector/ODBC](https://mariadb.com/downloads/connectors/connectors-data-access/odbc-connector/). See the [underlying driver compatibility](./using-the-aws-odbc-wrapper/using-the-aws-odbc-wrapper.md#underlying-driver-compatibility) notes - if you need IAM authentication with Aurora MySQL, use MariaDB Connector/ODBC, as MySQL Connector/ODBC has a connection string length limitation that prevents it from carrying an IAM token.
+    - To use the wrapper with Aurora DSQL, install the [psqlodbc PostgreSQL ODBC Driver](https://github.com/postgresql-interfaces/psqlodbc); see [Support for Amazon Aurora DSQL](./using-the-aws-odbc-wrapper/SupportForAuroraDSQL.md).
 
 ## Obtaining the AWS Advanced ODBC Wrapper
 

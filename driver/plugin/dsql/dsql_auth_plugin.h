@@ -15,6 +15,7 @@
 #ifndef DSQL_AUTH_PLUGIN_H_
 #define DSQL_AUTH_PLUGIN_H_
 
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -45,18 +46,25 @@ public:
         SQLSMALLINT *  StringLengthPtr,
         SQLUSMALLINT   DriverCompletion) override;
 
-    // Sets SSLMODE, dropping its short form CA: verify-full, verify-ca and require stay; anything else becomes
-    // verify-full. Merges pqopt: root_cert as sslrootcert for verify-full (none when it is ""), and the application
-    // name, each only when the user's pqopt doesn't set it. Returns the 01S02 text for a mode it replaced with
-    // verify-full, or "". ApplyConnectionDefaults calls it.
-    static std::string ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, std::string_view root_cert);
+    // Which SSLmode values ApplyTlsDefaults keeps.
+    enum class TlsPolicy : std::uint8_t {
+        DSQL_AUTH,   // RDS_AUTH_TYPE=DSQL: verify-full, verify-ca and require stay; anything else becomes verify-full
+        OTHER_AUTH,  // another auth type on an Aurora DSQL target: only what psqlODBC would run as disable changes
+    };
+
+    // Sets SSLMODE by the policy, dropping its short form CA, and merges pqopt: root_cert as sslrootcert for
+    // verify-full (none when it is ""), and the application name, each only when the user's pqopt doesn't set it.
+    // With OTHER_AUTH a mode psqlODBC runs is left as set, pqopt included. Returns the 01S02 text for a mode it
+    // replaced with verify-full, or "". Public for tests.
+    static std::string ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, TlsPolicy policy,
+                                        std::string_view root_cert);
 
     // Sets DATABASE to postgres, Aurora DSQL's only database, when neither DATABASE nor its short form DX is set:
     // libpq would use the user name. ApplyConnectionDefaults calls it.
     static void ApplyDatabaseDefault(std::map<std::string, std::string>& conn_attr);
 
     // Applies the Aurora DSQL connection defaults to the upper-cased connection attributes, the TLS ones with
-    // ApplyTlsDefaults, and returns its 01S02 text. root_cert is the sslrootcert value a verify-full
+    // ApplyTlsDefaults(DSQL_AUTH), and returns its 01S02 text. root_cert is the sslrootcert value a verify-full
     // connection gets when pqopt sets none (DefaultRootCert), or "" for no default. Public for tests.
     static std::string ApplyConnectionDefaults(std::map<std::string, std::string>& conn_attr,
                                                std::string_view root_cert = "system");
@@ -75,6 +83,12 @@ public:
     // system CA bundle) or on none, or "" when the error has nothing to do with it. Public for tests.
     static std::string_view GetRootCertHint(const std::map<std::string, std::string>& conn_attr,
                                             const std::string& error_message);
+
+    // When RDS_AUTH_TYPE is DSQL: folds SERVERNAME (any key case) into SERVER and erases it, its value becoming SERVER
+    // when there is none, and replaces an Aurora DSQL cluster ID in SERVER or IAM_HOST with the cluster endpoint,
+    // <id>.dsql.<region>.on.aws. Returns false, with the connect error in out_error, when SERVER and SERVERNAME name
+    // different hosts, when no region resolves, or when the region isn't a DNS host label. Public for tests.
+    static bool ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error);
 
 protected:
     // The region Connect resolved for this connect.

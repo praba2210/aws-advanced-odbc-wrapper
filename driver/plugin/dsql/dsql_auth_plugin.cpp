@@ -51,6 +51,8 @@ namespace {
     const std::string SSLMODE_VERIFY_FULL = "verify-full";
     const std::string SSLMODE_VERIFY_CA = "verify-ca";
     const std::string SSLMODE_REQUIRE = "require";
+    const std::string SSLMODE_PREFER = "prefer";
+    const std::string SSLMODE_ALLOW = "allow";
     const std::string ROOT_CERT_KEYWORD = "sslrootcert";
     const std::string SYSTEM_ROOT_CERT = "system";
     constexpr int LIBPQ_16 = 160000;  // first libpq where sslrootcert=system means the system's roots
@@ -64,6 +66,9 @@ namespace {
     const std::string DEFAULT_PROFILE = "default";
     const std::string DEFAULT_DATABASE = "postgres";
     const std::string APPLICATION_NAME = std::string("aurora-dsql-odbc/") + DRIVER_VERSION;
+    // An Aurora DSQL cluster ID: 26 letters or digits. The connectors match lowercase only; any case is accepted
+    // here and lowercased.
+    constexpr size_t CLUSTER_ID_LENGTH = 26;
     // The characters libpq's isspace() skips between conninfo options.
     constexpr std::string_view CONNINFO_SPACES = " \t\n\v\f\r";
 
@@ -90,6 +95,27 @@ namespace {
         BuildEnvVar{.name = "AWS_EC2_METADATA_DISABLED", .key_chain = false},
     };
 
+    // The error for a connect that names two different hosts in SERVER and SERVERNAME (any key case; hosts compare
+    // ASCII case-insensitively), or "" when there is at most one. The token is signed for one host, and the key that
+    // loses would be dropped without a word: a DSN's SERVER would beat the connection string's SERVERNAME.
+    std::string ServernameConflict(const std::map<std::string, std::string>& conn_attr)
+    {
+        const std::string* first = nullptr;
+        for (const auto& [key, value] : conn_attr) {
+            const std::string upper = ToAsciiUpper(key);
+            if (upper != KEY_SERVER && upper != ALIAS_KEY_SERVER_1) {
+                continue;
+            }
+            if (first == nullptr) {
+                first = &value;
+            } else if (AsciiLower(*first) != AsciiLower(value)) {
+                return std::string("DSQL Authentication failed. ") + KEY_SERVER + " and " + ALIAS_KEY_SERVER_1
+                    + " name different hosts ('" + *first + "' and '" + value + "'): set only one of them";
+            }
+        }
+        return "";
+    }
+
     // psqlODBC reads SERVERNAME as SERVER and the later one in its connection string wins; the wrapper writes the keys
     // in sorted order, so SERVERNAME would win. The token is signed for SERVER, so a DSQL connect keeps one host: the
     // SERVERNAME value when there is no SERVER, and nothing of SERVERNAME otherwise. The parsers upper-case every key,
@@ -115,6 +141,29 @@ namespace {
         if (servername && !has_server) {
             conn_attr.emplace(KEY_SERVER, std::move(*servername));
         }
+    }
+
+    // Letters match in any case, as the endpoint pattern does; the expansion lowercases them.
+    bool IsClusterId(const std::string& host)
+    {
+        return host.size() == CLUSTER_ID_LENGTH && std::ranges::all_of(host, [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        });
+    }
+
+    // The region is one label of the cluster endpoint, so it must follow the DNS host label rule: letters, digits and
+    // hyphens, starting and ending with a letter or digit, at most 63 characters. It's checked after the lowercase
+    // fold. The region names of every partition pass it (us-gov-west-1, cn-north-1, us-isob-east-1, eusc-de-east-1
+    // too); a list of names or the partition patterns would need a driver update for each new one. The check is only
+    // about the label: the expansion's .on.aws suffix is the commercial partition's.
+    bool IsRegionName(std::string_view region)
+    {
+        constexpr size_t MAX_LABEL_LENGTH = 63;
+        const auto is_alnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
+        return !region.empty() && region.size() <= MAX_LABEL_LENGTH && is_alnum(region.front())
+            && is_alnum(region.back()) && std::ranges::all_of(region, [&is_alnum](char c) {
+                   return is_alnum(c) || c == '-';
+               });
     }
 
     // The mode Aurora DSQL keeps for the requested one, lowercase, or "" when it's replaced. verify-ca and require
@@ -150,6 +199,35 @@ namespace {
             LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL;
         }
         return mode.empty() ? SSLMODE_VERIFY_FULL : mode;
+    }
+
+    // psqlODBC reads SSLmode by its first byte, case-sensitively, and runs what it doesn't know as disable.
+    bool RunsAsDisable(const std::string& mode)
+    {
+        return mode.empty() || (mode[0] != 'a' && mode[0] != 'p' && mode[0] != 'r' && mode[0] != 'v');
+    }
+
+    // The mode another auth type gets in place of one psqlODBC would run as disable, which Aurora DSQL always refuses:
+    // a full mode name in another case, lowercased (psqlODBC reads Require as disable), else verify-full.
+    std::string RaiseSslModeForOtherAuth(const std::string& requested_mode)
+    {
+        const std::string requested_lower = AsciiLower(requested_mode);
+        for (const std::string& mode :
+             {SSLMODE_ALLOW, SSLMODE_PREFER, SSLMODE_REQUIRE, SSLMODE_VERIFY_CA, SSLMODE_VERIFY_FULL}) {
+            if (requested_lower == mode) {
+                // The mode the user meant, so the app gets no 01S02; the log still says it changed.
+                if (requested_mode != mode) {
+                    LOG(INFO) << "[DSQL] Lowercasing SSLmode=" << requested_mode << " to " << mode
+                              << ": psqlODBC reads the mode case-sensitively and would connect without TLS";
+                }
+                return mode;
+            }
+        }
+        if (!requested_mode.empty()) {
+            LOG(WARNING) << "[DSQL] Overriding SSLmode=" << requested_mode << " with " << SSLMODE_VERIFY_FULL
+                         << ": psqlODBC would connect without TLS, which Aurora DSQL refuses";
+        }
+        return SSLMODE_VERIFY_FULL;
     }
 
     // The SSLmode the user set, under its long or short keyword, or "". The long one wins, as it does in psqlODBC,
@@ -369,8 +447,8 @@ namespace {
     // endpoint without private DNS, SERVER is the endpoint's own name), then AWS_REGION / AWS_DEFAULT_REGION (the
     // order most DSQL connectors use), then the region of the credentials' profile. There is no default region: an
     // empty result fails the connect with "Missing required parameters: Region". Each value is trimmed, so a blank one
-    // counts as unset, and the result is lowercased in ASCII: SigV4 signs the region as given, and region names are
-    // lowercase.
+    // counts as unset, and the result is lowercased in ASCII: SigV4 signs the region as given, region names are
+    // lowercase, and the signing region must match the one a cluster ID expands with.
     std::string ResolveDsqlRegion(const std::map<std::string, std::string>& conn_attr)
     {
         std::string region = TrimValue(MapUtils::GetStringValue(conn_attr, KEY_REGION, ""));
@@ -561,11 +639,18 @@ bool DsqlAuthPlugin::IsRootOwnedFile(const char* path)
 #endif
 }
 
-std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr,
+std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>& conn_attr, const TlsPolicy policy,
                                              const std::string_view root_cert)
 {
     const std::string requested = RequestedSslMode(conn_attr);
-    const std::string ssl_mode = ResolveSslMode(requested);
+    // Another auth type keeps a mode psqlODBC runs exactly as set, pqopt included: the connection works today, maybe
+    // with the user's own root certificate (~/.postgresql/root.crt, PGSSLROOTCERT) or PGAPPNAME, which a default here
+    // would override.
+    if (policy == TlsPolicy::OTHER_AUTH && !RunsAsDisable(requested)) {
+        return "";
+    }
+    const std::string ssl_mode =
+        policy == TlsPolicy::DSQL_AUTH ? ResolveSslMode(requested) : RaiseSslModeForOtherAuth(requested);
     conn_attr.erase(PG_KEY_SSLMODE_SHORT);
     conn_attr.insert_or_assign(PG_KEY_SSLMODE, ssl_mode);
 
@@ -573,8 +658,8 @@ std::string DsqlAuthPlugin::ApplyTlsDefaults(std::map<std::string, std::string>&
     conn_attr.insert_or_assign(pqopt_key, MergePqopt(MapUtils::GetStringValue(conn_attr, pqopt_key, ""), ssl_mode,
                                                      root_cert));
 
-    // A mode that was set and isn't kept was replaced.
-    if (requested.empty() || !KeptSslMode(requested).empty()) {
+    // A mode that was set, isn't kept and became verify-full was replaced; OTHER_AUTH may only lowercase one.
+    if (requested.empty() || ssl_mode != SSLMODE_VERIFY_FULL || !KeptSslMode(requested).empty()) {
         return "";
     }
     return SslModeChangedText(requested);
@@ -584,7 +669,7 @@ std::string DsqlAuthPlugin::ApplyConnectionDefaults(std::map<std::string, std::s
                                                     const std::string_view root_cert)
 {
     FoldServername(conn_attr);
-    std::string tls_warning = ApplyTlsDefaults(conn_attr, root_cert);
+    std::string tls_warning = ApplyTlsDefaults(conn_attr, TlsPolicy::DSQL_AUTH, root_cert);
 
     // A connection string keeps USER and USERNAME as typed (only DSN entries are mapped to UID), but the token is
     // signed for UID. Move an alias to UID, so psqlODBC also gets a single user name.
@@ -639,4 +724,43 @@ std::string_view DsqlAuthPlugin::GetRootCertHint(const std::map<std::string, std
         break;
     }
     return "";
+}
+
+bool DsqlAuthPlugin::ExpandClusterId(std::map<std::string, std::string>& conn_attr, std::string& out_error)
+{
+    if (AuthProvider::AuthTypeFromString(MapUtils::GetStringValue(conn_attr, KEY_AUTH_TYPE, "")) != AuthType::DSQL) {
+        return true;
+    }
+    if (std::string conflict = ServernameConflict(conn_attr); !conflict.empty()) {
+        out_error = std::move(conflict);
+        return false;
+    }
+    // This runs before the plugin chain and reads SERVER.
+    FoldServername(conn_attr);
+    std::string region;
+    for (const char* key : {KEY_SERVER, KEY_IAM_HOST}) {
+        const auto it = conn_attr.find(key);
+        if (it == conn_attr.end() || !IsClusterId(it->second)) {
+            continue;
+        }
+        if (region.empty()) {
+            region = ResolveDsqlRegion(conn_attr);
+        }
+        if (region.empty()) {
+            out_error = "DSQL Authentication failed. Region is required when host is a cluster ID (set '"
+                + std::string(KEY_REGION) + "')";
+            return false;
+        }
+        // The region becomes part of the host name. A space, a dot, a comma (libpq's host list separator) or a ';' (it
+        // would end SERVER in psqlODBC's connection string) would only fail later, as a host name or option error.
+        if (!IsRegionName(region)) {
+            out_error = "DSQL Authentication failed. Invalid region '" + region + "' for a cluster ID host: it must "
+                "be letters, digits and hyphens, start and end with a letter or digit, and be at most 63 characters "
+                "long, such as us-east-1 (set '" + std::string(KEY_REGION) + "')";
+            return false;
+        }
+        it->second = AsciiLower(it->second) + ".dsql." + region + ".on.aws";
+        LOG(INFO) << "[DSQL] Expanded the cluster ID in " << key << " to " << it->second;
+    }
+    return true;
 }

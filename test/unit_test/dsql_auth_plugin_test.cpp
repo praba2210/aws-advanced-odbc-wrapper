@@ -29,6 +29,7 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -423,6 +424,76 @@ TEST_F(DsqlAuthPluginTest, Connect_RootCertError_LogsHintOnce) {
 }
 
 namespace {
+    const std::string CLUSTER_ID = "abcdefghijklmnopqrstuvwxyz";
+    const std::string NO_REGION_ERROR =
+        "DSQL Authentication failed. Region is required when host is a cluster ID (set 'REGION')";
+
+    std::map<std::string, std::string> DsqlAttributes(const std::string& server) {
+        return {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {KEY_SERVER, server}};
+    }
+}  // namespace
+
+// A bare cluster ID connects to <id>.dsql.<region>.on.aws, as in the Aurora DSQL connectors.
+TEST_F(DsqlAuthPluginTest, ClusterId_ExpandsWithRegionKey) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    conn_attr.insert_or_assign(KEY_REGION, "eu-west-1");
+    std::string error;
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(CLUSTER_ID + ".dsql.eu-west-1.on.aws", conn_attr.at(KEY_SERVER));
+    EXPECT_EQ("", error);
+}
+
+// Two different hosts: the token is signed for one, and the other would be dropped silently (a DSN's SERVER would
+// beat the connection string's SERVERNAME). The same host in any case folds quietly.
+TEST_F(DsqlAuthPluginTest, ClusterId_ServerAndServernameDiffer_Fails) {
+    std::map<std::string, std::string> conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "a.example.com"},
+                                                    {"SERVERNAME", "b.example.com"},};
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("DSQL Authentication failed. SERVER and SERVERNAME name different hosts ('a.example.com' and "
+              "'b.example.com'): set only one of them", error);
+
+    conn_attr = {{KEY_AUTH_TYPE, VALUE_AUTH_DSQL}, {"SERVER", "A.Example.com"}, {"Servername", "a.example.COM"}};
+    EXPECT_TRUE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ("A.Example.com", conn_attr.at("SERVER"));
+    EXPECT_FALSE(conn_attr.contains("Servername"));
+}
+
+// The majority connectors' rule: no region, no endpoint. Nothing is changed.
+TEST_F(DsqlAuthPluginTest, ClusterId_NoRegion_Fails) {
+    std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+    std::string error;
+    EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error));
+    EXPECT_EQ(NO_REGION_ERROR, error);
+    EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER));
+}
+
+namespace {
+    std::string InvalidRegionError(const std::string& region) {
+        return "DSQL Authentication failed. Invalid region '" + region + "' for a cluster ID host: it must be letters, "
+               "digits and hyphens, start and end with a letter or digit, and be at most 63 characters long, such as "
+               "us-east-1 (set 'REGION')";
+    }
+
+    // Not a DNS host label: an inner space, a ';' (it would end SERVER in psqlODBC's connection string), a leading
+    // hyphen.
+    const std::vector<std::string> INVALID_REGIONS = {"us east-1", "us-east-1;port=1", "-us-east-1"};
+}  // namespace
+
+// The region becomes a DNS label of the endpoint. One that breaks the DNS host label rule fails here, with the value,
+// instead of later as a host name or connection option error from libpq.
+TEST_F(DsqlAuthPluginTest, ClusterId_InvalidRegion_Fails) {
+    for (const std::string& region : INVALID_REGIONS) {
+        std::map<std::string, std::string> conn_attr = DsqlAttributes(CLUSTER_ID);
+        conn_attr.insert_or_assign(KEY_REGION, region);
+        std::string error;
+        EXPECT_FALSE(DsqlAuthPlugin::ExpandClusterId(conn_attr, error)) << region;
+        EXPECT_EQ(InvalidRegionError(region), error) << region;
+        EXPECT_EQ(CLUSTER_ID, conn_attr.at(KEY_SERVER)) << region;
+    }
+}
+
+namespace {
     std::string OverrideWarning(const std::string& mode) {
         return "SSLmode=" + mode + " was changed to verify-full: Aurora DSQL requires TLS. Set SSLmode to verify-full, "
                "verify-ca or require.";
@@ -450,6 +521,40 @@ TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
         .WillOnce(testing::Return(SQL_ERROR));
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     EXPECT_EQ(nullptr, dbc_->err);
+}
+
+// With OTHER_AUTH a mode psqlODBC runs, in any form or under either keyword, stays exactly as set, pqopt included, and
+// no text is returned.
+TEST_F(DsqlAuthPluginTest, TlsDefaults_OtherAuth_KeepsAModePsqlodbcRuns) {
+    for (const auto& [key, mode] : std::vector<std::pair<std::string, std::string>>{
+             {"SSLMODE", "allow"}, {"SSLMODE", "prefer"}, {"SSLMODE", "require"}, {"SSLMODE", "r"},
+             {"SSLMODE", "verify-ca"}, {"SSLMODE", "verify-full"}, {"CA", "a"}, {"CA", "p"}, {"CA", "vf"},}) {
+        std::map<std::string, std::string> conn_attr = {{key, mode}, {"PQOPT", "{application_name=billing}"}};
+        const std::map<std::string, std::string> before = conn_attr;
+        EXPECT_EQ("", DsqlAuthPlugin::ApplyTlsDefaults(conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, "system"))
+            << key << "=" << mode;
+        EXPECT_EQ(before, conn_attr) << key << "=" << mode;
+    }
+}
+
+// With OTHER_AUTH only a mode psqlODBC would run as disable changes: a mode name in another case is lowercased with no
+// text, and anything else becomes verify-full with the 01S02 text, or none when no mode was set.
+TEST_F(DsqlAuthPluginTest, TlsDefaults_OtherAuth_RaisesAModePsqlodbcRunsAsDisable) {
+    for (const auto& [requested, expected, text] : std::vector<std::tuple<std::string, std::string, std::string>>{
+             {"disable", "verify-full", OverrideWarning("disable")},
+             {"on", "verify-full", OverrideWarning("on")},
+             {"Prefer", "prefer", ""},
+             {"Require", "require", ""},
+             {"VERIFY-FULL", "verify-full", ""},}) {
+        std::map<std::string, std::string> conn_attr = {{"SSLMODE", requested}};
+        EXPECT_EQ(text, DsqlAuthPlugin::ApplyTlsDefaults(conn_attr, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, "system"))
+            << requested;
+        EXPECT_EQ(expected, conn_attr.at("SSLMODE")) << requested;
+    }
+    std::map<std::string, std::string> unset;
+    EXPECT_EQ("", DsqlAuthPlugin::ApplyTlsDefaults(unset, DsqlAuthPlugin::TlsPolicy::OTHER_AUTH, "system"));
+    EXPECT_EQ("verify-full", unset.at("SSLMODE"));
+    EXPECT_EQ("{sslrootcert=system application_name=" + EXPECTED_APP_NAME + "}", unset.at("PQOPT"));
 }
 
 // Only the three kept modes get no warning; psqlODBC's short forms of the others (d, a, p) are replaced too.

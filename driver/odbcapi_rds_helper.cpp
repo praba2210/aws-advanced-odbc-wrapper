@@ -27,6 +27,7 @@
 #include "plugin/blue_green/blue_green_plugin.h"
 #include "plugin/custom_endpoint/custom_endpoint_plugin.h"
 #include "plugin/default_plugin.h"
+#include "plugin/dsql/dsql_compatibility_plugin.h"
 #include "plugin/failover/failover_plugin.h"
 #include "plugin/federated/adfs_auth_plugin.h"
 #include "plugin/federated/aws_sso_auth_plugin.h"
@@ -3022,6 +3023,7 @@ SQLRETURN RDS_InitializeConnection(DBC* dbc, const std::string& conn_str)
         // Plugin Builder
         if (!dbc->plugin_head) {
             std::shared_ptr<BasePlugin> plugin_head = std::make_shared<DefaultPlugin>(dbc);
+            plugin_head = DsqlCompatibilityPlugin::AddToChain(dbc, plugin_head);
 
             // Auth Plugins
             if (dbc->conn_attr.contains(KEY_AUTH_TYPE)) {

@@ -21,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <initializer_list>
 #include <map>
@@ -40,6 +41,7 @@
 #include "../../driver/dialect/dialect_aurora_dsql.h"
 #include "../../driver/driver.h"
 #include "../../driver/plugin/dsql/dsql_auth_plugin.h"
+#include "../../driver/plugin/dsql/dsql_compatibility_plugin.h"
 #include "../../driver/plugin/dsql/dsql_plugin_helper.h"
 #include "../../driver/util/aws_sdk_helper.h"
 #include "../../driver/util/connection_string_keys.h"
@@ -521,6 +523,22 @@ TEST_F(DsqlAuthPluginTest, Connect_SslModeOverridden_ConnectFails_NoWarning) {
         .WillOnce(testing::Return(SQL_ERROR));
     EXPECT_EQ(SQL_ERROR, ConnectWithMockProvider());
     EXPECT_EQ(nullptr, dbc_->err);
+}
+
+// The compatibility plugin below reports an isolation level set before connect: the one record holds both changes,
+// the override first.
+TEST_F(DsqlAuthPluginTest, Connect_SslModeOverriddenAndIsolationChanged_ReportsBoth) {
+    dbc_->conn_attr.insert_or_assign("SSLMODE", "disable");
+    dbc_->attr_map.insert_or_assign(SQL_ATTR_TXN_ISOLATION,
+        std::make_pair(reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(SQL_TXN_SERIALIZABLE)), 0));
+    ExpectTokenForRegion("us-west-2");
+    DsqlAuthPlugin plugin(dbc_, std::make_shared<DsqlCompatibilityPlugin>(dbc_, mock_base_plugin_),
+                          mock_auth_provider_);
+    EXPECT_EQ(SQL_SUCCESS_WITH_INFO, plugin.Connect(dbc_, nullptr, nullptr, 0, nullptr, SQL_DRIVER_NOPROMPT));
+    ASSERT_NE(nullptr, dbc_->err);
+    EXPECT_EQ(OverrideWarning("disable") + " SQL_ATTR_TXN_ISOLATION=SQL_TXN_SERIALIZABLE, set before connect, was "
+              "changed to SQL_TXN_REPEATABLE_READ: Aurora DSQL runs every transaction at REPEATABLE READ.",
+              dbc_->err->error_msg);
 }
 
 // With OTHER_AUTH a mode psqlODBC runs, in any form or under either keyword, stays exactly as set, pqopt included, and

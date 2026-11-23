@@ -82,6 +82,7 @@ set(INC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.h
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility_plugin.h
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_plugin_helper.h
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.h
@@ -203,6 +204,7 @@ set(SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/federated/sso_browser_login_util.cpp
     ## DSQL
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_auth_plugin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_compatibility_plugin.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/dsql/dsql_plugin_helper.cpp
     ## IAM
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/iam/iam_auth_plugin.cpp

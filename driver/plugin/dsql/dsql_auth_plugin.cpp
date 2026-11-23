@@ -583,12 +583,19 @@ SQLRETURN DsqlAuthPlugin::Connect(
         dbc->conn_attr.erase(password);
     }
     // The wrapper keeps one diagnostic record per handle, and it hides the base driver's. Report the override only
-    // when the base driver has nothing to report.
-    if (ret != SQL_SUCCESS || tls_warning.empty()) {
+    // when the base driver has nothing to report, first in the record when this connect changed something else too
+    // (DsqlCompatibilityPlugin's 01S02).
+    if (tls_warning.empty()) {
+        return ret;
+    }
+    std::string notice = tls_warning;
+    if (ret == SQL_SUCCESS_WITH_INFO && dbc->err && dbc->err->native_err == WARN_OPTION_VALUE_CHANGED) {
+        notice += " " + dbc->err->error_msg;
+    } else if (ret != SQL_SUCCESS) {
         return ret;
     }
     ClearError(dbc);
-    dbc->err = std::make_unique<ErrInfo>(tls_warning.c_str(), WARN_OPTION_VALUE_CHANGED);
+    dbc->err = std::make_unique<ErrInfo>(notice.c_str(), WARN_OPTION_VALUE_CHANGED);
     return SQL_SUCCESS_WITH_INFO;
 }
 

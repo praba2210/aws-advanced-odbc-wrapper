@@ -358,6 +358,7 @@ SQLRETURN RDS_SQLEndTran(
                 if (SQL_SUCCEEDED(ret) && dbc) {
                     dbc->transaction_status = TRANSACTION_CLOSED;
                 }
+                dbc->statement_failed_in_transaction = false;  // either outcome ends the transaction
             }
             break;
         case SQL_HANDLE_ENV:
@@ -395,6 +396,7 @@ SQLRETURN RDS_SQLEndTran(
                             dbc->transaction_status = TRANSACTION_CLOSED;
                         }
                     }
+                    dbc->statement_failed_in_transaction = false;
                     if (!SQL_SUCCEEDED(dbc_ret) && SQL_SUCCEEDED(ret)) {
                         ret = dbc_ret;
                         // A plugin's answer is the wrapper's record, so the environment gets it too.
@@ -721,6 +723,10 @@ SQLRETURN RDS_SQLSetConnectAttr(
         // Autocommit set on while already on changes nothing in psqlODBC, so a transaction opened with BEGIN stays open.
         if (!was_auto_commit || !dbc->auto_commit) {
             dbc->transaction_status = dbc->auto_commit ? TRANSACTION_CLOSED : TRANSACTION_OPEN;
+        }
+        // A switch ends the transaction.
+        if (SQL_SUCCEEDED(ret) && dbc->auto_commit != was_auto_commit) {
+            dbc->statement_failed_in_transaction = false;
         }
     }
 

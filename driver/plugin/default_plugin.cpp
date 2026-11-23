@@ -223,6 +223,7 @@ SQLRETURN DefaultPlugin::Execute(
     } else {
         res = this->odbc_helper_->ExecDirect(&stmt->wrapped_stmt, query);
     }
+    NoteStatementResult(dbc, res.fn_result);
 
     // Supports checking for transaction changes only if it was a direct execute
     if (SQL_SUCCEEDED(res.fn_result) && !query.empty()) {
@@ -232,6 +233,7 @@ SQLRETURN DefaultPlugin::Execute(
             || SqlQueryAnalyzer::DoesSwitchAutoCommitFalseTrue(dbc, query)
         ) {
             dbc->transaction_status = TRANSACTION_CLOSED;
+            dbc->statement_failed_in_transaction = false;
         }
 
         if (SqlQueryAnalyzer::IsStatementSettingAutoCommit(query)) {

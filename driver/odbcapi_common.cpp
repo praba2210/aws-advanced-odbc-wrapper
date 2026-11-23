@@ -1206,7 +1206,11 @@ SQLRETURN SQL_API SQLParamData(
     }
 #endif
 
-    return RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    const SQLRETURN ret = RDS_ProcessLibRes(SQL_HANDLE_STMT, stmt, res);
+    // Without the connection's lock, which SQLExecute takes before the statement's: only a call racing another
+    // thread's change of this connection's autocommit or transaction can note a failure it needn't.
+    NoteStatementResult(stmt->dbc, ret);
+    return ret;
 }
 
 SQLRETURN SQL_API SQLParamOptions(

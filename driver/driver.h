@@ -123,6 +123,9 @@ struct DBC {
     CONN_STATUS conn_status;
     TRANSACTION_STATUS transaction_status;
     bool auto_commit = true;  // By default, drivers will be in auto commit mode
+    // A statement call failed or warned since the transaction began, so the server may have ended the transaction.
+    // Atomic: SQLParamData sets it holding only the statement's lock.
+    std::atomic<bool> statement_failed_in_transaction = false;
 
     // TODO - May need to change SQLPOINTER to an actual object
     std::map<SQLINTEGER, std::pair<SQLPOINTER, SQLINTEGER>> attr_map;  // Key, <Value, Length>
@@ -229,6 +232,15 @@ inline bool HasWrappedHandle(const ENV* env) { return env != nullptr && env->wra
 inline bool HasWrappedHandle(const DBC* dbc) { return dbc != nullptr && dbc->wrapped_dbc != nullptr; }
 inline bool HasWrappedHandle(const STMT* stmt) { return stmt != nullptr && stmt->wrapped_stmt != nullptr; }
 inline bool HasWrappedHandle(const DESC* desc) { return desc != nullptr && desc->wrapped_desc != nullptr; }
+
+// Notes a statement call that failed or warned in a transaction: psqlODBC can report the failed rows of a parameter
+// array with SQL_SUCCESS_WITH_INFO.
+inline void NoteStatementResult(DBC* dbc, SQLRETURN ret) {
+    if ((ret == SQL_ERROR || ret == SQL_SUCCESS_WITH_INFO)
+        && (!dbc->auto_commit || dbc->transaction_status == TRANSACTION_OPEN)) {
+        dbc->statement_failed_in_transaction = true;
+    }
+}
 
 // Releases the handle's error record and re-arms the SQLError one-shot flag.
 template <typename HandleT>

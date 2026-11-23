@@ -50,7 +50,9 @@ public:
         SQLUSMALLINT   DriverCompletion) override;
 
     // Answers, without calling psqlODBC, the attributes that would undo a forced psqlODBC option or make psqlODBC send
-    // a statement Aurora DSQL rejects: the psqlODBC PGOPT attributes, a query timeout and the isolation level.
+    // a statement Aurora DSQL rejects: the psqlODBC PGOPT attributes, a query timeout and the isolation level. An
+    // autocommit change on a connected connection commits first (SQLEndTran); if that fails, it returns the commit's
+    // result and leaves autocommit unchanged.
     std::optional<SQLRETURN> TrySetConnectAttr(
         SQLHDBC        ConnectionHandle,
         SQLINTEGER     Attribute,
@@ -71,6 +73,12 @@ public:
         SQLINTEGER     Attribute,
         SQLPOINTER     ValuePtr,
         SQLINTEGER     StringLength) override;
+
+    // SQL_COMMIT after a statement failed in the transaction: checks with SELECT 1 whether Aurora DSQL ended it. 25P02
+    // means it did: rolls it back and returns SQL_ERROR with 25S03. Otherwise the commit goes ahead.
+    std::optional<SQLRETURN> TryEndTran(
+        SQLHDBC        ConnectionHandle,
+        SQLSMALLINT    CompletionType) override;
 };
 
 #endif // DSQL_COMPATIBILITY_PLUGIN_H_

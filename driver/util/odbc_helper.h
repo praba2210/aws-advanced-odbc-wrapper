@@ -70,6 +70,8 @@ public:
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc);
     virtual std::string GetSqlStateAndLogMessage(DBC *dbc, std::string& out_message);
     virtual std::string GetStmtErrorMessage(SQLHSTMT stmt);
+    // The SQLSTATE of the base driver's first diagnostic record on a statement; "" when there is none.
+    virtual std::string GetStmtSqlState(SQLHSTMT stmt);
 
     void ConvertDriverOutputToTarget(const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;
     void ConvertDriverOutputToTarget(bool wrapper_call, const SQLTCHAR* src, SQLTCHAR* dst, size_t src_byte_count, size_t dst_byte_count) const;

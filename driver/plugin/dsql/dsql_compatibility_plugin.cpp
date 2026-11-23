@@ -23,15 +23,21 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "../../driver.h"
 #include "../../error.h"
+#include "../../odbcapi.h"
+#include "../../odbcapi_rds_helper.h"
 #include "../../util/auth_provider.h"
 #include "../../util/connection_string_keys.h"
 #include "../../util/dsql_connection_validator.h"
 #include "../../util/logger_wrapper.h"
 #include "../../util/map_utils.h"
+#include "../../util/odbc_helper.h"
+#include "../../util/plugin_service.h"
+#include "../../util/rds_lib_loader.h"
 #include "dsql_auth_plugin.h"
 #include "dsql_plugin_helper.h"
 
@@ -248,6 +254,60 @@ namespace {
             }
         }
     }
+
+    const std::string TRANSACTION_ROLLED_BACK =
+        "The transaction was rolled back, not committed: a statement in it failed, and Aurora DSQL ends a transaction "
+        "at its first error (it has no savepoints). Roll back after an error, and run the whole transaction again.";
+
+    // What every statement fails with in a transaction the server has ended.
+    constexpr std::string_view IN_FAILED_TRANSACTION = "25P02";
+
+    // The end of the warning when the check can't tell: the commit goes ahead, as psqlODBC would make it.
+    constexpr std::string_view COMMITTING_UNCHECKED =
+        ": committing. If Aurora DSQL ended the transaction, the commit saves nothing.";
+
+    std::string StateForLog(const std::string& state)
+    {
+        return state.empty() ? "no SQLSTATE" : state;
+    }
+
+    // When a statement failed in the transaction, checks with SELECT 1 whether Aurora DSQL ended it, and on 25P02 rolls
+    // it back and returns SQL_ERROR with 25S03. Otherwise std::nullopt, with a warning when the check itself failed.
+    // Clears the note.
+    std::optional<SQLRETURN> RollBackAbortedTransaction(DBC* dbc)
+    {
+        if (!HasWrappedHandle(dbc) || !dbc->statement_failed_in_transaction.exchange(false)) {
+            return std::nullopt;
+        }
+        const std::shared_ptr<OdbcHelper> helper = dbc->plugin_service->GetOdbcHelper();
+        SQLHSTMT probe = SQL_NULL_HSTMT;
+        if (!SQL_SUCCEEDED(helper->BaseAllocStmt(&dbc->wrapped_dbc, &probe).fn_result) || probe == SQL_NULL_HSTMT) {
+            LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit couldn't "
+                         << "allocate a statement" << COMMITTING_UNCHECKED;
+            return std::nullopt;
+        }
+        // In a transaction Aurora DSQL has ended, every statement fails with 25P02.
+        const bool alive = SQL_SUCCEEDED(helper->ExecDirect(&probe, "SELECT 1").fn_result);
+        const std::string state = alive ? "" : helper->GetStmtSqlState(probe);
+        helper->BaseFreeStmt(&probe);
+        if (alive) {
+            return std::nullopt;
+        }
+        if (state != IN_FAILED_TRANSACTION) {
+            // Any other failure doesn't show that the transaction ended.
+            LOG(WARNING) << "[DSQL] A statement in this transaction failed, and the check before the commit got "
+                         << StateForLog(state) << ", not " << IN_FAILED_TRANSACTION << COMMITTING_UNCHECKED;
+            return std::nullopt;
+        }
+        // psqlODBC's SQLEndTran rolls back in manual-commit mode and after a BEGIN sent as SQL text, which it marks as a
+        // manual transaction.
+        RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(dbc->env->driver_lib_loader, RdsFuncNames::EndTran,
+            SQL_HANDLE_DBC, dbc->wrapped_dbc, SQL_ROLLBACK);
+        dbc->transaction_status = TRANSACTION_CLOSED;
+        LOG(WARNING) << "[DSQL] " << TRANSACTION_ROLLED_BACK << " (the check before the commit got " << state << ")";
+        dbc->err = std::make_unique<ErrInfo>(TRANSACTION_ROLLED_BACK.c_str(), ERR_TRANSACTION_IS_ROLLED_BACK);  // 25S03
+        return SQL_ERROR;
+    }
 }  // namespace
 
 DsqlCompatibilityPlugin::DsqlCompatibilityPlugin(DBC* dbc, std::shared_ptr<BasePlugin> next_plugin)
@@ -361,6 +421,20 @@ std::optional<SQLRETURN> DsqlCompatibilityPlugin::TrySetConnectAttr(
         case SQL_ATTR_TXN_ISOLATION:
             // Never forwarded: psqlODBC would send SET SESSION CHARACTERISTICS, which Aurora DSQL rejects.
             return SetIsolation(dbc, ValuePtr);
+        case SQL_ATTR_AUTOCOMMIT:
+            // Switching autocommit inside a transaction commits it, and psqlODBC drops that COMMIT's result
+            // (CC_set_autocommit), while Aurora DSQL reports write conflicts at COMMIT. So commit through SQLEndTran
+            // first, which also rolls back a failed transaction (25S03), and on an error leave autocommit as it is.
+            // SQLEndTran takes only the connection's lock, which is recursive and held here.
+            if (const SQLULEN mode = IntegerValue(ValuePtr);
+                (mode == SQL_AUTOCOMMIT_ON || mode == SQL_AUTOCOMMIT_OFF)
+                && (mode == SQL_AUTOCOMMIT_ON) != dbc->auto_commit && HasWrappedHandle(dbc)
+                && dbc->conn_status == CONN_CONNECTED) {
+                if (const SQLRETURN commit = RDS_SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT); !SQL_SUCCEEDED(commit)) {
+                    return commit;
+                }
+            }
+            break;
         default:
             break;
     }
@@ -401,4 +475,18 @@ std::optional<SQLRETURN> DsqlCompatibilityPlugin::TrySetStmtAttr(
         return QueryTimeoutChanged(static_cast<STMT*>(StatementHandle)->err, timeout);
     }
     return BasePlugin::TrySetStmtAttr(StatementHandle, Attribute, ValuePtr, StringLength);
+}
+
+std::optional<SQLRETURN> DsqlCompatibilityPlugin::TryEndTran(
+    SQLHDBC        ConnectionHandle,
+    SQLSMALLINT    CompletionType)
+{
+    // A COMMIT of a transaction Aurora DSQL ended at a failed statement saves nothing, and psqlODBC reports it as a
+    // success.
+    if (CompletionType == SQL_COMMIT) {
+        if (const std::optional<SQLRETURN> rolled_back = RollBackAbortedTransaction(static_cast<DBC*>(ConnectionHandle))) {
+            return rolled_back;
+        }
+    }
+    return BasePlugin::TryEndTran(ConnectionHandle, CompletionType);
 }

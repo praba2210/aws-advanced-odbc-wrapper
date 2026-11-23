@@ -346,6 +346,11 @@ SQLRETURN RDS_SQLEndTran(
                 if (!HasWrappedHandle(dbc)) {
                     return SQL_INVALID_HANDLE;
                 }
+                if (dbc->plugin_head) {
+                    if (const auto answer = dbc->plugin_head->TryEndTran(dbc, CompletionType)) {
+                        return *answer;
+                    }
+                }
                 res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
                     HandleType, dbc->wrapped_dbc, CompletionType
                 );
@@ -374,15 +379,28 @@ SQLRETURN RDS_SQLEndTran(
                     if (!HasWrappedHandle(dbc)) {
                         continue;
                     }
-                    res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
-                        SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
-                    );
-                    const SQLRETURN dbc_ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
-                    if (SQL_SUCCEEDED(dbc_ret) && dbc) {
-                        dbc->transaction_status = TRANSACTION_CLOSED;
+                    std::optional<SQLRETURN> answer;
+                    if (dbc->plugin_head) {
+                        answer = dbc->plugin_head->TryEndTran(dbc, CompletionType);
+                    }
+                    SQLRETURN dbc_ret = SQL_SUCCESS;
+                    if (answer) {
+                        dbc_ret = *answer;
+                    } else {
+                        res = RdsLibLoader::CallFunctionChecked<RDS_FP_SQLEndTran>(env->driver_lib_loader, RdsFuncNames::EndTran,
+                            SQL_HANDLE_DBC, dbc->wrapped_dbc, CompletionType
+                        );
+                        dbc_ret = RDS_ProcessLibRes(SQL_HANDLE_DBC, dbc, res);
+                        if (SQL_SUCCEEDED(dbc_ret) && dbc) {
+                            dbc->transaction_status = TRANSACTION_CLOSED;
+                        }
                     }
                     if (!SQL_SUCCEEDED(dbc_ret) && SQL_SUCCEEDED(ret)) {
                         ret = dbc_ret;
+                        // A plugin's answer is the wrapper's record, so the environment gets it too.
+                        if (answer && dbc->err) {
+                            env->err = std::make_unique<ErrInfo>(*dbc->err);
+                        }
                     }
                 }
 
@@ -667,6 +685,12 @@ SQLRETURN RDS_SQLSetConnectAttr(
 
     const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
     ClearError(dbc);
+
+    if (dbc->plugin_head) {
+        if (const auto answer = dbc->plugin_head->TrySetConnectAttr(dbc, Attribute, ValuePtr, StringLength)) {
+            return *answer;
+        }
+    }
 
     // If already connected, apply value to underlying DBC, otherwise track and apply on connect
     if (dbc->wrapped_dbc) {
@@ -2166,6 +2190,11 @@ SQLRETURN RDS_SQLGetInfo(
     if (!char_value) {
         {
             const std::lock_guard<std::recursive_mutex> lock_guard(dbc->lock);
+            if (dbc->plugin_head) {
+                if (const auto answer = dbc->plugin_head->TryGetInfo(dbc, InfoType, InfoValuePtr, BufferLength, StringLengthPtr)) {
+                    return *answer;
+                }
+            }
             if (dbc->wrapped_dbc) {
                 const ENV* env = dbc->env;
                 ClearError(dbc);
@@ -2663,6 +2692,12 @@ SQLRETURN RDS_SQLSetStmtAttr(
             return SQL_ERROR;
         default:
             break;
+    }
+
+    if (dbc->plugin_head) {
+        if (const auto answer = dbc->plugin_head->TrySetStmtAttr(stmt, Attribute, ValuePtr, StringLength)) {
+            return *answer;
+        }
     }
 
     if (stmt->wrapped_stmt) {

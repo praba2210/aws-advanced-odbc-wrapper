@@ -73,6 +73,57 @@ SQLRETURN BasePlugin::Execute(
 }
 
 // codechecker_suppress [misc-no-recursion]
+std::optional<SQLRETURN> BasePlugin::TrySetConnectAttr(
+    SQLHDBC        ConnectionHandle,
+    SQLINTEGER     Attribute,
+    SQLPOINTER     ValuePtr,
+    SQLINTEGER     StringLength)
+{
+    if (!next_plugin_ || next_plugin_.get() == this) {
+        return std::nullopt;
+    }
+    return next_plugin_->TrySetConnectAttr(ConnectionHandle, Attribute, ValuePtr, StringLength);
+}
+
+// codechecker_suppress [misc-no-recursion]
+std::optional<SQLRETURN> BasePlugin::TryGetInfo(
+    SQLHDBC        ConnectionHandle,
+    SQLUSMALLINT   InfoType,
+    SQLPOINTER     InfoValuePtr,
+    SQLSMALLINT    BufferLength,
+    SQLSMALLINT *  StringLengthPtr)
+{
+    if (!next_plugin_ || next_plugin_.get() == this) {
+        return std::nullopt;
+    }
+    return next_plugin_->TryGetInfo(ConnectionHandle, InfoType, InfoValuePtr, BufferLength, StringLengthPtr);
+}
+
+// codechecker_suppress [misc-no-recursion]
+std::optional<SQLRETURN> BasePlugin::TrySetStmtAttr(
+    SQLHSTMT       StatementHandle,
+    SQLINTEGER     Attribute,
+    SQLPOINTER     ValuePtr,
+    SQLINTEGER     StringLength)
+{
+    if (!next_plugin_ || next_plugin_.get() == this) {
+        return std::nullopt;
+    }
+    return next_plugin_->TrySetStmtAttr(StatementHandle, Attribute, ValuePtr, StringLength);
+}
+
+// codechecker_suppress [misc-no-recursion]
+std::optional<SQLRETURN> BasePlugin::TryEndTran(
+    SQLHDBC        ConnectionHandle,
+    SQLSMALLINT    CompletionType)
+{
+    if (!next_plugin_ || next_plugin_.get() == this) {
+        return std::nullopt;
+    }
+    return next_plugin_->TryEndTran(ConnectionHandle, CompletionType);
+}
+
+// codechecker_suppress [misc-no-recursion]
 SQLRETURN BasePlugin::ConnectNext(
     SQLHDBC        ConnectionHandle,
     SQLHWND        WindowHandle,

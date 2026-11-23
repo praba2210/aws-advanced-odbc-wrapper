@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "../../driver/driver.h"
@@ -67,6 +68,32 @@ namespace {
         return truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
     }
 
+    // The base driver's attribute, info and transaction calls, in order.
+    std::vector<std::string_view> g_base_calls;
+
+    SQLRETURN FakeSetConnectAttr(SQLHDBC /*connection_handle*/, SQLINTEGER /*attribute*/, SQLPOINTER /*value*/,
+                                 SQLINTEGER /*string_length*/) {
+        g_base_calls.emplace_back(RdsFuncNames::SetConnectAttr);
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeGetInfo(SQLHDBC /*connection_handle*/, SQLUSMALLINT /*info_type*/, SQLPOINTER /*value*/,
+                          SQLSMALLINT /*buffer_length*/, SQLSMALLINT* /*string_length*/) {
+        g_base_calls.emplace_back(RdsFuncNames::GetInfo);
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeSetStmtAttr(SQLHSTMT /*statement_handle*/, SQLINTEGER /*attribute*/, SQLPOINTER /*value*/,
+                              SQLINTEGER /*string_length*/) {
+        g_base_calls.emplace_back(RdsFuncNames::SetStmtAttr);
+        return SQL_SUCCESS;
+    }
+
+    SQLRETURN FakeEndTran(SQLSMALLINT /*handle_type*/, SQLHANDLE /*handle*/, SQLSMALLINT /*completion_type*/) {
+        g_base_calls.emplace_back(RdsFuncNames::EndTran);
+        return SQL_SUCCESS;
+    }
+
     // Nothing is loaded from the path; RDS_InitializeConnection only compares it with BASE_DRIVER.
     class FakeBaseDriver : public RdsLibLoader {
     public:
@@ -78,6 +105,18 @@ namespace {
             }
             if (function_name == RdsFuncNames::DriverConnect) {
                 return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeDriverConnect);
+            }
+            if (function_name == RdsFuncNames::SetConnectAttr) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeSetConnectAttr);
+            }
+            if (function_name == RdsFuncNames::GetInfo) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeGetInfo);
+            }
+            if (function_name == RdsFuncNames::SetStmtAttr) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeSetStmtAttr);
+            }
+            if (function_name == RdsFuncNames::EndTran) {
+                return reinterpret_cast<RdsPlatform::FuncHandle>(&FakeEndTran);
             }
             return nullptr;
         }
@@ -187,6 +226,30 @@ TEST_F(DefaultPluginTest, DriverConnect_ShortBuffer_ReturnsTerminatedPrefixAnd01
     const DBC& dbc = *dbcs_.back();
     ASSERT_NE(nullptr, dbc.err);
     EXPECT_EQ("01004", dbc.err->sqlstate);
+}
+
+// The chain built for another database answers none of the plugin hooks: each call reaches the base driver.
+TEST_F(DefaultPluginTest, PluginHooks_OtherDatabase_ReachTheBaseDriver) {
+    ASSERT_EQ(SQL_SUCCESS, DriverConnect(nullptr, 0, nullptr));
+    DBC& dbc = *dbcs_.back();
+    ASSERT_NE(nullptr, dbc.plugin_head);
+    env_.dbc_list.push_back(&dbc);
+    STMT stmt;
+    stmt.dbc = &dbc;
+    stmt.wrapped_stmt = static_cast<SQLHSTMT>(&fake_handle);
+    g_base_calls.clear();
+
+    SQLUINTEGER value = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetConnectAttr(&dbc, SQL_ATTR_TXN_ISOLATION,
+                                                 reinterpret_cast<SQLPOINTER>(SQL_TXN_SERIALIZABLE), 0));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetInfo(&dbc, SQL_TXN_ISOLATION_OPTION, &value, sizeof(value), nullptr));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLSetStmtAttr(&stmt, SQL_ATTR_QUERY_TIMEOUT, reinterpret_cast<SQLPOINTER>(30), 0));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_DBC, &dbc, SQL_COMMIT));
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLEndTran(SQL_HANDLE_ENV, &env_, SQL_COMMIT));
+    const std::vector<std::string_view> expected = {
+        RdsFuncNames::SetConnectAttr, RdsFuncNames::GetInfo, RdsFuncNames::SetStmtAttr, RdsFuncNames::EndTran,
+        RdsFuncNames::EndTran, RdsFuncNames::EndTran};
+    EXPECT_EQ(expected, g_base_calls);
 }
 
 #ifdef UNICODE

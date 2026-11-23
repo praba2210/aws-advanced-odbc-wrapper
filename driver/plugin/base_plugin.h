@@ -19,6 +19,7 @@
 #include "../error.h"
 
 #include <memory>
+#include <optional>
 
 struct DBC;
 struct STMT;
@@ -44,6 +45,31 @@ public:
         SQLINTEGER     TextLength = -1);
 
     virtual void ReleaseResources();
+
+    // A plugin can answer these calls in place of the base driver. Unless overridden, each forwards to the next plugin;
+    // at the end of the chain it answers nothing (std::nullopt), and the caller goes on to the base driver.
+    virtual std::optional<SQLRETURN> TrySetConnectAttr(
+        SQLHDBC        ConnectionHandle,
+        SQLINTEGER     Attribute,
+        SQLPOINTER     ValuePtr,
+        SQLINTEGER     StringLength);
+
+    virtual std::optional<SQLRETURN> TryGetInfo(
+        SQLHDBC        ConnectionHandle,
+        SQLUSMALLINT   InfoType,
+        SQLPOINTER     InfoValuePtr,
+        SQLSMALLINT    BufferLength,
+        SQLSMALLINT *  StringLengthPtr);
+
+    virtual std::optional<SQLRETURN> TrySetStmtAttr(
+        SQLHSTMT       StatementHandle,
+        SQLINTEGER     Attribute,
+        SQLPOINTER     ValuePtr,
+        SQLINTEGER     StringLength);
+
+    virtual std::optional<SQLRETURN> TryEndTran(
+        SQLHDBC        ConnectionHandle,
+        SQLSMALLINT    CompletionType);
 
 protected:
     SQLRETURN ConnectNext(

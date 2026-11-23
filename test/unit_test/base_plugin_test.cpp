@@ -18,7 +18,9 @@
 #include "../../driver/plugin/base_plugin.h"
 
 #include <cstring>
+#include <optional>
 #include <sqlext.h>
+#include <vector>
 
 namespace {
 
@@ -49,9 +51,32 @@ public:
         BasePlugin::ReleaseResources();
     }
 
+    // Each hook answers with SQL_SUCCESS_WITH_INFO and records the argument that names what was asked.
+    std::optional<SQLRETURN> TrySetConnectAttr(SQLHDBC, SQLINTEGER Attribute, SQLPOINTER, SQLINTEGER) override {
+        hook_args.push_back(Attribute);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    std::optional<SQLRETURN> TryGetInfo(SQLHDBC, SQLUSMALLINT InfoType, SQLPOINTER, SQLSMALLINT,
+                                        SQLSMALLINT*) override {
+        hook_args.push_back(InfoType);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    std::optional<SQLRETURN> TrySetStmtAttr(SQLHSTMT, SQLINTEGER Attribute, SQLPOINTER, SQLINTEGER) override {
+        hook_args.push_back(Attribute);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
+    std::optional<SQLRETURN> TryEndTran(SQLHDBC, SQLSMALLINT CompletionType) override {
+        hook_args.push_back(CompletionType);
+        return SQL_SUCCESS_WITH_INFO;
+    }
+
     bool connect_called = false;
     bool execute_called = false;
     bool release_called = false;
+    std::vector<SQLINTEGER> hook_args;
 };
 
 // Mirrors how real plugins (failover, blue/green, etc.) delegate through the
@@ -247,4 +272,27 @@ TEST_F(BasePluginTest, ReleaseResourcesDelegatesToNextPlugin) {
     plugin.ReleaseResources();
 
     EXPECT_TRUE(next->release_called);
+}
+
+// A plugin that doesn't override a hook passes the call on, as it came; at the end of the chain nothing answers, so the
+// caller goes on to the base driver.
+TEST_F(BasePluginTest, TryHooks_ForwardToTheNextPlugin_AndAnswerNothingAtTheEnd) {
+    const std::shared_ptr<RecordingPlugin> next = std::make_shared<RecordingPlugin>();
+    for (const bool at_the_end : {false, true}) {
+        SCOPED_TRACE(at_the_end ? "at the end of the chain" : "with a next plugin");
+        BasePlugin plugin(dbc_, at_the_end ? nullptr : next);
+        const std::optional<SQLRETURN> expected =
+            at_the_end ? std::nullopt : std::optional<SQLRETURN>(SQL_SUCCESS_WITH_INFO);
+        SQLUINTEGER value = 0;
+        SQLSMALLINT info_length = 0;
+        EXPECT_EQ(expected, plugin.TrySetConnectAttr(dbc_, SQL_ATTR_AUTOCOMMIT, nullptr, 0));
+        EXPECT_EQ(expected, plugin.TryGetInfo(dbc_, SQL_TXN_ISOLATION_OPTION, &value, 0, &info_length));
+        EXPECT_EQ(expected, plugin.TrySetStmtAttr(stmt_, SQL_ATTR_QUERY_TIMEOUT, nullptr, 0));
+        EXPECT_EQ(expected, plugin.TryEndTran(dbc_, SQL_ROLLBACK));
+    }
+    const std::vector<SQLINTEGER> expected_args = {
+        SQL_ATTR_AUTOCOMMIT, SQL_TXN_ISOLATION_OPTION, SQL_ATTR_QUERY_TIMEOUT, SQL_ROLLBACK};
+    EXPECT_EQ(expected_args, next->hook_args);
+    EXPECT_EQ(nullptr, dbc_->err);
+    EXPECT_EQ(nullptr, stmt_->err);
 }

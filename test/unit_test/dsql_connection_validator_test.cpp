@@ -25,6 +25,7 @@
 #include "../../driver/driver.h"
 #include "../../driver/error.h"
 #include "../../driver/odbcapi_rds_helper.h"
+#include "../../driver/plugin/dsql/dsql_auth_plugin.h"
 #include "../../driver/util/connection_string_keys.h"
 #include "../../driver/util/dsql_connection_validator.h"
 #include "../../driver/util/logger_wrapper.h"
@@ -246,4 +247,20 @@ TEST_F(DsqlConnectionValidatorReuseTest, ReusedHandle_DsqlThenOther_Fails08001) 
     EXPECT_EQ("This connection handle was first used to connect to Aurora DSQL, and these settings aren't Aurora DSQL: "
               "none of RDS_AUTH_TYPE=DSQL, an Aurora DSQL endpoint as SERVER, or DATABASE_DIALECT=AURORA_DSQL is set. "
               "Allocate a new connection handle to connect to another database.", dbc_->err->error_msg);
+}
+
+// RDS_AUTH_TYPE=DSQL builds the Aurora DSQL auth plugin, with the compatibility plugin below it: the auth plugin
+// forwards the isolation info, and the compatibility plugin answers it.
+TEST_F(DsqlConnectionValidatorReuseTest, InitializeConnection_DsqlAuth_BuildsTheDsqlPlugins) {
+    dbc_->conn_attr.insert_or_assign(KEY_AUTH_TYPE, "DSQL");
+    ASSERT_EQ(SQL_SUCCESS, ConnectTo(DSQL_HOST));
+    EXPECT_NE(nullptr, dynamic_cast<DsqlAuthPlugin*>(dbc_->plugin_head));
+
+    int base_dbc_stand_in = 0;
+    dbc_->wrapped_dbc = static_cast<SQLHDBC>(&base_dbc_stand_in);
+    SQLUINTEGER value = 0;
+    EXPECT_EQ(SQL_SUCCESS, RDS_SQLGetInfo(dbc_, SQL_TXN_ISOLATION_OPTION, &value,
+                                          static_cast<SQLSMALLINT>(sizeof(value)), nullptr));
+    EXPECT_EQ(static_cast<SQLUINTEGER>(SQL_TXN_REPEATABLE_READ), value);
+    dbc_->wrapped_dbc = SQL_NULL_HDBC;
 }
